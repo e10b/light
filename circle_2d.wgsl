@@ -7,15 +7,30 @@ struct VertexOutput {
     @location(0) uv: vec2f,
 };
 
-struct TwoDUniform {
-    orbital: vec4f, // x:n, y:l, z:m, w:colorMode
-    tuning: vec4f,  // x:intensityScale, y:intensityRange, z:zoom, w:thickness
-    render: vec4f,  // x:time, y:aspect ratio, z:phase speed, w:mode
-    pan: vec4f,     // x:panX, y:panY, z:sliceZ, w:integrateDepth(0/1)
-    tdse: vec4f,    // x:gridSize, y:domainHalfExtent, z:potentialOverlay, w:reserved
+struct Params {
+    orbital: vec4f, // x:maxBounces, y:spp, z:dispersion, w:roughness
+    tuning: vec4f,  // x:camPos.x, y:camPos.y, z:camPos.z, w:exposure
+    render: vec4f,  // x:time, y:aspect, z:yaw, w:pitch
+    pan: vec4f,     // x:envBrightness, y:envMode, z:envRotation
+    tdse: vec4f,
 };
 
-@group(0) @binding(0) var<uniform> u: TwoDUniform;
+@group(0) @binding(0) var<uniform> u: Params;
+@group(0) @binding(1) var envTex: texture_2d<f32>;
+@group(0) @binding(2) var envSamp: sampler;
+struct BvhNode {
+    bminLeft: vec4f,  // xyz: min, w: leftFirst
+    bmaxCount: vec4f, // xyz: max, w: count (leaf if > 0)
+};
+struct Tri {
+    v0: vec4f,
+    v1: vec4f,
+    v2: vec4f,
+};
+@group(0) @binding(3) var<storage, read> bvhNodes: array<BvhNode>;
+@group(0) @binding(4) var<storage, read> bvhTris: array<Tri>;
+
+const PI: f32 = 3.14159265359;
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
@@ -25,169 +40,319 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     return out;
 }
 
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4f {
-    let circleColor = clamp(u.orbital.xyz, vec3f(0.0), vec3f(1.0));
-    let background = clamp(u.orbital.w, 0.0, 1.0);
-    let radius = clamp(u.tuning.x, 0.001, 2.0);
-    let softness = max(u.tuning.y, 0.0001);
-    let glow = max(u.tuning.z, 0.0);
-    let aspect = max(u.render.y, 0.0001);
-    let center = u.pan.xy;
-
-    var uv = input.uv;
-    uv.x *= aspect;
-    let d = length(uv - center);
-    let edge = 1.0 - smoothstep(radius - softness, radius + softness, d);
-    let halo = exp(-max(d - radius, 0.0) * (16.0 / max(softness, 0.002))) * glow;
-    let alpha = clamp(edge + halo, 0.0, 1.0);
-    let bg = vec3f(background);
-    let color = mix(bg, circleColor, alpha);
-    return vec4f(color, 1.0);
+fn hash12(p: vec2f) -> f32 {
+    let h = dot(p, vec2f(127.1, 311.7));
+    return fract(sin(h) * 43758.5453123);
 }
 
-fn associatedLaguerre(k: i32, alpha: i32, x: f32) -> f32 {
-    if (k <= 0) { return 1.0; }
-    var lm2 = 1.0;
-    var lm1 = 1.0 + f32(alpha) - x;
-    if (k == 1) { return lm1; }
-    var l = lm1;
-    var j = 2;
-    loop {
-        if (j > k) { break; }
-        l = ((f32(2 * j - 1 + alpha) - x) * lm1 - f32(j - 1 + alpha) * lm2) / f32(j);
-        lm2 = lm1;
-        lm1 = l;
-        j += 1;
+fn hash13(p: vec3f) -> f32 {
+    let h = dot(p, vec3f(127.1, 311.7, 74.7));
+    return fract(sin(h) * 43758.5453123);
+}
+
+fn acesToneMap(color: vec3f) -> vec3f {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3f(0.0), vec3f(1.0));
+}
+
+fn wavelengthToRgb(lambdaNm: f32) -> vec3f {
+    let t = clamp((lambdaNm - 380.0) / 400.0, 0.0, 1.0);
+    let r = smoothstep(0.45, 0.85, t) + (1.0 - smoothstep(0.0, 0.15, t)) * 0.35;
+    let g = smoothstep(0.1, 0.45, t) * (1.0 - smoothstep(0.65, 0.9, t));
+    let b = (1.0 - smoothstep(0.2, 0.55, t)) + smoothstep(0.88, 1.0, t) * 0.2;
+    return clamp(vec3f(r, g, b), vec3f(0.0), vec3f(1.0));
+}
+
+fn envSky(d: vec3f) -> vec3f {
+    let t = clamp(0.5 * (d.y + 1.0), 0.0, 1.0);
+    let sky = mix(vec3f(0.9, 0.95, 1.0), vec3f(0.2, 0.34, 0.65), pow(1.0 - t, 1.4));
+    let warm = vec3f(1.0, 0.75, 0.45) * pow(max(dot(d, normalize(vec3f(-0.6, 0.2, -0.8))), 0.0), 70.0);
+    let sun = vec3f(1.0, 0.95, 0.8) * pow(max(dot(d, normalize(vec3f(-0.4, 0.55, -0.7))), 0.0), 1200.0);
+    return sky + warm + sun;
+}
+
+fn envSunset(d: vec3f) -> vec3f {
+    let t = clamp(0.5 * (d.y + 1.0), 0.0, 1.0);
+    let low = vec3f(0.95, 0.33, 0.14);
+    let mid = vec3f(0.95, 0.64, 0.30);
+    let top = vec3f(0.12, 0.25, 0.52);
+    let warm = mix(low, mid, smoothstep(0.0, 0.35, t));
+    let sky = mix(warm, top, smoothstep(0.35, 1.0, t));
+    let sun = vec3f(1.0, 0.8, 0.52) * pow(max(dot(d, normalize(vec3f(-0.1, 0.25, -0.95))), 0.0), 700.0);
+    return sky + sun;
+}
+
+fn envHdrLatLong(d: vec3f) -> vec3f {
+    let rot = u.pan.z;
+    let cr = cos(rot);
+    let sr = sin(rot);
+    let dr = vec3f(
+        d.x * cr - d.z * sr,
+        d.y,
+        d.x * sr + d.z * cr
+    );
+    let phi = atan2(dr.z, dr.x);
+    let theta = acos(clamp(dr.y, -1.0, 1.0));
+    let uv = vec2f((phi + PI) / (2.0 * PI), theta / PI);
+    return textureSample(envTex, envSamp, uv).rgb;
+}
+
+fn sampleEnvironment(d: vec3f) -> vec3f {
+    let mode = i32(clamp(u.pan.y, 0.0, 2.0));
+    if (mode == 0) {
+        return envHdrLatLong(d);
     }
-    return l;
+    if (mode == 1) {
+        return envSky(d);
+    }
+    return envSunset(d);
 }
 
-fn associatedLegendre(l: i32, mAbs: i32, x: f32) -> f32 {
-    var pmm = 1.0;
-    if (mAbs > 0) {
-        let somx2 = sqrt(max(0.0, (1.0 - x) * (1.0 + x)));
-        var fact = 1.0;
-        var j = 1;
-        loop {
-            if (j > mAbs) { break; }
-            pmm = pmm * (-fact) * somx2;
-            fact += 2.0;
-            j += 1;
+fn intersectAabb(ro: vec3f, invRd: vec3f, bmin: vec3f, bmax: vec3f, tMax: f32) -> bool {
+    let t0 = (bmin - ro) * invRd;
+    let t1 = (bmax - ro) * invRd;
+    let tsm = min(t0, t1);
+    let tbg = max(t0, t1);
+    let tn = max(max(tsm.x, tsm.y), max(tsm.z, 0.0));
+    let tf = min(min(tbg.x, tbg.y), min(tbg.z, tMax));
+    return tn <= tf;
+}
+
+fn intersectTri(ro: vec3f, rd: vec3f, tri: Tri, tBest: f32) -> vec4f {
+    let v0 = tri.v0.xyz;
+    let v1 = tri.v1.xyz;
+    let v2 = tri.v2.xyz;
+    let e1 = v1 - v0;
+    let e2 = v2 - v0;
+    let p = cross(rd, e2);
+    let det = dot(e1, p);
+    if (abs(det) < 1e-7) {
+        return vec4f(-1.0);
+    }
+    let invDet = 1.0 / det;
+    let tvec = ro - v0;
+    let u = dot(tvec, p) * invDet;
+    if (u < 0.0 || u > 1.0) {
+        return vec4f(-1.0);
+    }
+    let q = cross(tvec, e1);
+    let v = dot(rd, q) * invDet;
+    if (v < 0.0 || u + v > 1.0) {
+        return vec4f(-1.0);
+    }
+    let t = dot(e2, q) * invDet;
+    if (t <= 0.0005 || t >= tBest) {
+        return vec4f(-1.0);
+    }
+    let n = normalize(cross(e1, e2));
+    return vec4f(n, t);
+}
+
+fn intersectMesh(ro: vec3f, rd: vec3f) -> vec4f {
+    var bestT = 1e20;
+    var bestN = vec3f(0.0);
+
+    var stack: array<i32, 64>;
+    var sp = 0;
+    stack[sp] = 0;
+    sp += 1;
+    let invRd = 1.0 / select(vec3f(1e-6), rd, abs(rd) > vec3f(1e-6));
+
+    loop {
+        if (sp <= 0) { break; }
+        sp -= 1;
+        let ni = stack[sp];
+        if (ni < 0) { continue; }
+        let node = bvhNodes[u32(ni)];
+        let bmin = node.bminLeft.xyz;
+        let bmax = node.bmaxCount.xyz;
+        if (!intersectAabb(ro, invRd, bmin, bmax, bestT)) {
+            continue;
+        }
+        let leftFirst = i32(node.bminLeft.w + 0.5);
+        let enc = node.bmaxCount.w;
+        let count = i32(enc + 0.5);
+        if (count > 0) {
+            for (var i = 0; i < count; i += 1) {
+                let tri = bvhTris[u32(leftFirst + i)];
+                let hit = intersectTri(ro, rd, tri, bestT);
+                if (hit.w > 0.0) {
+                    bestT = hit.w;
+                    bestN = hit.xyz;
+                }
+            }
+        } else {
+            let right = i32(-enc - 1.0 + 0.5);
+            if (sp + 2 < 64) {
+                stack[sp] = right;
+                sp += 1;
+                stack[sp] = leftFirst;
+                sp += 1;
+            }
         }
     }
-    if (l == mAbs) { return pmm; }
-    var pm1m = x * f32(2 * mAbs + 1) * pmm;
-    if (l == mAbs + 1) { return pm1m; }
-    var pll = pm1m;
-    var ll = mAbs + 2;
-    loop {
-        if (ll > l) { break; }
-        pll = ((f32(2 * ll - 1) * x * pm1m) - (f32(ll + mAbs - 1) * pmm)) / f32(ll - mAbs);
-        pmm = pm1m;
-        pm1m = pll;
-        ll += 1;
+    if (bestT < 1e19) {
+        return vec4f(bestN, bestT);
     }
-    return pll;
+    return vec4f(0.0, 0.0, 0.0, -1.0);
 }
 
-fn factorialInt(v: i32) -> f32 {
-    if (v <= 1) { return 1.0; }
-    var out = 1.0;
-    var i = 2;
-    loop {
-        if (i > v) { break; }
-        out *= f32(i);
-        i += 1;
-    }
-    return out;
+fn snellIorForWavelength(lambdaNm: f32, dispersion: f32) -> f32 {
+    let etaD = 1.50;
+    let x = (lambdaNm - 550.0) / 170.0;
+    return etaD + dispersion * (-x + 0.2 * x * x);
 }
 
-fn intensityAt(pos: vec3f, n: i32, l: i32, m: i32, intensityScale: f32, intensityRange: f32) -> f32 {
-    let r = length(pos);
-    let theta = acos(clamp(pos.y / max(r, 0.0001), -1.0, 1.0));
-    let rho = 2.0 * r / max(f32(n), 1.0);
-    let k = n - l - 1;
-    let alpha = 2 * l + 1;
-    let laguerre = associatedLaguerre(max(k, 0), alpha, rho);
-    let nn = max(f32(n), 1.0);
-    let num = factorialInt(max(n - l - 1, 0));
-    let den = factorialInt(max(n + l, 0));
-    let norm = pow(2.0 / nn, 3.0) * num / (2.0 * nn * max(den, 1.0));
-    let radial = sqrt(max(norm, 0.0)) * exp(-rho * 0.5) * pow(max(rho, 0.0001), f32(l)) * laguerre;
-    let radialP = radial * radial;
-    let x = cos(theta);
-    let mAbs = abs(m);
-    let plm = associatedLegendre(l, mAbs, x);
-    let angNum = factorialInt(max(l - mAbs, 0));
-    let angDen = max(factorialInt(max(l + mAbs, 0)), 1e-8);
-    let yNorm = (f32(2 * l + 1) / (4.0 * 3.14159265358979323846)) * (angNum / angDen);
-    let angular = yNorm * plm * plm;
-    let raw = radialP * angular;
-    let nNorm = pow(max(f32(n), 1.0), 3.0);
-    let scaled = raw * intensityScale * 30.0 * nNorm;
-    return clamp(scaled / (scaled + intensityRange), 0.0, 1.0);
+fn schlick(cosTheta: f32, etaI: f32, etaT: f32) -> f32 {
+    let r0 = pow((etaI - etaT) / (etaI + etaT), 2.0);
+    return r0 + (1.0 - r0) * pow(1.0 - cosTheta, 5.0);
 }
 
-fn samplePalette6(x: f32, c0: vec3f, c1: vec3f, c2: vec3f, c3: vec3f, c4: vec3f, c5: vec3f) -> vec3f {
-    let u = clamp(x, 0.0, 1.0) * 5.0;
-    if (u < 1.0) { return c0 + u * (c1 - c0); }
-    if (u < 2.0) { return c1 + (u - 1.0) * (c2 - c1); }
-    if (u < 3.0) { return c2 + (u - 2.0) * (c3 - c2); }
-    if (u < 4.0) { return c3 + (u - 3.0) * (c4 - c3); }
-    return c4 + (u - 4.0) * (c5 - c4);
+fn cosineHemisphere(n: vec3f, seed: vec2f) -> vec3f {
+    let r1 = fract(seed.x);
+    let r2 = fract(seed.y);
+    let phi = 2.0 * PI * r1;
+    let r = sqrt(r2);
+    let x = r * cos(phi);
+    let y = r * sin(phi);
+    let z = sqrt(max(1.0 - r2, 0.0));
+
+    let up = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), abs(n.y) < 0.999);
+    let t = normalize(cross(up, n));
+    let b = cross(n, t);
+    return normalize(t * x + b * y + n * z);
 }
 
-fn hsvToRgb(h: f32, s: f32, v: f32) -> vec3f {
-    let hue = fract(h);
-    let hh = hue * 6.0;
-    let c = v * s;
-    let x = c * (1.0 - abs(fract(hh) * 2.0 - 1.0));
-    let m = v - c;
-    if (hh < 1.0) { return vec3f(c + m, x + m, m); }
-    if (hh < 2.0) { return vec3f(x + m, c + m, m); }
-    if (hh < 3.0) { return vec3f(m, c + m, x + m); }
-    if (hh < 4.0) { return vec3f(m, x + m, c + m); }
-    if (hh < 5.0) { return vec3f(x + m, m, c + m); }
-    return vec3f(c + m, m, x + m);
+fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
+    var origin = ro;
+    var dir = rd;
+    var throughput = vec3f(1.0);
+    var radiance = vec3f(0.0);
+
+    let maxBounces = i32(clamp(u.orbital.x, 1.0, 32.0));
+    let roughness = clamp(u.orbital.w, 0.0, 0.2);
+    let dispersion = clamp(u.orbital.z, 0.0, 0.2);
+    let spectralWeight = wavelengthToRgb(lambdaNm);
+
+    var etaCurrent = 1.0;
+
+    for (var bounce = 0; bounce < maxBounces; bounce += 1) {
+        let meshHit = intersectMesh(origin, dir);
+        let tGround = (-0.62 - origin.y) / dir.y;
+        let hitGround = (tGround > 0.0005);
+        let hitMesh = (meshHit.w > 0.0);
+
+        var hitMat = -1.0;
+        var hitPos = vec3f(0.0);
+        var nRaw = vec3f(0.0);
+        if (hitMesh && (!hitGround || meshHit.w < tGround)) {
+            hitMat = 1.0;
+            hitPos = origin + dir * meshHit.w;
+            nRaw = meshHit.xyz;
+        } else if (hitGround) {
+            hitMat = 0.0;
+            hitPos = origin + dir * tGround;
+            nRaw = vec3f(0.0, 1.0, 0.0);
+        } else {
+            radiance += throughput * sampleEnvironment(dir) * u.pan.x * spectralWeight;
+            break;
+        }
+
+        let n = select(-nRaw, nRaw, dot(dir, nRaw) < 0.0);
+
+        if (hitMat < 0.5) {
+            let l = normalize(vec3f(-0.55, 0.9, -0.35));
+            let ndotl = max(dot(n, l), 0.0);
+            let base = vec3f(0.08, 0.08, 0.09);
+            let albedo = vec3f(0.7, 0.72, 0.74);
+            radiance += throughput * (base + albedo * ndotl) * spectralWeight;
+            break;
+        }
+
+        let glassIor = snellIorForWavelength(lambdaNm, dispersion);
+        let entering = dot(dir, nRaw) < 0.0;
+        let etaI = select(glassIor, 1.0, entering);
+        let etaT = select(1.0, glassIor, entering);
+
+        let eta = etaI / etaT;
+        let cosI = clamp(dot(-dir, n), 0.0, 1.0);
+        let sin2T = eta * eta * (1.0 - cosI * cosI);
+        let cannotRefract = sin2T > 1.0;
+
+        let fresnel = select(schlick(cosI, etaI, etaT), 1.0, cannotRefract);
+        let r = hash13(vec3f(pixelJitter, f32(bounce) * 17.0 + u.render.x));
+
+        var nextDir = reflect(dir, n);
+        if (r > fresnel && !cannotRefract) {
+            nextDir = refract(dir, n, eta);
+            etaCurrent = etaT;
+        }
+
+        if (roughness > 0.0) {
+            let jitter = cosineHemisphere(nextDir, vec2f(
+                hash13(vec3f(hitPos.xy, f32(bounce) * 2.71 + 11.0)),
+                hash13(vec3f(hitPos.zy, f32(bounce) * 4.31 + 29.0))
+            ));
+            nextDir = normalize(mix(nextDir, jitter, roughness));
+        }
+
+        throughput *= mix(vec3f(0.98), vec3f(1.0), vec3f(fresnel));
+        origin = hitPos + nextDir * 0.002;
+        dir = nextDir;
+
+        if (max(throughput.r, max(throughput.g, throughput.b)) < 0.01) {
+            break;
+        }
+
+        _ = etaCurrent;
+    }
+
+    return radiance;
 }
 
-fn mapColor(t: f32, colorMode: i32, samplePos: vec3f, simulationTime: f32, n: i32, m: i32, localOmega: f32) -> vec3f {
-    let x = clamp(t, 0.0, 1.0);
-    if (colorMode == 0) {
-        return samplePalette6(x, vec3f(0.0015, 0.0005, 0.0139), vec3f(0.1462, 0.0449, 0.3374), vec3f(0.3904, 0.1004, 0.5019), vec3f(0.6663, 0.1819, 0.3698), vec3f(0.9018, 0.4251, 0.1081), vec3f(0.9884, 0.9984, 0.6449));
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+    let aspect = max(u.render.y, 0.0001);
+    let time = u.render.x;
+    let spp = i32(clamp(u.orbital.y, 1.0, 256.0));
+
+    let camPos = u.tuning.xyz;
+    let exposure = max(u.tuning.w, 0.01);
+
+    let yaw = u.render.z;
+    let pitch = u.render.w;
+    let eye = camPos;
+    let forward = normalize(vec3f(
+        cos(pitch) * sin(yaw),
+        sin(pitch),
+        cos(pitch) * cos(yaw)));
+    let right = normalize(cross(forward, vec3f(0.0, 1.0, 0.0)));
+    let up = cross(right, forward);
+
+    let uv = vec2f(input.uv.x * aspect, input.uv.y);
+
+    var color = vec3f(0.0);
+    for (var i = 0; i < spp; i += 1) {
+        let fi = f32(i);
+        let jitter = vec2f(
+            hash12(uv + vec2f(fi, time * 0.17)),
+            hash12(uv.yx + vec2f(time * 0.23, fi * 1.7))
+        ) - 0.5;
+
+        let pixelUv = uv + jitter * (0.0018 + 0.0007 * hash12(vec2f(fi, time)));
+        let rd = normalize(forward + pixelUv.x * right + pixelUv.y * up);
+
+        let lambda = 380.0 + 400.0 * hash12(vec2f(fi * 13.1 + uv.x * 91.0, uv.y * 73.0 + time * 0.31));
+        color += trace(eye, rd, jitter + vec2f(fi * 0.03), lambda);
     }
-    if (colorMode == 1) {
-        return samplePalette6(x, vec3f(0.0015, 0.0005, 0.0139), vec3f(0.1717, 0.0673, 0.3708), vec3f(0.4452, 0.1227, 0.5069), vec3f(0.7164, 0.2150, 0.4753), vec3f(0.9440, 0.3776, 0.3651), vec3f(0.9871, 0.9914, 0.7495));
-    }
-    if (colorMode == 2) {
-        return samplePalette6(x, vec3f(0.0504, 0.0298, 0.5280), vec3f(0.4176, 0.0006, 0.6584), vec3f(0.6928, 0.1651, 0.5645), vec3f(0.8814, 0.3925, 0.3832), vec3f(0.9883, 0.6523, 0.2114), vec3f(0.9400, 0.9752, 0.1313));
-    }
-    if (colorMode == 3) {
-        return samplePalette6(x, vec3f(0.2670, 0.0049, 0.3294), vec3f(0.2539, 0.2653, 0.5300), vec3f(0.1636, 0.4711, 0.5581), vec3f(0.1347, 0.6586, 0.5176), vec3f(0.4775, 0.8214, 0.3182), vec3f(0.9932, 0.9062, 0.1439));
-    }
-    if (colorMode == 4) {
-        return samplePalette6(x, vec3f(0.0000, 0.1262, 0.3015), vec3f(0.2081, 0.2666, 0.4622), vec3f(0.3390, 0.4306, 0.5270), vec3f(0.4887, 0.5864, 0.5053), vec3f(0.6785, 0.7335, 0.3791), vec3f(0.9957, 0.9093, 0.2178));
-    }
-    if (colorMode == 5) {
-        return samplePalette6(x, vec3f(0.1900, 0.0718, 0.2322), vec3f(0.2511, 0.2524, 0.6337), vec3f(0.2763, 0.4774, 0.9308), vec3f(0.1637, 0.7170, 0.8030), vec3f(0.7560, 0.8940, 0.2260), vec3f(0.9840, 0.4920, 0.1280));
-    }
-    if (colorMode == 6) {
-        return vec3f(x, x, x);
-    }
-    if (colorMode == 8) {
-        return vec3f(0.2 + 0.8 * x, 1.0 - 0.6 * x, 1.0);
-    }
-    if (colorMode == 9) {
-        let basePhi = atan2(samplePos.y, samplePos.x) / 6.28318530717958647692;
-        let hue = fract(basePhi + simulationTime * (0.06 * localOmega));
-        return hsvToRgb(hue, 0.92, 0.22 + 0.78 * x);
-    }
-    if (colorMode == 10) {
-        let basePhi = f32(m) * atan2(samplePos.y, samplePos.x) / 6.28318530717958647692;
-        let energyOmega = 1.0 / max(f32(n * n), 1.0);
-        let hue = fract(basePhi + simulationTime * (0.9 * energyOmega));
-        return hsvToRgb(hue, 0.88, 0.24 + 0.76 * x);
-    }
-    return samplePalette6(x, vec3f(0.0, 0.0, 0.0), vec3f(0.5, 0.0, 0.99), vec3f(0.8, 0.0, 0.0), vec3f(1.0, 0.5, 0.0), vec3f(1.0, 1.0, 0.0), vec3f(1.0, 1.0, 1.0));
+
+    color /= f32(spp);
+    color *= exposure;
+    color = acesToneMap(color);
+    color = pow(color, vec3f(1.0 / 2.2));
+    return vec4f(color, 1.0);
 }
