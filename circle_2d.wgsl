@@ -72,11 +72,11 @@ fn wavelengthToRgb(lambdaNm: f32) -> vec3f {
 }
 
 fn envSky(d: vec3f) -> vec3f {
+    // Simple blue sky gradient - darker at horizon, lighter at zenith
     let t = clamp(0.5 * (d.y + 1.0), 0.0, 1.0);
-    let sky = mix(vec3f(0.9, 0.95, 1.0), vec3f(0.2, 0.34, 0.65), pow(1.0 - t, 1.4));
-    let warm = vec3f(1.0, 0.75, 0.45) * pow(max(dot(d, normalize(vec3f(-0.6, 0.2, -0.8))), 0.0), 70.0);
-    let sun = vec3f(1.0, 0.95, 0.8) * pow(max(dot(d, normalize(vec3f(-0.4, 0.55, -0.7))), 0.0), 1200.0);
-    return sky + warm + sun;
+    let horizon = vec3f(0.4, 0.6, 0.9);  // Light blue at horizon
+    let zenith = vec3f(0.2, 0.4, 0.8);   // Deeper blue at top
+    return mix(horizon, zenith, pow(t, 0.8));
 }
 
 fn envSunset(d: vec3f) -> vec3f {
@@ -127,13 +127,69 @@ fn sunDirection() -> vec3f {
     ));
 }
 
-fn sunLamp(d: vec3f) -> vec3f {
-    let sunDir = sunDirection();
-    let softness = max(u.tdse.w, 1.0);
+fn spotlightDirection() -> vec3f {
+    // Point the spotlight toward the center of the decanters
+    let spotPos = spotlightPosition();
+    let targetPos = vec3f(0.0, 0.2, 0.0); // Center of glass objects
+    return normalize(targetPos - spotPos);
+}
+
+fn spotlightPosition() -> vec3f {
+    // Position the spotlight above and to the side of the scene
+    return vec3f(1.5, 2.5, 1.0);
+}
+
+fn spotLight(p: vec3f, n: vec3f) -> vec3f {
+    let spotPos = spotlightPosition();
+    let spotDir = spotlightDirection();
     let intensity = max(u.tdse.z, 0.0);
-    let warm = vec3f(1.0, 0.94, 0.82);
-    let spot = pow(max(dot(d, sunDir), 0.0), softness);
-    return warm * intensity * spot;
+    let softness = max(u.tdse.w, 16.0);
+    
+    // Vector from surface point to light
+    let toLight = spotPos - p;
+    let dist = length(toLight);
+    let L = normalize(toLight);
+    
+    // Spotlight cone angle (cosine of the cone angle)
+    let coneAngle = 0.85; // ~32 degrees
+    let coneSoftness = 0.75; // Soft edge
+    
+    // Check if point is within spotlight cone
+    let spotEffect = dot(-L, spotDir);
+    let spotAttenuation = smoothstep(coneSoftness, coneAngle, spotEffect);
+    
+    // Distance attenuation (inverse square with some artistic control)
+    let distAttenuation = 1.0 / (1.0 + 0.1 * dist + 0.01 * dist * dist);
+    
+    // Lambertian diffuse
+    let ndotl = max(dot(n, L), 0.0);
+    
+    // Shadow test - check if light ray is blocked by glass
+    let shadowRayOrigin = p + L * 0.01;
+    let meshShadow = intersectMesh(shadowRayOrigin, L);
+    
+    // Also check sphere
+    let sphereCenter = vec3f(-0.8, -0.12, 0.5);
+    let sphereRadius = 0.5;
+    let sphereShadow = intersectSphere(shadowRayOrigin, L, sphereCenter, sphereRadius);
+    
+    var shadowFactor = 1.0;
+    
+    // If blocked by glass, create shadow
+    if ((meshShadow.w > 0.0 && meshShadow.w < (dist - 0.01)) ||
+        (sphereShadow.w > 0.0 && sphereShadow.w < (dist - 0.01))) {
+        shadowFactor = 0.15; // Soft shadow
+    }
+    
+    // Warm white light color
+    let lightColor = vec3f(1.0, 0.98, 0.95);
+    
+    return lightColor * intensity * spotAttenuation * distAttenuation * ndotl * shadowFactor;
+}
+
+fn sunLamp(d: vec3f) -> vec3f {
+    // Disabled - using spotlight instead
+    return vec3f(0.0);
 }
 
 fn intersectAabb(ro: vec3f, invRd: vec3f, bmin: vec3f, bmax: vec3f, tMax: f32) -> bool {
@@ -174,6 +230,33 @@ fn intersectTri(ro: vec3f, rd: vec3f, tri: Tri, tBest: f32) -> vec4f {
     }
     let n = normalize(cross(e1, e2));
     return vec4f(n, t);
+}
+
+fn intersectSphere(ro: vec3f, rd: vec3f, center: vec3f, radius: f32) -> vec4f {
+    let oc = ro - center;
+    let a = dot(rd, rd);
+    let b = 2.0 * dot(oc, rd);
+    let c = dot(oc, oc) - radius * radius;
+    let discriminant = b * b - 4.0 * a * c;
+    
+    if (discriminant < 0.0) {
+        return vec4f(0.0, 0.0, 0.0, -1.0);
+    }
+    
+    let sqrtDisc = sqrt(discriminant);
+    var t = (-b - sqrtDisc) / (2.0 * a);
+    
+    if (t < 0.0005) {
+        t = (-b + sqrtDisc) / (2.0 * a);
+    }
+    
+    if (t < 0.0005) {
+        return vec4f(0.0, 0.0, 0.0, -1.0);
+    }
+    
+    let hitPos = ro + rd * t;
+    let normal = normalize(hitPos - center);
+    return vec4f(normal, t);
 }
 
 fn intersectMesh(ro: vec3f, rd: vec3f) -> vec4f {
@@ -287,36 +370,64 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
 
     for (var bounce = 0; bounce < maxBounces; bounce += 1) {
         let meshHit = intersectMesh(origin, dir);
+        
+        // Add glass sphere at position (-0.8, -0.12, 0.5) with radius 0.5
+        let sphereCenter = vec3f(-0.8, -0.12, 0.5);
+        let sphereRadius = 0.5;
+        let sphereHit = intersectSphere(origin, dir, sphereCenter, sphereRadius);
+        
         let tGround = (-0.62 - origin.y) / dir.y;
         let hitGround = (tGround > 0.0005);
         let hitMesh = (meshHit.w > 0.0);
+        let hitSphere = (sphereHit.w > 0.0);
 
         var hitMat = -1.0;
         var hitPos = vec3f(0.0);
         var nRaw = vec3f(0.0);
-        if (hitMesh && (!hitGround || meshHit.w < tGround)) {
-            hitMat = 1.0;
+        
+        // Find closest hit
+        var tClosest = 1e20;
+        
+        if (hitSphere && sphereHit.w < tClosest) {
+            tClosest = sphereHit.w;
+            hitMat = 1.0; // Glass
+            hitPos = origin + dir * sphereHit.w;
+            nRaw = sphereHit.xyz;
+        }
+        
+        if (hitMesh && meshHit.w < tClosest) {
+            tClosest = meshHit.w;
+            hitMat = 1.0; // Glass
             hitPos = origin + dir * meshHit.w;
             nRaw = meshHit.xyz;
-        } else if (hitGround) {
-            hitMat = 0.0;
+        }
+        
+        if (hitGround && tGround < tClosest) {
+            tClosest = tGround;
+            hitMat = 0.0; // Ground
             hitPos = origin + dir * tGround;
             nRaw = vec3f(0.0, 1.0, 0.0);
-        } else {
-            radiance += throughput * (sampleEnvironment(dir) * u.pan.x + sunLamp(dir)) * spectralWeight;
+        }
+        
+        if (hitMat < -0.5) {
+            radiance += throughput * sampleEnvironment(dir) * u.pan.x * spectralWeight;
             break;
         }
 
         let n = select(-nRaw, nRaw, dot(dir, nRaw) < 0.0);
 
         if (hitMat < 0.5) {
-            let l = sunDirection();
-            let ndotl = max(dot(n, l), 0.0);
+            // Ground material with basic lighting
             let base = vec3f(0.08, 0.08, 0.09);
             let albedo = vec3f(0.7, 0.72, 0.74);
-            let sunTrans = glassTransmissionToSun(hitPos, l, lambdaNm);
-            let sunDiffuse = vec3f(1.0, 0.94, 0.82) * ndotl * max(u.tdse.z, 0.0) * sunTrans;
-            radiance += throughput * (base + albedo * (0.4 + 0.6 * ndotl) + sunDiffuse) * spectralWeight;
+            
+            // Direct spotlight contribution (with shadow)
+            let spotContrib = spotLight(hitPos, n);
+            
+            // Ambient from sky
+            let ambient = vec3f(0.3, 0.35, 0.4) * 0.2;
+            
+            radiance += throughput * (base + albedo * (ambient + spotContrib)) * spectralWeight;
             break;
         }
 
