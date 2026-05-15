@@ -477,19 +477,28 @@ fn photonIndexFromXZ(xz: vec2f) -> i32 {
     return i32(iy * dims.x + ix);
 }
 
-fn writePhoton(xz: vec2f, energy: f32) {
+fn writePhoton(xz: vec2f, energy: vec3f) {
     let idx = photonIndexFromXZ(xz);
     if (idx < 0) {
         return;
     }
-    let quant = u32(clamp(energy * 4096.0, 0.0, 65535.0));
-    if (quant == 0u) {
+    let q = vec3u(
+        u32(clamp(energy.r * 4096.0, 0.0, 65535.0)),
+        u32(clamp(energy.g * 4096.0, 0.0, 65535.0)),
+        u32(clamp(energy.b * 4096.0, 0.0, 65535.0))
+    );
+    if (q.r == 0u && q.g == 0u && q.b == 0u) {
         return;
     }
+    let base = u32(idx) * 3u;
     if (photon.data.z > 0.5) {
-        atomicAdd(&photonB[u32(idx)], quant);
+        atomicAdd(&photonB[base + 0u], q.r);
+        atomicAdd(&photonB[base + 1u], q.g);
+        atomicAdd(&photonB[base + 2u], q.b);
     } else {
-        atomicAdd(&photonA[u32(idx)], quant);
+        atomicAdd(&photonA[base + 0u], q.r);
+        atomicAdd(&photonA[base + 1u], q.g);
+        atomicAdd(&photonA[base + 2u], q.b);
     }
 }
 
@@ -500,12 +509,21 @@ fn readPhoton(idx: u32) -> u32 {
     return atomicLoad(&photonB[idx]);
 }
 
-fn samplePhotonGrid(xz: vec2f) -> f32 {
+fn readPhotonRgb(cellIndex: u32) -> vec3f {
+    let base = cellIndex * 3u;
+    return vec3f(
+        f32(readPhoton(base + 0u)),
+        f32(readPhoton(base + 1u)),
+        f32(readPhoton(base + 2u))
+    );
+}
+
+fn samplePhotonGrid(xz: vec2f) -> vec3f {
     let dims = photonGridDims();
     let span = PHOTON_MAX_XZ - PHOTON_MIN_XZ;
     let uv = (xz - PHOTON_MIN_XZ) / span;
     if (uv.x < 0.0 || uv.x >= 1.0 || uv.y < 0.0 || uv.y >= 1.0) {
-        return 0.0;
+        return vec3f(0.0);
     }
 
     let gx = clamp(uv.x * f32(dims.x) - 0.5, 0.0, f32(dims.x) - 1.0);
@@ -522,10 +540,10 @@ fn samplePhotonGrid(xz: vec2f) -> f32 {
     let i01 = iy1 * dims.x + ix;
     let i11 = iy1 * dims.x + ix1;
 
-    let p00 = f32(readPhoton(i00));
-    let p10 = f32(readPhoton(i10));
-    let p01 = f32(readPhoton(i01));
-    let p11 = f32(readPhoton(i11));
+    let p00 = readPhotonRgb(i00);
+    let p10 = readPhotonRgb(i10);
+    let p01 = readPhotonRgb(i01);
+    let p11 = readPhotonRgb(i11);
 
     let a = mix(p00, p10, fx);
     let b = mix(p01, p11, fx);
@@ -541,6 +559,7 @@ fn tracePhotonFromLight(seed: vec3f, lambdaNm: f32) {
     ), 0.85);
 
     var power = 1.0;
+    let spectralColor = wavelengthToRgb(lambdaNm);
     var seenGlass = false;
     let sphereCenter = vec3f(-0.8, -0.12, 0.5);
     let sphereRadius = 0.5;
@@ -581,7 +600,7 @@ fn tracePhotonFromLight(seed: vec3f, lambdaNm: f32) {
         let hitPos = pos + direction * tClosest;
         if (hitType < 0.5) {
             if (seenGlass) {
-                writePhoton(hitPos.xz, power);
+                writePhoton(hitPos.xz, spectralColor * power);
             }
             break;
         }
@@ -628,8 +647,18 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
     let dispersion = clamp(u.orbital.z, 0.0, 0.2);
     let spectralWeight = wavelengthToRgb(lambdaNm);
 
-    // Light-traced pass: emit photons from the spotlight into a floor grid.
-    tracePhotonFromLight(vec3f(pixelJitter, u.render.x), lambdaNm);
+    // Light-traced pass: emit spectral photons from the spotlight into a floor grid.
+    let photonRaysPerSample = 4;
+    for (var pi = 0; pi < photonRaysPerSample; pi += 1) {
+        let pf = f32(pi);
+        let photonSeed = vec3f(
+            pixelJitter.x + pf * 0.37,
+            pixelJitter.y + pf * 0.61,
+            u.render.x + pf * 1.17
+        );
+        let photonLambda = 380.0 + 400.0 * hash13(photonSeed + vec3f(9.3, 4.1, 2.7));
+        tracePhotonFromLight(photonSeed, photonLambda);
+    }
 
     var etaCurrent = 1.0;
 
@@ -758,8 +787,8 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
             }
 
             // Photon-map caustics from light-traced paths through glass.
-            let photonDensity = samplePhotonGrid(hitPos.xz);
-            let causticColor = vec3f(1.0, 0.98, 0.95) * photonDensity * max(u.tdse.z, 0.0);
+            let photonColor = samplePhotonGrid(hitPos.xz);
+            let causticColor = photonColor * max(u.tdse.z, 0.0);
             
             radiance += throughput * (base + albedo * (ambient + lightContrib + causticColor)) * spectralWeight;
             
