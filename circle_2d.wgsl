@@ -29,6 +29,10 @@ struct Tri {
 };
 @group(0) @binding(3) var<storage, read> bvhNodes: array<BvhNode>;
 @group(0) @binding(4) var<storage, read> bvhTris: array<Tri>;
+@group(0) @binding(5) var<storage, read_write> accumA: array<vec4f>;
+@group(0) @binding(6) var<storage, read_write> accumB: array<vec4f>;
+struct AccumParams { data: vec4f, };
+@group(0) @binding(7) var<uniform> accum: AccumParams;
 
 const PI: f32 = 3.14159265359;
 
@@ -110,6 +114,26 @@ fn sampleEnvironment(d: vec3f) -> vec3f {
         return envSky(d);
     }
     return envSunset(d);
+}
+
+fn sunDirection() -> vec3f {
+    let az = u.tdse.x;
+    let el = clamp(u.tdse.y, 0.001, 1.56);
+    let ce = cos(el);
+    return normalize(vec3f(
+        cos(az) * ce,
+        sin(el),
+        sin(az) * ce
+    ));
+}
+
+fn sunLamp(d: vec3f) -> vec3f {
+    let sunDir = sunDirection();
+    let softness = max(u.tdse.w, 1.0);
+    let intensity = max(u.tdse.z, 0.0);
+    let warm = vec3f(1.0, 0.94, 0.82);
+    let spot = pow(max(dot(d, sunDir), 0.0), softness);
+    return warm * intensity * spot;
 }
 
 fn intersectAabb(ro: vec3f, invRd: vec3f, bmin: vec3f, bmax: vec3f, tMax: f32) -> bool {
@@ -201,6 +225,27 @@ fn intersectMesh(ro: vec3f, rd: vec3f) -> vec4f {
     return vec4f(0.0, 0.0, 0.0, -1.0);
 }
 
+fn glassTransmissionToSun(p: vec3f, sunDir: vec3f, lambdaNm: f32) -> f32 {
+    // First intersection from ground toward sun
+    let h1 = intersectMesh(p + sunDir * 0.003, sunDir);
+    if (h1.w <= 0.0) {
+        return 1.0;
+    }
+
+    // Second intersection approximates glass thickness along this path
+    let pInside = p + sunDir * (h1.w + 0.006);
+    let h2 = intersectMesh(pInside, sunDir);
+    if (h2.w <= 0.0) {
+        return 0.25;
+    }
+
+    let thickness = max(h2.w, 0.0);
+    // Slightly stronger absorption for short wavelengths to mimic tinted dispersion.
+    let t = clamp((lambdaNm - 380.0) / 400.0, 0.0, 1.0);
+    let sigma = mix(0.9, 0.45, t);
+    return exp(-sigma * thickness * 6.0);
+}
+
 fn snellIorForWavelength(lambdaNm: f32, dispersion: f32) -> f32 {
     let etaD = 1.50;
     let x = (lambdaNm - 550.0) / 170.0;
@@ -258,18 +303,20 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
             hitPos = origin + dir * tGround;
             nRaw = vec3f(0.0, 1.0, 0.0);
         } else {
-            radiance += throughput * sampleEnvironment(dir) * u.pan.x * spectralWeight;
+            radiance += throughput * (sampleEnvironment(dir) * u.pan.x + sunLamp(dir)) * spectralWeight;
             break;
         }
 
         let n = select(-nRaw, nRaw, dot(dir, nRaw) < 0.0);
 
         if (hitMat < 0.5) {
-            let l = normalize(vec3f(-0.55, 0.9, -0.35));
+            let l = sunDirection();
             let ndotl = max(dot(n, l), 0.0);
             let base = vec3f(0.08, 0.08, 0.09);
             let albedo = vec3f(0.7, 0.72, 0.74);
-            radiance += throughput * (base + albedo * ndotl) * spectralWeight;
+            let sunTrans = glassTransmissionToSun(hitPos, l, lambdaNm);
+            let sunDiffuse = vec3f(1.0, 0.94, 0.82) * ndotl * max(u.tdse.z, 0.0) * sunTrans;
+            radiance += throughput * (base + albedo * (0.4 + 0.6 * ndotl) + sunDiffuse) * spectralWeight;
             break;
         }
 
@@ -352,7 +399,28 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
 
     color /= f32(spp);
     color *= exposure;
-    color = acesToneMap(color);
-    color = pow(color, vec3f(1.0 / 2.2));
-    return vec4f(color, 1.0);
+
+    let w = max(i32(accum.data.x + 0.5), 1);
+    let h = max(i32(accum.data.y + 0.5), 1);
+    let xi = clamp(i32(input.position.x), 0, w - 1);
+    let yi = clamp(i32(input.position.y), 0, h - 1);
+    let idx = u32(yi * w + xi);
+    let useA = accum.data.z > 0.5;
+    let reset = accum.data.w > 0.5;
+
+    let prev = select(accumB[idx], accumA[idx], useA);
+    let prevSum = select(prev.rgb, vec3f(0.0), reset);
+    let prevCount = select(prev.w, 0.0, reset);
+    let sum = prevSum + color;
+    let count = prevCount + 1.0;
+    let outVal = vec4f(sum, count);
+    if (useA) {
+        accumB[idx] = outVal;
+    } else {
+        accumA[idx] = outVal;
+    }
+
+    let avg = sum / max(count, 1.0);
+    let mapped = pow(acesToneMap(avg), vec3f(1.0 / 2.2));
+    return vec4f(mapped, 1.0);
 }
