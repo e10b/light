@@ -164,21 +164,27 @@ fn spotLight(p: vec3f, n: vec3f) -> vec3f {
     // Lambertian diffuse
     let ndotl = max(dot(n, L), 0.0);
     
-    // Shadow test - check if light ray is blocked by glass
+    // Shadow test - trace through glass with refraction
     let shadowRayOrigin = p + L * 0.01;
-    let meshShadow = intersectMesh(shadowRayOrigin, L);
     
-    // Also check sphere
+    // Check sphere first
     let sphereCenter = vec3f(-0.8, -0.12, 0.5);
     let sphereRadius = 0.5;
     let sphereShadow = intersectSphere(shadowRayOrigin, L, sphereCenter, sphereRadius);
     
+    // Check mesh
+    let meshShadow = intersectMesh(shadowRayOrigin, L);
+    
     var shadowFactor = 1.0;
     
-    // If blocked by glass, create shadow
-    if ((meshShadow.w > 0.0 && meshShadow.w < (dist - 0.01)) ||
-        (sphereShadow.w > 0.0 && sphereShadow.w < (dist - 0.01))) {
-        shadowFactor = 0.15; // Soft shadow
+    // If we hit glass, we need to trace THROUGH it with refraction
+    // This is where caustics come from!
+    let hitGlass = (meshShadow.w > 0.0 && meshShadow.w < (dist - 0.01)) ||
+                   (sphereShadow.w > 0.0 && sphereShadow.w < (dist - 0.01));
+    
+    if (hitGlass) {
+        // Glass blocks direct light - it will be added via refracted paths
+        shadowFactor = 0.0;
     }
     
     // Warm white light color
@@ -190,6 +196,78 @@ fn spotLight(p: vec3f, n: vec3f) -> vec3f {
 fn sunLamp(d: vec3f) -> vec3f {
     // Disabled - using spotlight instead
     return vec3f(0.0);
+}
+
+fn traceShadowThroughGlass(origin: vec3f, dir: vec3f, maxDist: f32) -> f32 {
+    // Trace shadow ray through glass with refraction
+    // This creates caustics when wavelength-dependent refraction focuses light
+    
+    var pos = origin;
+    var direction = dir;
+    var transmittance = 1.0;
+    var traveled = 0.0;
+    
+    let sphereCenter = vec3f(-0.8, -0.12, 0.5);
+    let sphereRadius = 0.5;
+    
+    // Trace through glass (up to 2 refractions: enter and exit)
+    for (var i = 0; i < 2; i += 1) {
+        let meshHit = intersectMesh(pos, direction);
+        let sphereHit = intersectSphere(pos, direction, sphereCenter, sphereRadius);
+        
+        // Find closest hit
+        var hit = vec4f(0.0, 0.0, 0.0, -1.0);
+        if (meshHit.w > 0.0 && sphereHit.w > 0.0) {
+            hit = select(sphereHit, meshHit, meshHit.w < sphereHit.w);
+        } else if (meshHit.w > 0.0) {
+            hit = meshHit;
+        } else if (sphereHit.w > 0.0) {
+            hit = sphereHit;
+        }
+        
+        if (hit.w <= 0.0) {
+            // No more glass - check if we reached light
+            return select(0.0, transmittance, traveled < maxDist);
+        }
+        
+        traveled += hit.w;
+        if (traveled > maxDist) {
+            return 0.0;
+        }
+        
+        // Hit glass - refract through it
+        let hitPos = pos + direction * hit.w;
+        let nRaw = hit.xyz;
+        let entering = dot(direction, nRaw) < 0.0;
+        let n = select(-nRaw, nRaw, entering);
+        
+        // Use wavelength-dependent IOR for caustics!
+        // We don't have the wavelength here, so use a middle value
+        // The spectral path tracer will sample different wavelengths
+        let glassIor = 1.5;
+        let etaI = select(glassIor, 1.0, entering);
+        let etaT = select(1.0, glassIor, entering);
+        let eta = etaI / etaT;
+        
+        let cosI = clamp(dot(-direction, n), 0.0, 1.0);
+        let sin2T = eta * eta * (1.0 - cosI * cosI);
+        
+        if (sin2T > 1.0) {
+            return 0.0; // TIR blocks light
+        }
+        
+        let fresnel = schlick(cosI, etaI, etaT);
+        transmittance *= (1.0 - fresnel);
+        
+        direction = refract(direction, n, eta);
+        pos = hitPos + direction * 0.002;
+        
+        if (transmittance < 0.01) {
+            return 0.0;
+        }
+    }
+    
+    return select(0.0, transmittance, traveled < maxDist);
 }
 
 fn intersectAabb(ro: vec3f, invRd: vec3f, bmin: vec3f, bmax: vec3f, tMax: f32) -> bool {
@@ -410,57 +488,146 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
         }
         
         if (hitMat < -0.5) {
+            // Hit environment/sky
             radiance += throughput * sampleEnvironment(dir) * u.pan.x * spectralWeight;
+            
+            // Check if we hit the spotlight directly (caustics path!)
+            let spotPos = spotlightPosition();
+            let spotDir = spotlightDirection();
+            let spotIntensity = max(u.tdse.z, 0.0);
+            
+            if (spotIntensity > 0.0) {
+                // Check if we're looking at the light
+                let toSpot = spotPos - origin;
+                let distToSpot = length(toSpot);
+                let dirToSpot = normalize(toSpot);
+                
+                // Are we pointing at the light position?
+                let angleDiff = acos(clamp(dot(dir, dirToSpot), -1.0, 1.0));
+                let lightRadius = 0.3; // Larger light for easier caustic paths
+                
+                if (angleDiff < lightRadius / distToSpot) {
+                    // We hit the light! Check if it's in the spotlight cone
+                    let spotEffect = dot(-dirToSpot, spotDir);
+                    if (spotEffect > 0.75) {
+                        let spotAttenuation = smoothstep(0.75, 0.85, spotEffect);
+                        let distAttenuation = 1.0 / (1.0 + 0.1 * distToSpot + 0.01 * distToSpot * distToSpot);
+                        let lightColor = vec3f(1.0, 0.98, 0.95);
+                        
+                        // Add light emission - THIS IS THE CAUSTIC!
+                        radiance += throughput * lightColor * spotIntensity * spotAttenuation * distAttenuation * spectralWeight;
+                    }
+                }
+            }
+            
             break;
         }
 
         let n = select(-nRaw, nRaw, dot(dir, nRaw) < 0.0);
 
         if (hitMat < 0.5) {
-            // Ground material with basic lighting
+            // Ground material - DIFFUSE surface
+            // This is where we do Next Event Estimation (shadow ray to light)
             let base = vec3f(0.08, 0.08, 0.09);
             let albedo = vec3f(0.7, 0.72, 0.74);
-            
-            // Direct spotlight contribution (with shadow)
-            let spotContrib = spotLight(hitPos, n);
             
             // Ambient from sky
             let ambient = vec3f(0.3, 0.35, 0.4) * 0.2;
             
-            radiance += throughput * (base + albedo * (ambient + spotContrib)) * spectralWeight;
-            break;
-        }
-
-        let glassIor = snellIorForWavelength(lambdaNm, dispersion);
-        let entering = dot(dir, nRaw) < 0.0;
-        let etaI = select(glassIor, 1.0, entering);
-        let etaT = select(1.0, glassIor, entering);
-
-        let eta = etaI / etaT;
-        let cosI = clamp(dot(-dir, n), 0.0, 1.0);
-        let sin2T = eta * eta * (1.0 - cosI * cosI);
-        let cannotRefract = sin2T > 1.0;
-
-        let fresnel = select(schlick(cosI, etaI, etaT), 1.0, cannotRefract);
-        let r = hash13(vec3f(pixelJitter, f32(bounce) * 17.0 + u.render.x));
-
-        var nextDir = reflect(dir, n);
-        if (r > fresnel && !cannotRefract) {
-            nextDir = refract(dir, n, eta);
-            etaCurrent = etaT;
-        }
-
-        if (roughness > 0.0) {
-            let jitter = cosineHemisphere(nextDir, vec2f(
-                hash13(vec3f(hitPos.xy, f32(bounce) * 2.71 + 11.0)),
-                hash13(vec3f(hitPos.zy, f32(bounce) * 4.31 + 29.0))
+            // Next Event Estimation: sample the light directly
+            let spotPos = spotlightPosition();
+            let spotDir = spotlightDirection();
+            let spotIntensity = max(u.tdse.z, 0.0);
+            
+            var lightContrib = vec3f(0.0);
+            
+            if (spotIntensity > 0.0) {
+                let toLight = spotPos - hitPos;
+                let distToLight = length(toLight);
+                let L = normalize(toLight);
+                let ndotl = max(dot(n, L), 0.0);
+                
+                // Check spotlight cone
+                let spotEffect = dot(-L, spotDir);
+                let spotAttenuation = smoothstep(0.75, 0.85, spotEffect);
+                let distAttenuation = 1.0 / (1.0 + 0.1 * distToLight + 0.01 * distToLight * distToLight);
+                
+                // Shadow test - check for occlusion
+                let shadowOrigin = hitPos + L * 0.01;
+                let meshShadow = intersectMesh(shadowOrigin, L);
+                let sphereCenter = vec3f(-0.8, -0.12, 0.5);
+                let sphereRadius = 0.5;
+                let sphereShadow = intersectSphere(shadowOrigin, L, sphereCenter, sphereRadius);
+                
+                // If glass is in the way, light is blocked (no NEE through glass)
+                let blocked = (meshShadow.w > 0.0 && meshShadow.w < distToLight) ||
+                             (sphereShadow.w > 0.0 && sphereShadow.w < distToLight);
+                
+                if (!blocked) {
+                    // Direct light reaches ground
+                    let lightColor = vec3f(1.0, 0.98, 0.95);
+                    lightContrib = lightColor * spotIntensity * spotAttenuation * distAttenuation * ndotl;
+                }
+            }
+            
+            radiance += throughput * (base + albedo * (ambient + lightContrib)) * spectralWeight;
+            
+            // CONTINUE BOUNCING from ground (diffuse reflection)
+            // This allows paths like: Camera -> Ground -> Glass -> Light (caustics!)
+            let diffuseDir = cosineHemisphere(n, vec2f(
+                hash13(vec3f(hitPos.xy, f32(bounce) * 3.14)),
+                hash13(vec3f(hitPos.xz, f32(bounce) * 2.71))
             ));
-            nextDir = normalize(mix(nextDir, jitter, roughness));
+            
+            throughput *= albedo;
+            origin = hitPos + diffuseDir * 0.002;
+            dir = diffuseDir;
+            
+            // Continue to next bounce instead of breaking!
+        } else {
+            // Glass material - specular reflection/refraction
+            let glassIor = snellIorForWavelength(lambdaNm, dispersion);
+            let entering = dot(dir, nRaw) < 0.0;
+            let etaI = select(glassIor, 1.0, entering);
+            let etaT = select(1.0, glassIor, entering);
+
+            let eta = etaI / etaT;
+            let cosI = clamp(dot(-dir, n), 0.0, 1.0);
+            let sin2T = eta * eta * (1.0 - cosI * cosI);
+            let cannotRefract = sin2T > 1.0;
+
+            let fresnel = select(schlick(cosI, etaI, etaT), 1.0, cannotRefract);
+            let r = hash13(vec3f(pixelJitter, f32(bounce) * 17.0 + u.render.x));
+
+            var nextDir = reflect(dir, n);
+            if (r > fresnel && !cannotRefract) {
+                nextDir = refract(dir, n, eta);
+                etaCurrent = etaT;
+            }
+
+            if (roughness > 0.0) {
+                let jitter = cosineHemisphere(nextDir, vec2f(
+                    hash13(vec3f(hitPos.xy, f32(bounce) * 2.71 + 11.0)),
+                    hash13(vec3f(hitPos.zy, f32(bounce) * 4.31 + 29.0))
+                ));
+                nextDir = normalize(mix(nextDir, jitter, roughness));
+            }
+
+            throughput *= mix(vec3f(0.98), vec3f(1.0), vec3f(fresnel));
+            origin = hitPos + nextDir * 0.002;
+            dir = nextDir;
         }
 
-        throughput *= mix(vec3f(0.98), vec3f(1.0), vec3f(fresnel));
-        origin = hitPos + nextDir * 0.002;
-        dir = nextDir;
+        // Russian Roulette path termination (but keep going if throughput is high)
+        let maxThroughput = max(throughput.r, max(throughput.g, throughput.b));
+        if (bounce > 3 && maxThroughput < 0.1) {
+            let rrProb = maxThroughput;
+            let rrRand = hash13(vec3f(pixelJitter, f32(bounce) * 23.0 + u.render.x));
+            if (rrRand > rrProb) {
+                break;
+            }
+            throughput /= rrProb;
+        }
 
         if (max(throughput.r, max(throughput.g, throughput.b)) < 0.01) {
             break;
