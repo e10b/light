@@ -33,8 +33,15 @@ struct Tri {
 @group(0) @binding(6) var<storage, read_write> accumB: array<vec4f>;
 struct AccumParams { data: vec4f, };
 @group(0) @binding(7) var<uniform> accum: AccumParams;
+@group(0) @binding(8) var<storage, read_write> photonA: array<atomic<u32>>;
+struct PhotonParams { data: vec4f, };
+@group(0) @binding(9) var<uniform> photon: PhotonParams;
+@group(0) @binding(10) var<storage, read_write> photonB: array<atomic<u32>>;
 
 const PI: f32 = 3.14159265359;
+const GROUND_Y: f32 = -0.62;
+const PHOTON_MIN_XZ: vec2f = vec2f(-2.8, -2.8);
+const PHOTON_MAX_XZ: vec2f = vec2f(2.8, 2.8);
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
@@ -128,10 +135,15 @@ fn sunDirection() -> vec3f {
 }
 
 fn spotlightDirection() -> vec3f {
-    // Point the spotlight toward the center of the decanters
-    let spotPos = spotlightPosition();
-    let targetPos = vec3f(0.0, 0.2, 0.0); // Center of glass objects
-    return normalize(targetPos - spotPos);
+    // Rotation-controlled spotlight orientation.
+    let az = u.tdse.x;
+    let el = clamp(u.tdse.y, 0.001, 1.56);
+    let ce = cos(el);
+    return normalize(vec3f(
+        cos(az) * ce,
+        -sin(el),
+        sin(az) * ce
+    ));
 }
 
 fn spotlightPosition() -> vec3f {
@@ -433,6 +445,178 @@ fn cosineHemisphere(n: vec3f, seed: vec2f) -> vec3f {
     return normalize(t * x + b * y + n * z);
 }
 
+fn sampleConeDirection(axis: vec3f, seed: vec2f, coneCos: f32) -> vec3f {
+    let r1 = fract(seed.x);
+    let r2 = fract(seed.y);
+    let phi = 2.0 * PI * r2;
+    let cosTheta = mix(coneCos, 1.0, r1);
+    let sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+
+    let up = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), abs(axis.y) < 0.999);
+    let t = normalize(cross(up, axis));
+    let b = cross(axis, t);
+    return normalize(t * (cos(phi) * sinTheta) + b * (sin(phi) * sinTheta) + axis * cosTheta);
+}
+
+fn photonGridDims() -> vec2u {
+    return vec2u(
+        max(u32(photon.data.x + 0.5), 1u),
+        max(u32(photon.data.y + 0.5), 1u)
+    );
+}
+
+fn photonIndexFromXZ(xz: vec2f) -> i32 {
+    let dims = photonGridDims();
+    let span = PHOTON_MAX_XZ - PHOTON_MIN_XZ;
+    let uv = (xz - PHOTON_MIN_XZ) / span;
+    if (uv.x < 0.0 || uv.x >= 1.0 || uv.y < 0.0 || uv.y >= 1.0) {
+        return -1;
+    }
+    let ix = min(u32(uv.x * f32(dims.x)), dims.x - 1u);
+    let iy = min(u32(uv.y * f32(dims.y)), dims.y - 1u);
+    return i32(iy * dims.x + ix);
+}
+
+fn writePhoton(xz: vec2f, energy: f32) {
+    let idx = photonIndexFromXZ(xz);
+    if (idx < 0) {
+        return;
+    }
+    let quant = u32(clamp(energy * 4096.0, 0.0, 65535.0));
+    if (quant == 0u) {
+        return;
+    }
+    if (photon.data.z > 0.5) {
+        atomicAdd(&photonB[u32(idx)], quant);
+    } else {
+        atomicAdd(&photonA[u32(idx)], quant);
+    }
+}
+
+fn readPhoton(idx: u32) -> u32 {
+    if (photon.data.z > 0.5) {
+        return atomicLoad(&photonA[idx]);
+    }
+    return atomicLoad(&photonB[idx]);
+}
+
+fn samplePhotonGrid(xz: vec2f) -> f32 {
+    let dims = photonGridDims();
+    let span = PHOTON_MAX_XZ - PHOTON_MIN_XZ;
+    let uv = (xz - PHOTON_MIN_XZ) / span;
+    if (uv.x < 0.0 || uv.x >= 1.0 || uv.y < 0.0 || uv.y >= 1.0) {
+        return 0.0;
+    }
+
+    let gx = clamp(uv.x * f32(dims.x) - 0.5, 0.0, f32(dims.x) - 1.0);
+    let gy = clamp(uv.y * f32(dims.y) - 0.5, 0.0, f32(dims.y) - 1.0);
+    let ix = u32(gx);
+    let iy = u32(gy);
+    let ix1 = min(ix + 1u, dims.x - 1u);
+    let iy1 = min(iy + 1u, dims.y - 1u);
+    let fx = fract(gx);
+    let fy = fract(gy);
+
+    let i00 = iy * dims.x + ix;
+    let i10 = iy * dims.x + ix1;
+    let i01 = iy1 * dims.x + ix;
+    let i11 = iy1 * dims.x + ix1;
+
+    let p00 = f32(readPhoton(i00));
+    let p10 = f32(readPhoton(i10));
+    let p01 = f32(readPhoton(i01));
+    let p11 = f32(readPhoton(i11));
+
+    let a = mix(p00, p10, fx);
+    let b = mix(p01, p11, fx);
+    return mix(a, b, fy) * photon.data.w;
+}
+
+fn tracePhotonFromLight(seed: vec3f, lambdaNm: f32) {
+    var pos = spotlightPosition();
+    let spotAxis = spotlightDirection();
+    var direction = sampleConeDirection(spotAxis, vec2f(
+        hash13(seed + vec3f(0.13, 0.71, 1.11)),
+        hash13(seed + vec3f(0.47, 0.23, 2.73))
+    ), 0.85);
+
+    var power = 1.0;
+    var seenGlass = false;
+    let sphereCenter = vec3f(-0.8, -0.12, 0.5);
+    let sphereRadius = 0.5;
+
+    for (var step = 0; step < 10; step += 1) {
+        let meshHit = intersectMesh(pos, direction);
+        let sphereHit = intersectSphere(pos, direction, sphereCenter, sphereRadius);
+
+        let tGround = (GROUND_Y - pos.y) / direction.y;
+        let hitGround = tGround > 0.0005;
+        let hitMesh = meshHit.w > 0.0;
+        let hitSphere = sphereHit.w > 0.0;
+
+        var tClosest = 1e20;
+        var hitType = -1.0;
+        var nRaw = vec3f(0.0);
+
+        if (hitSphere && sphereHit.w < tClosest) {
+            tClosest = sphereHit.w;
+            hitType = 1.0;
+            nRaw = sphereHit.xyz;
+        }
+        if (hitMesh && meshHit.w < tClosest) {
+            tClosest = meshHit.w;
+            hitType = 1.0;
+            nRaw = meshHit.xyz;
+        }
+        if (hitGround && tGround < tClosest) {
+            tClosest = tGround;
+            hitType = 0.0;
+            nRaw = vec3f(0.0, 1.0, 0.0);
+        }
+
+        if (hitType < -0.5) {
+            break;
+        }
+
+        let hitPos = pos + direction * tClosest;
+        if (hitType < 0.5) {
+            if (seenGlass) {
+                writePhoton(hitPos.xz, power);
+            }
+            break;
+        }
+
+        seenGlass = true;
+        let n = select(-nRaw, nRaw, dot(direction, nRaw) < 0.0);
+        let glassIor = snellIorForWavelength(lambdaNm, clamp(u.orbital.z, 0.0, 0.2));
+        let entering = dot(direction, nRaw) < 0.0;
+        let etaI = select(glassIor, 1.0, entering);
+        let etaT = select(1.0, glassIor, entering);
+        let eta = etaI / etaT;
+
+        let cosI = clamp(dot(-direction, n), 0.0, 1.0);
+        let sin2T = eta * eta * (1.0 - cosI * cosI);
+        let cannotRefract = sin2T > 1.0;
+        let fresnel = select(schlick(cosI, etaI, etaT), 1.0, cannotRefract);
+        let r = hash13(seed + vec3f(f32(step) * 2.37, f32(step) * 0.91, u.render.x));
+
+        var nextDir = reflect(direction, n);
+        if (r > fresnel && !cannotRefract) {
+            nextDir = refract(direction, n, eta);
+            power *= 0.985;
+        } else {
+            power *= 0.96;
+        }
+
+        if (power < 0.01) {
+            break;
+        }
+
+        pos = hitPos + nextDir * 0.002;
+        direction = nextDir;
+    }
+}
+
 fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
     var origin = ro;
     var dir = rd;
@@ -443,6 +627,9 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
     let roughness = clamp(u.orbital.w, 0.0, 0.2);
     let dispersion = clamp(u.orbital.z, 0.0, 0.2);
     let spectralWeight = wavelengthToRgb(lambdaNm);
+
+    // Light-traced pass: emit photons from the spotlight into a floor grid.
+    tracePhotonFromLight(vec3f(pixelJitter, u.render.x), lambdaNm);
 
     var etaCurrent = 1.0;
 
@@ -569,8 +756,12 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
                     lightContrib = lightColor * spotIntensity * spotAttenuation * distAttenuation * ndotl;
                 }
             }
+
+            // Photon-map caustics from light-traced paths through glass.
+            let photonDensity = samplePhotonGrid(hitPos.xz);
+            let causticColor = vec3f(1.0, 0.98, 0.95) * photonDensity * max(u.tdse.z, 0.0);
             
-            radiance += throughput * (base + albedo * (ambient + lightContrib)) * spectralWeight;
+            radiance += throughput * (base + albedo * (ambient + lightContrib + causticColor)) * spectralWeight;
             
             // CONTINUE BOUNCING from ground (diffuse reflection)
             // This allows paths like: Camera -> Ground -> Glass -> Light (caustics!)
