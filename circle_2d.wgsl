@@ -449,7 +449,7 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
     for (var bounce = 0; bounce < maxBounces; bounce += 1) {
         let meshHit = intersectMesh(origin, dir);
         
-        // Add glass sphere at position (-0.8, -0.12, 0.5) with radius 0.5
+        // Add glass sphere at position on the ground
         let sphereCenter = vec3f(-0.8, -0.12, 0.5);
         let sphereRadius = 0.5;
         let sphereHit = intersectSphere(origin, dir, sphereCenter, sphereRadius);
@@ -529,7 +529,7 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
             // Ground material - DIFFUSE surface
             // This is where we do Next Event Estimation (shadow ray to light)
             let base = vec3f(0.08, 0.08, 0.09);
-            let albedo = vec3f(0.7, 0.72, 0.74);
+            let albedo = vec3f(0.85, 0.85, 0.85);  // More reflective for brighter caustics
             
             // Ambient from sky
             let ambient = vec3f(0.3, 0.35, 0.4) * 0.2;
@@ -579,7 +579,7 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
                 hash13(vec3f(hitPos.xz, f32(bounce) * 2.71))
             ));
             
-            throughput *= albedo;
+            throughput *= albedo * 3.0; // Boost to make caustics more visible
             origin = hitPos + diffuseDir * 0.002;
             dir = diffuseDir;
             
