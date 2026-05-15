@@ -27,63 +27,23 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4f {
-    let n = max(1, i32(round(u.orbital.x)));
-    let lRaw = i32(round(u.orbital.y));
-    let l = clamp(lRaw, 0, n - 1);
-    let mRaw = i32(round(u.orbital.z));
-    let m = clamp(mRaw, -l, l);
-    let colorMode = i32(round(u.orbital.w));
-    let intensityScale = max(u.tuning.x, 0.0001);
-    let intensityRange = max(u.tuning.y, 0.0001);
-    let zoom = max(u.tuning.z, 0.0001);
-    let thickness = max(u.tuning.w, 0.01);
+    let circleColor = clamp(u.orbital.xyz, vec3f(0.0), vec3f(1.0));
+    let background = clamp(u.orbital.w, 0.0, 1.0);
+    let radius = clamp(u.tuning.x, 0.001, 2.0);
+    let softness = max(u.tuning.y, 0.0001);
+    let glow = max(u.tuning.z, 0.0);
     let aspect = max(u.render.y, 0.0001);
-    let phaseSpeed = u.render.z;
-    let sliceZ = u.pan.z;
-    let integrateDepth = u.pan.w > 0.5;
-    let time = u.render.x;
+    let center = u.pan.xy;
 
     var uv = input.uv;
     uv.x *= aspect;
-    uv /= zoom;
-    uv -= u.pan.xy;
-
-    var bright = 0.0;
-    var color = vec3f(0.0, 0.0, 0.0);
-
-    if (!integrateDepth) {
-        // Exact 2D slice through the same 3D analytic orbital field.
-        bright = intensityAt(vec3f(uv.x, uv.y, sliceZ), n, l, m, intensityScale, intensityRange);
-    } else {
-        var accum = 0.0;
-        var maxSample = 0.0;
-        let steps = 72;
-        let dz = (2.0 * thickness) / f32(steps);
-        var i = 0;
-        loop {
-            if (i >= steps) {
-                break;
-            }
-            let z = sliceZ - thickness + (f32(i) + 0.5) * dz;
-            let p = vec3f(uv.x, uv.y, z);
-            let s = intensityAt(p, n, l, m, intensityScale, intensityRange);
-            accum += s;
-            maxSample = max(maxSample, s);
-            i += 1;
-        }
-        let integrated = accum / f32(steps);
-        bright = clamp(0.3 * maxSample + 1.5 * integrated, 0.0, 1.0);
-    }
-
-    let r = length(vec3f(uv.x, uv.y, 0.0));
-    let safeR = max(r, 0.02);
-    let safeSin = max(abs(sin(acos(clamp(0.0 / safeR, -1.0, 1.0)))), 0.08);
-    let omega = f32(m) / (safeR * safeSin);
-    color = mapColor(bright, colorMode, vec3f(uv.x, uv.y, 0.0), time * phaseSpeed, n, m, omega);
-
-    let bg = vec3f(0.01, 0.01, 0.02);
-
-    return vec4f(mix(bg, color, bright), 1.0);
+    let d = length(uv - center);
+    let edge = 1.0 - smoothstep(radius - softness, radius + softness, d);
+    let halo = exp(-max(d - radius, 0.0) * (16.0 / max(softness, 0.002))) * glow;
+    let alpha = clamp(edge + halo, 0.0, 1.0);
+    let bg = vec3f(background);
+    let color = mix(bg, circleColor, alpha);
+    return vec4f(color, 1.0);
 }
 
 fn associatedLaguerre(k: i32, alpha: i32, x: f32) -> f32 {
