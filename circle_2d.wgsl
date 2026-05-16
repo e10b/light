@@ -78,12 +78,81 @@ fn wavelengthToRgb(lambdaNm: f32) -> vec3f {
     return clamp(vec3f(r, g, b), vec3f(0.0), vec3f(1.0));
 }
 
+fn preethamPerez(cosTheta: f32, gamma: f32, cosGamma: f32, a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {
+    let ct = max(cosTheta, 0.01);
+    return (1.0 + a * exp(b / ct)) * (1.0 + c * exp(d * gamma) + e * cosGamma * cosGamma);
+}
+
+fn xyzToSrgb(xyz: vec3f) -> vec3f {
+    let rgb = mat3x3f(
+        3.2406, -0.9689,  0.0557,
+       -1.5372,  1.8758, -0.2040,
+       -0.4986,  0.0415,  1.0570
+    ) * xyz;
+    return max(rgb, vec3f(0.0));
+}
+
 fn envSky(d: vec3f) -> vec3f {
-    // Simple blue sky gradient - darker at horizon, lighter at zenith
-    let t = clamp(0.5 * (d.y + 1.0), 0.0, 1.0);
-    let horizon = vec3f(0.4, 0.6, 0.9);  // Light blue at horizon
-    let zenith = vec3f(0.2, 0.4, 0.8);   // Deeper blue at top
-    return mix(horizon, zenith, pow(t, 0.8));
+    let dir = normalize(d);
+    let up = vec3f(0.0, 1.0, 0.0);
+    let sunDir = sunDirection();
+    let cosTheta = clamp(dot(dir, up), 0.0, 1.0);
+    let theta = acos(clamp(cosTheta, 0.0, 1.0));
+    let cosThetaS = clamp(dot(sunDir, up), 0.001, 1.0);
+    let thetaS = acos(cosThetaS);
+    let cosGamma = clamp(dot(dir, sunDir), -1.0, 1.0);
+    let gamma = acos(cosGamma);
+
+    let T = 3.0;
+    let T2 = T * T;
+
+    let Ay = 0.1787 * T - 1.4630;
+    let By = -0.3554 * T + 0.4275;
+    let Cy = -0.0227 * T + 5.3251;
+    let Dy = 0.1206 * T - 2.5771;
+    let Ey = -0.0670 * T + 0.3703;
+
+    let Ax = -0.0193 * T - 0.2592;
+    let Bx = -0.0665 * T + 0.0008;
+    let Cx = -0.0004 * T + 0.2125;
+    let Dx = -0.0641 * T - 0.8989;
+    let Ex = -0.0033 * T + 0.0452;
+
+    let Az = -0.0167 * T - 0.2608;
+    let Bz = -0.0950 * T + 0.0092;
+    let Cz = -0.0079 * T + 0.2102;
+    let Dz = -0.0441 * T - 1.6537;
+    let Ez = -0.0109 * T + 0.0529;
+
+    let chi = (4.0 / 9.0 - T / 120.0) * (PI - 2.0 * thetaS);
+    let Yz = (4.0453 * T - 4.9710) * tan(chi) - 0.2155 * T + 2.4192;
+    let xz = (0.00165 * thetaS * thetaS * thetaS - 0.00374 * thetaS * thetaS + 0.00208 * thetaS) * T2 +
+             (-0.02902 * thetaS * thetaS * thetaS + 0.06377 * thetaS * thetaS - 0.03202 * thetaS + 0.00394) * T +
+             (0.11693 * thetaS * thetaS * thetaS - 0.21196 * thetaS * thetaS + 0.06052 * thetaS + 0.25886);
+    let yz = (0.00275 * thetaS * thetaS * thetaS - 0.00610 * thetaS * thetaS + 0.00316 * thetaS) * T2 +
+             (-0.04214 * thetaS * thetaS * thetaS + 0.08970 * thetaS * thetaS - 0.04153 * thetaS + 0.00515) * T +
+             (0.15346 * thetaS * thetaS * thetaS - 0.26756 * thetaS * thetaS + 0.06669 * thetaS + 0.26688);
+
+    let FyThetaGamma = preethamPerez(cosTheta, gamma, cosGamma, Ay, By, Cy, Dy, Ey);
+    let FxThetaGamma = preethamPerez(cosTheta, gamma, cosGamma, Ax, Bx, Cx, Dx, Ex);
+    let FzThetaGamma = preethamPerez(cosTheta, gamma, cosGamma, Az, Bz, Cz, Dz, Ez);
+
+    let FySun = preethamPerez(cosThetaS, 0.0, 1.0, Ay, By, Cy, Dy, Ey);
+    let FxSun = preethamPerez(cosThetaS, 0.0, 1.0, Ax, Bx, Cx, Dx, Ex);
+    let FzSun = preethamPerez(cosThetaS, 0.0, 1.0, Az, Bz, Cz, Dz, Ez);
+
+    let Y = max(Yz * FyThetaGamma / max(FySun, 1e-4), 0.0);
+    let x = clamp(xz * FxThetaGamma / max(FxSun, 1e-4), 0.001, 0.999);
+    let y = clamp(yz * FzThetaGamma / max(FzSun, 1e-4), 0.001, 0.999);
+
+    let X = (x / y) * Y;
+    let Z = ((1.0 - x - y) / y) * Y;
+    var sky = xyzToSrgb(vec3f(X, Y, Z)) * 0.12;
+
+    let sunCos = cos(0.53 * PI / 180.0 * 0.5);
+    let sunDisk = smoothstep(sunCos - 0.0008, sunCos + 0.0002, cosGamma);
+    sky += vec3f(1.0, 0.98, 0.93) * sunDisk * max(u.tdse.z, 0.0) * 0.4;
+    return sky;
 }
 
 fn envSunset(d: vec3f) -> vec3f {
@@ -547,16 +616,20 @@ fn samplePhotonGrid(xz: vec2f) -> vec3f {
 
     let a = mix(p00, p10, fx);
     let b = mix(p01, p11, fx);
+
     return mix(a, b, fy) * photon.data.w;
 }
 
 fn tracePhotonFromLight(seed: vec3f, lambdaNm: f32) {
-    var pos = spotlightPosition();
-    let spotAxis = spotlightDirection();
-    var direction = sampleConeDirection(spotAxis, vec2f(
-        hash13(seed + vec3f(0.13, 0.71, 1.11)),
-        hash13(seed + vec3f(0.47, 0.23, 2.73))
-    ), 0.85);
+    let sunAxis = -sunDirection();
+    let upRef = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), abs(sunAxis.y) < 0.95);
+    let basisX = normalize(cross(upRef, sunAxis));
+    let basisY = normalize(cross(sunAxis, basisX));
+    let u0 = hash13(seed + vec3f(0.13, 0.71, 1.11));
+    let v0 = hash13(seed + vec3f(0.47, 0.23, 2.73));
+    let span = 3.2;
+    var pos = vec3f(0.0, 1.4, 0.2) - sunAxis * 5.5 + basisX * mix(-span, span, u0) + basisY * mix(-span, span, v0);
+    var direction = sunAxis;
 
     var power = 1.0;
     let spectralColor = wavelengthToRgb(lambdaNm);
@@ -647,7 +720,7 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
     let dispersion = clamp(u.orbital.z, 0.0, 0.2);
     let spectralWeight = wavelengthToRgb(lambdaNm);
 
-    // Light-traced pass: emit spectral photons from the spotlight into a floor grid.
+    // Light-traced pass: emit spectral photons from directional sun into a floor grid.
     let photonRaysPerSample = 4;
     for (var pi = 0; pi < photonRaysPerSample; pi += 1) {
         let pf = f32(pi);
@@ -706,36 +779,6 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
         if (hitMat < -0.5) {
             // Hit environment/sky
             radiance += throughput * sampleEnvironment(dir) * u.pan.x * spectralWeight;
-            
-            // Check if we hit the spotlight directly (caustics path!)
-            let spotPos = spotlightPosition();
-            let spotDir = spotlightDirection();
-            let spotIntensity = max(u.tdse.z, 0.0);
-            
-            if (spotIntensity > 0.0) {
-                // Check if we're looking at the light
-                let toSpot = spotPos - origin;
-                let distToSpot = length(toSpot);
-                let dirToSpot = normalize(toSpot);
-                
-                // Are we pointing at the light position?
-                let angleDiff = acos(clamp(dot(dir, dirToSpot), -1.0, 1.0));
-                let lightRadius = 0.3; // Larger light for easier caustic paths
-                
-                if (angleDiff < lightRadius / distToSpot) {
-                    // We hit the light! Check if it's in the spotlight cone
-                    let spotEffect = dot(-dirToSpot, spotDir);
-                    if (spotEffect > 0.75) {
-                        let spotAttenuation = smoothstep(0.75, 0.85, spotEffect);
-                        let distAttenuation = 1.0 / (1.0 + 0.1 * distToSpot + 0.01 * distToSpot * distToSpot);
-                        let lightColor = vec3f(1.0, 0.98, 0.95);
-                        
-                        // Add light emission - THIS IS THE CAUSTIC!
-                        radiance += throughput * lightColor * spotIntensity * spotAttenuation * distAttenuation * spectralWeight;
-                    }
-                }
-            }
-            
             break;
         }
 
@@ -750,39 +793,29 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
             // Ambient from sky
             let ambient = vec3f(0.3, 0.35, 0.4) * 0.2;
             
-            // Next Event Estimation: sample the light directly
-            let spotPos = spotlightPosition();
-            let spotDir = spotlightDirection();
-            let spotIntensity = max(u.tdse.z, 0.0);
+            // Next Event Estimation: sample directional sun directly
+            let sunDir = sunDirection();
+            let sunIntensity = max(u.tdse.z, 0.0);
             
             var lightContrib = vec3f(0.0);
             
-            if (spotIntensity > 0.0) {
-                let toLight = spotPos - hitPos;
-                let distToLight = length(toLight);
-                let L = normalize(toLight);
+            if (sunIntensity > 0.0) {
+                let L = sunDir;
                 let ndotl = max(dot(n, L), 0.0);
-                
-                // Check spotlight cone
-                let spotEffect = dot(-L, spotDir);
-                let spotAttenuation = smoothstep(0.75, 0.85, spotEffect);
-                let distAttenuation = 1.0 / (1.0 + 0.1 * distToLight + 0.01 * distToLight * distToLight);
-                
-                // Shadow test - check for occlusion
+
+                // Shadow test along sun direction (infinite directional light)
                 let shadowOrigin = hitPos + L * 0.01;
                 let meshShadow = intersectMesh(shadowOrigin, L);
                 let sphereCenter = vec3f(-0.8, -0.12, 0.5);
                 let sphereRadius = 0.5;
                 let sphereShadow = intersectSphere(shadowOrigin, L, sphereCenter, sphereRadius);
-                
-                // If glass is in the way, light is blocked (no NEE through glass)
-                let blocked = (meshShadow.w > 0.0 && meshShadow.w < distToLight) ||
-                             (sphereShadow.w > 0.0 && sphereShadow.w < distToLight);
-                
+
+                // If glass is in the way, direct sun is blocked.
+                let blocked = (meshShadow.w > 0.0) || (sphereShadow.w > 0.0);
+
                 if (!blocked) {
-                    // Direct light reaches ground
                     let lightColor = vec3f(1.0, 0.98, 0.95);
-                    lightContrib = lightColor * spotIntensity * spotAttenuation * distAttenuation * ndotl;
+                    lightContrib = lightColor * sunIntensity * ndotl;
                 }
             }
 
@@ -799,7 +832,7 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
                 hash13(vec3f(hitPos.xz, f32(bounce) * 2.71))
             ));
             
-            throughput *= albedo * 3.0; // Boost to make caustics more visible
+            throughput *= albedo;
             origin = hitPos + diffuseDir * 0.002;
             dir = diffuseDir;
             
