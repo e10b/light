@@ -6,6 +6,7 @@ struct Uniforms {
   light_pos: vec4<f32>,
   sphere_pos: vec4<f32>,
   sphere_color: vec4<f32>,
+  mesh_center: vec4<f32>,
   sun_intensity: f32,
   frame: u32,
   render_width: u32,
@@ -20,6 +21,26 @@ var acc_struct: acceleration_structure;
 
 @group(0) @binding(2)
 var<storage, read_write> accum: array<vec4<f32>>;
+
+@group(0) @binding(3)
+var<storage, read> mesh_positions: array<vec4<f32>>;
+
+@group(0) @binding(4)
+var<storage, read> mesh_normals: array<vec4<f32>>;
+
+@group(0) @binding(5)
+var<storage, read> mesh_indices: array<u32>;
+
+@group(0) @binding(6)
+var<storage, read> mesh_triangle_material: array<u32>;
+
+struct MaterialData {
+  base_color: vec4<f32>,
+  params: vec4<f32>, // metallic, roughness, transmission, ior
+}
+
+@group(0) @binding(7)
+var<storage, read> materials: array<MaterialData>;
 
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
@@ -122,6 +143,28 @@ fn randu(seed: u32) -> u32 {
   return hash(seed);
 }
 
+fn rand01(seed: u32) -> f32 {
+  return f32(randu(seed) & 0x00FFFFFFu) / 16777215.0;
+}
+
+fn wl(lambda_nm: f32) -> vec3<f32> {
+  let t = clamp((lambda_nm - 380.0) / 400.0, 0.0, 1.0);
+  let r = smoothstep(0.45, 0.85, t) + (1.0 - smoothstep(0.0, 0.15, t)) * 0.35;
+  let g = smoothstep(0.1, 0.45, t) * (1.0 - smoothstep(0.65, 0.9, t));
+  let b = (1.0 - smoothstep(0.2, 0.55, t)) + smoothstep(0.88, 1.0, t) * 0.2;
+  return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn snell_ior_for_wavelength(lambda_nm: f32, dispersion: f32) -> f32 {
+  let x = (lambda_nm - 550.0) / 170.0;
+  return 1.5 + dispersion * (-x + 0.2 * x * x);
+}
+
+fn schlick(cos_theta: f32, eta_i: f32, eta_t: f32) -> f32 {
+  let r0 = pow((eta_i - eta_t) / (eta_i + eta_t), 2.0);
+  return r0 + (1.0 - r0) * pow(1.0 - cos_theta, 5.0);
+}
+
 // Ground plane at y = -1.5
 fn ground_plane_intersection(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   let ground_y = -1.5;
@@ -152,13 +195,15 @@ fn sphere_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f
 }
 
 fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32> {
-  // Path tracing loop (cosine-weighted hemisphere sampling)
   var L = vec3<f32>(0.0);
   var throughput = vec3<f32>(1.0);
   var rng_seed = seed_in;
+  let lambda_nm = 380.0 + 400.0 * rand01(seed_in ^ 0x9e3779b9u);
+  let spectral_weight = wl(lambda_nm);
+  let dispersion = 0.12;
   var ro = origin;
   var rd = direction;
-  let max_bounces = 4u;
+  let max_bounces = 16u;
   var bounce: u32 = 0u;
   loop {
     if (bounce >= max_bounces) { break; }
@@ -201,8 +246,8 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
 
     if (hit_type == 0u) {
-      // Miss -> add environment
-      L = L + throughput * sky(rd);
+      // Miss -> environment/sun in spectral space
+      L = L + throughput * sky(rd) * spectral_weight;
       break;
     }
 
@@ -212,15 +257,42 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var albedo = vec3<f32>(0.8);
 
+    var metallic = 0.0;
+    var roughness = 0.2;
+    var transmission = 0.0;
+    var ior = 1.5;
+
     if (hit_type == 1u) {
-      // Sphere
+      // Sphere: allow glass behavior via sphere_color.w toggle
       normal = normalize(hit_pos - sphere_center);
-      albedo = uniforms.sphere_color.xyz;
+      albedo = max(uniforms.sphere_color.xyz, vec3<f32>(0.001));
+      metallic = 0.0;
+      roughness = 0.0025;
+      transmission = clamp(uniforms.sphere_color.w, 0.0, 1.0);
+      ior = 1.52;
     } else if (hit_type == 2u) {
-      // Mesh hit: use a stable pseudo-normal to avoid view-dependent flips/acne.
-      // We don't have per-triangle normals in this path, so orient opposite the ray.
-      normal = normalize(-rd);
-      albedo = vec3<f32>(0.8);
+      // True triangle normal/material from ray-query primitive + barycentrics.
+      let prim = tri_hit.primitive_index;
+      let i0 = mesh_indices[prim * 3u + 0u];
+      let i1 = mesh_indices[prim * 3u + 1u];
+      let i2 = mesh_indices[prim * 3u + 2u];
+      let bary = tri_hit.barycentrics;
+      let w = 1.0 - bary.x - bary.y;
+      let n0 = mesh_normals[i0].xyz;
+      let n1 = mesh_normals[i1].xyz;
+      let n2 = mesh_normals[i2].xyz;
+      normal = normalize(n0 * w + n1 * bary.x + n2 * bary.y);
+      let mid = mesh_triangle_material[prim];
+      let m = materials[mid];
+      albedo = m.base_color.rgb;
+      metallic = clamp(m.params.x, 0.0, 1.0);
+      roughness = clamp(m.params.y, 0.001, 1.0);
+      transmission = clamp(m.params.z, 0.0, 1.0);
+      ior = max(m.params.w, 1.0);
+      // Decanter path: force true dielectric behavior even when source material metadata is weak.
+      transmission = max(transmission, 0.98);
+      roughness = min(roughness, 0.003);
+      albedo = mix(albedo, vec3<f32>(1.0), 0.85);
     } else {
       // Ground
       normal = vec3<f32>(0.0, 1.0, 0.0);
@@ -229,12 +301,15 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       let grid_z = i32(floor(hit_pos.z / grid_scale)) & 1;
       let is_white = (grid_x ^ grid_z) == 0;
       albedo = select(vec3<f32>(0.3), vec3<f32>(0.7), is_white);
+      metallic = 0.0;
+      roughness = 0.9;
+      transmission = 0.0;
+      ior = 1.0;
     }
 
-    // Directional sun lamp
+    // Direct sun term / shadow
     let sun_dir = normalize(uniforms.light_pos.xyz);
     let to_light = sun_dir;
-    // Shadow test
     var shadow_rq: ray_query;
     let shadow_origin = hit_pos + normal * 0.02;
     rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, 10000.0, shadow_origin, to_light));
@@ -247,43 +322,64 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       uniforms.sphere_pos.w,
     );
     let visible = (shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (sphere_shadow_t >= 1e37);
-    if (visible) {
+    if (visible && transmission < 0.5) {
       let nl = max(dot(normal, to_light), 0.0);
-      let sun_color = vec3<f32>(1.0, 0.98, 0.93);
-      L = L + throughput * sun_color * nl * uniforms.sun_intensity;
+      let base = select(vec3<f32>(0.08), vec3<f32>(0.05), hit_type == 1u);
+      let sun_color = vec3<f32>(1.0, 0.94, 0.82);
+      L = L + throughput * (base + albedo * sun_color * nl * uniforms.sun_intensity) * spectral_weight;
+      break;
     }
 
-    // Multiply throughput by albedo and cosine
-    // Sample new direction: cosine-weighted hemisphere
-    rng_seed = randu(rng_seed);
-    let r1 = f32(rng_seed & 0x00FFFFFFu) / 16777215.0;
-    rng_seed = randu(rng_seed + 1u);
-    let r2 = f32(rng_seed & 0x00FFFFFFu) / 16777215.0;
-    rng_seed = rng_seed + u32(bounce) * 9781u;
-    let phi = 2.0 * 3.141592653589793 * r1;
-    let cos_theta = sqrt(1.0 - r2);
-    let sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
-    let local_dir = vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+    if (hit_type == 2u || transmission >= 0.5) {
+      // Spectral glass transport (faithful style to main branch)
+      let entering = dot(rd, normal) < 0.0;
+      let n = select(-normal, normal, entering);
+      let local_dispersion = select(dispersion, 0.08, hit_type == 1u);
+      let glass_ior = ior + (snell_ior_for_wavelength(lambda_nm, local_dispersion) - 1.5);
+      let eta_i = select(glass_ior, 1.0, entering);
+      let eta_t = select(1.0, glass_ior, entering);
+      let eta = eta_i / eta_t;
+      let cos_i = clamp(dot(-rd, n), 0.0, 1.0);
+      let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
+      let tir = sin2_t > 1.0;
+      let fresnel = select(schlick(cos_i, eta_i, eta_t), 1.0, tir);
+      let choose = rand01(rng_seed ^ (0xa511e9b3u + bounce * 977u));
+      let next_dir = select(refract(rd, n, eta), reflect(rd, n), choose < fresnel || tir);
+      if (roughness > 0.0) {
+        let j = normalize(
+          n + vec3<f32>(
+            rand01(rng_seed ^ (bounce * 1231u + 11u)),
+            rand01(rng_seed ^ (bounce * 1867u + 17u)),
+            rand01(rng_seed ^ (bounce * 2017u + 23u))
+          ) * 2.0 - 1.0
+        );
+        rd = normalize(mix(next_dir, j, roughness));
+      } else {
+        rd = normalize(next_dir);
+      }
+      throughput *= mix(albedo * 0.985, vec3<f32>(1.0), vec3<f32>(fresnel));
+      rng_seed = randu(rng_seed + bounce * 26699u);
+      ro = hit_pos + rd * 0.002;
+      if (max(max(throughput.x, throughput.y), throughput.z) < 0.01) { break; }
+      continue;
+    }
 
-    // Build TBN
-    var up = vec3<f32>(0.0, 1.0, 0.0);
-    if (abs(normal.y) >= 0.999) { up = vec3<f32>(1.0, 0.0, 0.0); }
-    let tangent = normalize(cross(up, normal));
-    let bitangent = cross(normal, tangent);
-    let new_dir = normalize(tangent * local_dir.x + bitangent * local_dir.y + normal * local_dir.z);
+    // If diffuse surface is shadowed, keep only small ambient and terminate.
+    if (transmission < 0.5) {
+      L = L + throughput * (vec3<f32>(0.04) * albedo) * spectral_weight;
+      break;
+    }
 
+    // Fallback (shouldn't hit with current material split)
     throughput = throughput * albedo;
-    // Russian roulette
     if (bounce > 2u) {
       let p = max(max(throughput.x, throughput.y), throughput.z);
       rng_seed = randu(rng_seed + 7u);
-      if (f32(rng_seed & 0x00FFFFFFu) / 16777215.0 > p) { break; }
-      throughput = throughput * (1.0 / p);
+      if (rand01(rng_seed) > p) { break; }
+      throughput = throughput * (1.0 / max(p, 1e-4));
     }
-
-    // Setup next ray
     ro = hit_pos + normal * 0.001;
-    rd = new_dir;
+    rd = normalize(reflect(rd, normal));
   }
 
   return L;

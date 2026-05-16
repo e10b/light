@@ -13,23 +13,91 @@ struct Vertex {
     position: [f32; 3],
 }
 
-fn load_gltf_mesh(path: &Path) -> Result<(Vec<Vertex>, Vec<u32>), Box<dyn std::error::Error>> {
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuMaterial {
+    base_color: [f32; 4],
+    params: [f32; 4], // metallic, roughness, transmission, ior
+}
+
+struct MeshData {
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    positions4: Vec<[f32; 4]>,
+    normals4: Vec<[f32; 4]>,
+    triangle_material_ids: Vec<u32>,
+    materials: Vec<GpuMaterial>,
+}
+
+fn load_gltf_mesh(path: &Path) -> Result<MeshData, Box<dyn std::error::Error>> {
     let (document, buffers, _images) = gltf::import(path)?;
 
     let mut all_vertices = Vec::new();
     let mut all_indices = Vec::new();
+    let mut all_positions4 = Vec::new();
+    let mut all_normals = Vec::new();
+    let mut all_triangle_material_ids = Vec::new();
+
+    let mut materials = Vec::new();
+    let mut any_likely_glass = false;
+    for mat in document.materials() {
+        let pbr = mat.pbr_metallic_roughness();
+        let base_color = pbr.base_color_factor();
+        let metallic = pbr.metallic_factor();
+        let roughness = pbr.roughness_factor();
+        let mat_name = mat.name().unwrap_or("").to_ascii_lowercase();
+        let looks_glass = mat_name.contains("glass") || mat_name.contains("decanter");
+        let transmission = if looks_glass || base_color[3] < 0.99 { 1.0 } else { 0.0 };
+        if transmission > 0.5 {
+            any_likely_glass = true;
+        }
+        let ior = if transmission > 0.0 { 1.52 } else { 1.0 };
+        materials.push(GpuMaterial {
+            base_color,
+            params: [metallic, roughness.max(0.02), transmission, ior],
+        });
+    }
+    if materials.is_empty() {
+        materials.push(GpuMaterial {
+            base_color: [1.0, 1.0, 1.0, 1.0],
+            params: [0.0, 0.03, 1.0, 1.52],
+        });
+        any_likely_glass = true;
+    }
+    if !any_likely_glass {
+        // Fallback for assets that omit helpful naming/alpha cues: keep decanter-like meshes transmissive.
+        for m in &mut materials {
+            m.params[2] = 1.0; // transmission
+            m.params[3] = 1.52; // ior
+            m.params[1] = m.params[1].min(0.08).max(0.01); // roughness
+        }
+    }
 
     for mesh in document.meshes() {
         for primitive in mesh.primitives() {
             let reader = primitive.reader(|buffer_index| Some(&buffers[buffer_index.index()]));
 
             let start_vertex = all_vertices.len() as u32;
-            let mut local_vertex_count = 0u32;
+            let mut local_positions: Vec<[f32; 3]> = Vec::new();
+            let mut local_indices: Vec<u32> = Vec::new();
 
             if let Some(iter) = reader.read_positions() {
                 for pos in iter {
-                    all_vertices.push(Vertex { position: pos });
-                    local_vertex_count += 1;
+                    local_positions.push(pos);
+                }
+            }
+            let local_vertex_count = local_positions.len() as u32;
+            for pos in &local_positions {
+                all_vertices.push(Vertex { position: *pos });
+                all_positions4.push([pos[0], pos[1], pos[2], 0.0]);
+            }
+
+            let mut local_normals = vec![[0.0f32; 3]; local_positions.len()];
+            if let Some(iter) = reader.read_normals() {
+                for (i, n) in iter.enumerate() {
+                    if i < local_normals.len() {
+                        local_normals[i] = n;
+                    }
                 }
             }
 
@@ -37,29 +105,70 @@ fn load_gltf_mesh(path: &Path) -> Result<(Vec<Vertex>, Vec<u32>), Box<dyn std::e
                 match iter {
                     gltf::mesh::util::ReadIndices::U32(idx_iter) => {
                         for idx in idx_iter {
-                            all_indices.push(start_vertex + idx);
+                            local_indices.push(idx);
                         }
                     }
                     gltf::mesh::util::ReadIndices::U16(idx_iter) => {
                         for idx in idx_iter {
-                            all_indices.push(start_vertex + idx as u32);
+                            local_indices.push(idx as u32);
                         }
                     }
                     gltf::mesh::util::ReadIndices::U8(idx_iter) => {
                         for idx in idx_iter {
-                            all_indices.push(start_vertex + idx as u32);
+                            local_indices.push(idx as u32);
                         }
                     }
                 }
             } else {
                 for idx in 0..local_vertex_count {
-                    all_indices.push(start_vertex + idx);
+                    local_indices.push(idx);
                 }
+            }
+
+            if reader.read_normals().is_none() {
+                for tri in local_indices.chunks_exact(3) {
+                    let i0 = tri[0] as usize;
+                    let i1 = tri[1] as usize;
+                    let i2 = tri[2] as usize;
+                    if i0 < local_positions.len() && i1 < local_positions.len() && i2 < local_positions.len() {
+                        let p0 = glam::Vec3::from(local_positions[i0]);
+                        let p1 = glam::Vec3::from(local_positions[i1]);
+                        let p2 = glam::Vec3::from(local_positions[i2]);
+                        let fnorm = (p1 - p0).cross(p2 - p0);
+                        if fnorm.length_squared() > 1e-20 {
+                            let n = fnorm.normalize();
+                            for idx in [i0, i1, i2] {
+                                let old = glam::Vec3::from(local_normals[idx]);
+                                let sum = old + n;
+                                local_normals[idx] = sum.to_array();
+                            }
+                        }
+                    }
+                }
+            }
+            for n in &local_normals {
+                let nn = glam::Vec3::from(*n).normalize_or_zero();
+                all_normals.push([nn.x, nn.y, nn.z, 0.0]);
+            }
+
+            let mat_id = primitive.material().index().unwrap_or(0) as u32;
+            for tri in local_indices.chunks_exact(3) {
+                all_indices.push(start_vertex + tri[0]);
+                all_indices.push(start_vertex + tri[1]);
+                all_indices.push(start_vertex + tri[2]);
+                all_triangle_material_ids.push(mat_id);
             }
         }
     }
 
-    Ok((all_vertices, all_indices))
+    Ok(MeshData {
+        vertices: all_vertices,
+        indices: all_indices,
+        positions4: all_positions4,
+        normals4: all_normals,
+        triangle_material_ids: all_triangle_material_ids,
+        materials,
+    })
 }
 
 #[repr(C)]
@@ -70,6 +179,7 @@ struct SceneUniforms {
     light_pos: [f32; 4],
     sphere_pos: [f32; 4],
     sphere_color: [f32; 4],
+    mesh_center: [f32; 4],
     sun_intensity: f32,
     frame: u32,
     render_width: u32,
@@ -165,7 +275,9 @@ async fn run() {
     surface.configure(&device, &config);
 
     let decanter_path = std::path::Path::new("res/wine_decanter_and_glass.glb");
-    let (model_verts, model_idx) = load_gltf_mesh(decanter_path).expect("Failed to load decanter model");
+    let mesh = load_gltf_mesh(decanter_path).expect("Failed to load decanter model");
+    let model_verts = mesh.vertices;
+    let model_idx = mesh.indices;
 
     println!("Loaded {} vertices and {} indices from decanter", model_verts.len(), model_idx.len());
 
@@ -191,6 +303,31 @@ async fn run() {
         label: Some("model_ibuf"),
         contents: bytemuck::cast_slice(&model_idx),
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::BLAS_INPUT,
+    });
+    let pos_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh_pos_buf"),
+        contents: bytemuck::cast_slice(&mesh.positions4),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let nrm_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh_nrm_buf"),
+        contents: bytemuck::cast_slice(&mesh.normals4),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh_idx_buf"),
+        contents: bytemuck::cast_slice(&model_idx),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let tri_mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh_tri_mat_buf"),
+        contents: bytemuck::cast_slice(&mesh.triangle_material_ids),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh_materials_buf"),
+        contents: bytemuck::cast_slice(&mesh.materials),
+        usage: wgpu::BufferUsages::STORAGE,
     });
 
     let model_blas_desc = wgpu::BlasTriangleGeometrySizeDescriptor {
@@ -256,7 +393,8 @@ async fn run() {
         proj_inv: projection.inverse().to_cols_array_2d(),
         light_pos: [10.0, 8.0, 10.0, 1.0],
         sphere_pos: [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius],
-        sphere_color: [1.0, 0.1, 0.1, 0.0],
+        sphere_color: [0.98, 1.0, 1.0, 1.0],
+        mesh_center: [center.x, center.y, center.z, 0.0],
         sun_intensity: 0.8,
         frame: 0,
         render_width: config.width,
@@ -315,6 +453,56 @@ async fn run() {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -333,6 +521,26 @@ async fn run() {
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: accum_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: pos_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: nrm_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: idx_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: tri_mat_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: mat_buf.as_entire_binding(),
             },
         ],
     });
@@ -511,6 +719,26 @@ async fn run() {
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: accum_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: pos_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: nrm_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: idx_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: tri_mat_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: mat_buf.as_entire_binding(),
                         },
                     ],
                 });
