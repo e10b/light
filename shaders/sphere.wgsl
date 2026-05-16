@@ -9,8 +9,10 @@ struct Uniforms {
   mesh_center: vec4<f32>,
   sun_intensity: f32,
   frame: u32,
+  scene_kind: u32,
   render_width: u32,
   render_height: u32,
+  pad: vec3<u32>,
 };
 
 @group(0) @binding(0)
@@ -197,7 +199,133 @@ fn sphere_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f
   return 1e38;
 }
 
+fn trace_cornell(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32> {
+  var L = vec3<f32>(0.0);
+  var throughput = vec3<f32>(1.0);
+  var ro = origin;
+  var rd = direction;
+  var rng_seed = seed_in;
+
+  let room_min = vec3<f32>(-1.0, 0.0, -2.0);
+  let room_max = vec3<f32>(1.0, 2.0, 0.0);
+  let sphere_center = vec3<f32>(0.35, 0.35, -1.05);
+  let sphere_radius = 0.35;
+
+  var bounce: u32 = 0u;
+  loop {
+    if (bounce >= 10u) { break; }
+    bounce = bounce + 1u;
+
+    var hit_t = 1e38;
+    var normal = vec3<f32>(0.0);
+    var albedo = vec3<f32>(0.9);
+    var emissive = vec3<f32>(0.0);
+
+    if (abs(rd.x) > 0.0001) {
+      let t_left = (room_min.x - ro.x) / rd.x;
+      if (t_left > 0.001) {
+        let p = ro + rd * t_left;
+        if (p.y >= room_min.y && p.y <= room_max.y && p.z >= room_min.z && p.z <= room_max.z && t_left < hit_t) {
+          hit_t = t_left;
+          normal = vec3<f32>(1.0, 0.0, 0.0);
+          albedo = vec3<f32>(0.75, 0.14, 0.14);
+        }
+      }
+      let t_right = (room_max.x - ro.x) / rd.x;
+      if (t_right > 0.001) {
+        let p = ro + rd * t_right;
+        if (p.y >= room_min.y && p.y <= room_max.y && p.z >= room_min.z && p.z <= room_max.z && t_right < hit_t) {
+          hit_t = t_right;
+          normal = vec3<f32>(-1.0, 0.0, 0.0);
+          albedo = vec3<f32>(0.14, 0.75, 0.14);
+        }
+      }
+    }
+
+    if (abs(rd.y) > 0.0001) {
+      let t_floor = (room_min.y - ro.y) / rd.y;
+      if (t_floor > 0.001) {
+        let p = ro + rd * t_floor;
+        if (p.x >= room_min.x && p.x <= room_max.x && p.z >= room_min.z && p.z <= room_max.z && t_floor < hit_t) {
+          hit_t = t_floor;
+          normal = vec3<f32>(0.0, 1.0, 0.0);
+          albedo = vec3<f32>(0.82, 0.82, 0.82);
+        }
+      }
+      let t_ceiling = (room_max.y - ro.y) / rd.y;
+      if (t_ceiling > 0.001) {
+        let p = ro + rd * t_ceiling;
+        if (p.x >= room_min.x && p.x <= room_max.x && p.z >= room_min.z && p.z <= room_max.z && t_ceiling < hit_t) {
+          hit_t = t_ceiling;
+          normal = vec3<f32>(0.0, -1.0, 0.0);
+          albedo = vec3<f32>(0.86, 0.86, 0.86);
+          if (abs(p.x) < 0.32 && abs(p.z + 1.0) < 0.32) {
+            emissive = vec3<f32>(11.5, 10.8, 9.8);
+          }
+        }
+      }
+    }
+
+    if (abs(rd.z) > 0.0001) {
+      let t_back = (room_min.z - ro.z) / rd.z;
+      if (t_back > 0.001) {
+        let p = ro + rd * t_back;
+        if (p.x >= room_min.x && p.x <= room_max.x && p.y >= room_min.y && p.y <= room_max.y && t_back < hit_t) {
+          hit_t = t_back;
+          normal = vec3<f32>(0.0, 0.0, 1.0);
+          albedo = vec3<f32>(0.84, 0.84, 0.84);
+        }
+      }
+    }
+
+    let t_sphere = sphere_intersection_t(ro, rd, sphere_center, sphere_radius);
+    if (t_sphere < hit_t) {
+      hit_t = t_sphere;
+      let hit_pos = ro + rd * hit_t;
+      normal = normalize(hit_pos - sphere_center);
+      albedo = vec3<f32>(0.88, 0.88, 0.9);
+    }
+
+    if (hit_t >= 1e37) {
+      break;
+    }
+
+    let hit_pos = ro + rd * hit_t;
+    if (max(max(emissive.x, emissive.y), emissive.z) > 0.0) {
+      L = L + throughput * emissive;
+      break;
+    }
+
+    let n = normalize(normal);
+    let jitter = vec3<f32>(
+      rand01(rng_seed ^ (bounce * 1231u + 11u)),
+      rand01(rng_seed ^ (bounce * 1867u + 17u)),
+      rand01(rng_seed ^ (bounce * 2017u + 23u))
+    ) * 2.0 - 1.0;
+    rd = normalize(n + jitter);
+    ro = hit_pos + n * 0.001;
+    throughput = throughput * albedo;
+
+    if (bounce > 2u) {
+      let p = max(max(throughput.x, throughput.y), throughput.z);
+      rng_seed = randu(rng_seed + 7u);
+      if (rand01(rng_seed) > p) { break; }
+      throughput = throughput * (1.0 / max(p, 1e-4));
+    }
+
+    if (max(max(throughput.x, throughput.y), throughput.z) < 0.01) {
+      break;
+    }
+  }
+
+  return L;
+}
+
 fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32> {
+  if (uniforms.scene_kind == 1u) {
+    return trace_cornell(origin, direction, seed_in);
+  }
+
   var L = vec3<f32>(0.0);
   var throughput = vec3<f32>(1.0);
   var rng_seed = seed_in;
