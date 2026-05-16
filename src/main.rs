@@ -70,8 +70,9 @@ struct SceneUniforms {
     light_pos: [f32; 4],
     sphere_pos: [f32; 4],
     sphere_color: [f32; 4],
+    sun_intensity: f32,
     frame: u32,
-    _pad: [u32; 3],
+    _pad: [u32; 2],
 }
 
 struct Camera {
@@ -255,13 +256,15 @@ async fn run() {
         light_pos: [10.0, 8.0, 10.0, 1.0],
         sphere_pos: [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius],
         sphere_color: [1.0, 0.1, 0.1, 0.0],
+        sun_intensity: 0.8,
         frame: 0,
-        _pad: [0, 0, 0],
+        _pad: [0, 0],
     };
 
     let mut sun_azimuth_deg = uniforms.light_pos[2].atan2(uniforms.light_pos[0]).to_degrees();
     let sun_len_xz = (uniforms.light_pos[0] * uniforms.light_pos[0] + uniforms.light_pos[2] * uniforms.light_pos[2]).sqrt();
     let mut sun_elevation_deg = uniforms.light_pos[1].atan2(sun_len_xz).to_degrees();
+    let mut sun_intensity = uniforms.sun_intensity;
 
     let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ubuf"),
@@ -458,7 +461,7 @@ async fn run() {
                 event: winit::event::DeviceEvent::MouseMotion { delta },
                 ..
             } => {
-                if imgui.io().want_capture_mouse {
+                if imgui.io().want_capture_mouse || !keys_pressed.contains("v") {
                     return;
                 }
                 let (dx, dy) = delta;
@@ -531,10 +534,11 @@ async fn run() {
                             let ui = imgui.frame();
 
                             ui.window("Sun Controls")
-                                .size([300.0, 120.0], Condition::FirstUseEver)
+                                .size([300.0, 160.0], Condition::FirstUseEver)
                                 .build(|| {
                                     ui.slider_config("Azimuth (deg)", -180.0, 180.0).build(&mut sun_azimuth_deg);
                                     ui.slider_config("Elevation (deg)", -10.0, 89.0).build(&mut sun_elevation_deg);
+                                    ui.slider_config("Intensity", 0.0, 5.0).build(&mut sun_intensity);
                                 });
 
                             let sun_az = sun_azimuth_deg.to_radians();
@@ -546,6 +550,7 @@ async fn run() {
                             )
                             .normalize_or_zero();
                             uniforms.light_pos = [sun_dir.x, sun_dir.y, sun_dir.z, 1.0];
+                            uniforms.sun_intensity = sun_intensity.max(0.0);
                             queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
 
                             let view = tex.texture.create_view(&wgpu::TextureViewDescriptor::default());

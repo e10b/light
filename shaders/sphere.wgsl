@@ -6,6 +6,7 @@ struct Uniforms {
   light_pos: vec4<f32>,
   sphere_pos: vec4<f32>,
   sphere_color: vec4<f32>,
+  sun_intensity: f32,
   frame: u32,
 };
 
@@ -221,8 +222,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     if (visible) {
       let nl = max(dot(normal, to_light), 0.0);
       let sun_color = vec3<f32>(1.0, 0.98, 0.93);
-      let sun_intensity = 2.5;
-      L = L + throughput * sun_color * nl * sun_intensity;
+      L = L + throughput * sun_color * nl * uniforms.sun_intensity;
     }
 
     // Multiply throughput by albedo and cosine
