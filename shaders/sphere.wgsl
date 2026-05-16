@@ -42,6 +42,9 @@ struct MaterialData {
 @group(0) @binding(7)
 var<storage, read> materials: array<MaterialData>;
 
+@group(0) @binding(8)
+var output_image: texture_storage_2d<rgba8unorm, write>;
+
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) tex_coords: vec2<f32>,
@@ -424,4 +427,41 @@ fn fs_main(vertex: VertexOut) -> @location(0) vec4<f32> {
 
   accum[idx] = vec4<f32>(accum_color, 1.0);
   return vec4<f32>(sqrt(max(accum_color, vec3<f32>(0.0))), 1.0);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= uniforms.render_width || gid.y >= uniforms.render_height) {
+    return;
+  }
+
+  let px = gid.x;
+  let py = gid.y;
+  let idx = py * uniforms.render_width + px;
+
+  let uv = vec2<f32>(
+    (f32(px) + 0.5) / f32(uniforms.render_width),
+    (f32(py) + 0.5) / f32(uniforms.render_height)
+  );
+  let ndc = vec3<f32>(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 0.5);
+
+  let cam_far = uniforms.proj_inv * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
+  let far_pos = cam_far.xyz / cam_far.w;
+
+  let origin = (uniforms.view_inv * vec4<f32>(0.0, 0.0, 0.0, 1.0)).xyz;
+  let far_world = (uniforms.view_inv * vec4<f32>(far_pos, 1.0)).xyz;
+  let direction = normalize(far_world - origin);
+
+  let seed = uniforms.frame * 1973u + px * 9277u + py * 7013u + 1u;
+  let sample_color = trace_ray(origin, direction, seed);
+
+  var accum_color = sample_color;
+  if (uniforms.frame > 0u) {
+    let prev = accum[idx].rgb;
+    let n = f32(uniforms.frame + 1u);
+    accum_color = prev + (sample_color - prev) / n;
+  }
+
+  accum[idx] = vec4<f32>(accum_color, 1.0);
+  textureStore(output_image, vec2<i32>(i32(px), i32(py)), vec4<f32>(sqrt(max(accum_color, vec3<f32>(0.0))), 1.0));
 }

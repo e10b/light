@@ -7,6 +7,9 @@ use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use wgpu::util::DeviceExt;
 use winit::{event::*, event_loop::EventLoop, window};
 
+mod compute_pass;
+mod quad_pass;
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
@@ -255,12 +258,7 @@ async fn run() {
         .expect("Failed to create device");
 
     let surface_caps = surface.get_capabilities(&adapter);
-    let surface_format = surface_caps
-        .formats
-        .iter()
-        .copied()
-        .find(|f| f.is_srgb())
-        .unwrap_or(surface_caps.formats[0]);
+    let surface_format = surface_caps.formats[0];
 
     let mut config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -291,6 +289,8 @@ async fn run() {
     let center = (min_pos + max_pos) * 0.5;
     let size = max_pos - min_pos;
     let _max_extent = size.max_element();
+    let render_width = 1280u32;
+    let render_height = 720u32;
 
     println!("Model bounds: center={:?}, size={:?}", center, size);
 
@@ -397,8 +397,8 @@ async fn run() {
         mesh_center: [center.x, center.y, center.z, 0.0],
         sun_intensity: 0.8,
         frame: 0,
-        render_width: config.width,
-        render_height: config.height,
+        render_width,
+        render_height,
     };
 
     let mut sun_azimuth_deg = uniforms.light_pos[2].atan2(uniforms.light_pos[0]).to_degrees();
@@ -412,8 +412,8 @@ async fn run() {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
-    let mut accum_byte_size = (config.width as u64) * (config.height as u64) * 16;
-    let mut accum_buf = device.create_buffer(&wgpu::BufferDescriptor {
+    let accum_byte_size = (render_width as u64) * (render_height as u64) * 16;
+    let accum_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("accum_buf"),
         size: accum_byte_size,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -429,7 +429,7 @@ async fn run() {
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -439,13 +439,13 @@ async fn run() {
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
                 count: None,
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: false },
                     has_dynamic_offset: false,
@@ -455,7 +455,7 @@ async fn run() {
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 3,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -465,7 +465,7 @@ async fn run() {
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 4,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -475,7 +475,7 @@ async fn run() {
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 5,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -485,7 +485,7 @@ async fn run() {
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 6,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -495,7 +495,7 @@ async fn run() {
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 7,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -503,10 +503,23 @@ async fn run() {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
         ],
     });
 
-    let mut ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let compute_pass = compute_pass::ComputePass::new(&device, &ubind, render_width, render_height);
+    let quad_pass = quad_pass::QuadPass::new(&device, surface_format, compute_pass.output_view());
+
+    let ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ugroup"),
         layout: &ubind,
         entries: &[
@@ -542,52 +555,11 @@ async fn run() {
                 binding: 7,
                 resource: mat_buf.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(compute_pass.output_view()),
+            },
         ],
-    });
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("pathtracer"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sphere.wgsl").into()),
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("pl"),
-        bind_group_layouts: &[Some(&ubind)],
-        immediate_size: 0,
-    });
-
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("rp"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: config.format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            unclipped_depth: false,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            conservative: false,
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
     });
 
     let mut imgui = imgui::Context::create();
@@ -691,59 +663,8 @@ async fn run() {
                     1000.0,
                 );
                 uniforms.proj_inv = projection.inverse().to_cols_array_2d();
-                uniforms.render_width = config.width;
-                uniforms.render_height = config.height;
                 uniforms.frame = 0;
                 queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
-                accum_byte_size = (config.width as u64) * (config.height as u64) * 16;
-                accum_buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("accum_buf"),
-                    size: accum_byte_size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                let zeros = vec![0u8; accum_byte_size as usize];
-                queue.write_buffer(&accum_buf, 0, &zeros);
-                let ugroup_resized = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("ugroup"),
-                    layout: &ubind,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: ubuf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::AccelerationStructure(&tlas),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: accum_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: pos_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: nrm_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: idx_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: tri_mat_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 7,
-                            resource: mat_buf.as_entire_binding(),
-                        },
-                    ],
-                });
-                // Shadow current bind group with resized one for subsequent draws.
-                let _ = std::mem::replace(&mut ugroup, ugroup_resized);
                 surface.configure(&device, &config);
             }
             Event::DeviceEvent {
@@ -862,8 +783,11 @@ async fn run() {
                             let view = tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
                             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
                             {
-                                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("rp"),
+                                compute_pass.record(&mut encoder, &ugroup);
+                            }
+                            {
+                                let mut present_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("present_pass"),
                                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                         view: &view,
                                         resolve_target: None,
@@ -878,9 +802,7 @@ async fn run() {
                                     occlusion_query_set: None,
                                     timestamp_writes: None,
                                 });
-                                rpass.set_pipeline(&pipeline);
-                                rpass.set_bind_group(0, &ugroup, &[]);
-                                rpass.draw(0..3, 0..1);
+                                quad_pass.render(&mut present_rpass);
                             }
                             platform.prepare_render(ui, &window);
                             let draw_data = imgui.render();
