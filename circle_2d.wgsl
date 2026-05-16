@@ -252,6 +252,7 @@ fn spotLight(p: vec3f, n: vec3f) -> vec3f {
     let sphereCenter = vec3f(-0.8, -0.12, 0.5);
     let sphereRadius = 0.5;
     let sphereShadow = intersectSphere(shadowRayOrigin, L, sphereCenter, sphereRadius);
+    let prismShadow = intersectPrism(shadowRayOrigin, L);
     
     // Check mesh
     let meshShadow = intersectMesh(shadowRayOrigin, L);
@@ -261,7 +262,8 @@ fn spotLight(p: vec3f, n: vec3f) -> vec3f {
     // If we hit glass, we need to trace THROUGH it with refraction
     // This is where caustics come from!
     let hitGlass = (meshShadow.w > 0.0 && meshShadow.w < (dist - 0.01)) ||
-                   (sphereShadow.w > 0.0 && sphereShadow.w < (dist - 0.01));
+                   (sphereShadow.w > 0.0 && sphereShadow.w < (dist - 0.01)) ||
+                   (prismShadow.w > 0.0 && prismShadow.w < (dist - 0.01));
     
     if (hitGlass) {
         // Glass blocks direct light - it will be added via refracted paths
@@ -295,6 +297,7 @@ fn traceShadowThroughGlass(origin: vec3f, dir: vec3f, maxDist: f32) -> f32 {
     for (var i = 0; i < 2; i += 1) {
         let meshHit = intersectMesh(pos, direction);
         let sphereHit = intersectSphere(pos, direction, sphereCenter, sphereRadius);
+        let prismHit = intersectPrism(pos, direction);
         
         // Find closest hit
         var hit = vec4f(0.0, 0.0, 0.0, -1.0);
@@ -416,6 +419,101 @@ fn intersectSphere(ro: vec3f, rd: vec3f, center: vec3f, radius: f32) -> vec4f {
     let hitPos = ro + rd * t;
     let normal = normalize(hitPos - center);
     return vec4f(normal, t);
+}
+
+fn intersectPrism(ro: vec3f, rd: vec3f) -> vec4f {
+    // Triangular prism for visible dispersion.
+    // Stand on the SMALLEST face (triangular end cap): triangle lies in XZ, extruded along Y.
+    let c = vec2f(1.65, 1.20); // (x, z) center on ground area
+    let v0 = c + vec2f(0.00, 0.42);
+    let v1 = c + vec2f(-0.34, -0.16);
+    let v2 = c + vec2f(0.34, -0.16);
+    let yMin = GROUND_Y;
+    let yMax = GROUND_Y + 0.70;
+
+    var tEnter = -1e20;
+    var tExit = 1e20;
+    var nEnter = vec3f(0.0, 1.0, 0.0);
+    var nExit = vec3f(0.0, -1.0, 0.0);
+    let eps = 1e-6;
+
+    let e0 = v1 - v0;
+    let e1 = v2 - v1;
+    let e2 = v0 - v2;
+    let n0xz = normalize(vec2f(e0.y, -e0.x));
+    let n1xz = normalize(vec2f(e1.y, -e1.x));
+    let n2xz = normalize(vec2f(e2.y, -e2.x));
+    let n0 = vec3f(n0xz.x, 0.0, n0xz.y);
+    let n1 = vec3f(n1xz.x, 0.0, n1xz.y);
+    let n2 = vec3f(n2xz.x, 0.0, n2xz.y);
+    let d0 = -dot(n0xz, v0);
+    let d1 = -dot(n1xz, v1);
+    let d2 = -dot(n2xz, v2);
+
+    let ny0 = vec3f(0.0, 1.0, 0.0);
+    let dy0 = -yMax;
+    let ny1 = vec3f(0.0, -1.0, 0.0);
+    let dy1 = yMin;
+
+    {
+        let f = dot(n0, ro) + d0;
+        let den = dot(n0, rd);
+        if (abs(den) < eps) { if (f > 0.0) { return vec4f(0.0, 0.0, 0.0, -1.0); } }
+        else {
+            let t = -f / den;
+            if (den < 0.0) { if (t > tEnter) { tEnter = t; nEnter = n0; } }
+            else { if (t < tExit) { tExit = t; nExit = n0; } }
+            if (tEnter > tExit) { return vec4f(0.0, 0.0, 0.0, -1.0); }
+        }
+    }
+    {
+        let f = dot(n1, ro) + d1;
+        let den = dot(n1, rd);
+        if (abs(den) < eps) { if (f > 0.0) { return vec4f(0.0, 0.0, 0.0, -1.0); } }
+        else {
+            let t = -f / den;
+            if (den < 0.0) { if (t > tEnter) { tEnter = t; nEnter = n1; } }
+            else { if (t < tExit) { tExit = t; nExit = n1; } }
+            if (tEnter > tExit) { return vec4f(0.0, 0.0, 0.0, -1.0); }
+        }
+    }
+    {
+        let f = dot(n2, ro) + d2;
+        let den = dot(n2, rd);
+        if (abs(den) < eps) { if (f > 0.0) { return vec4f(0.0, 0.0, 0.0, -1.0); } }
+        else {
+            let t = -f / den;
+            if (den < 0.0) { if (t > tEnter) { tEnter = t; nEnter = n2; } }
+            else { if (t < tExit) { tExit = t; nExit = n2; } }
+            if (tEnter > tExit) { return vec4f(0.0, 0.0, 0.0, -1.0); }
+        }
+    }
+    {
+        let f = dot(ny0, ro) + dy0;
+        let den = dot(ny0, rd);
+        if (abs(den) < eps) { if (f > 0.0) { return vec4f(0.0, 0.0, 0.0, -1.0); } }
+        else {
+            let t = -f / den;
+            if (den < 0.0) { if (t > tEnter) { tEnter = t; nEnter = ny0; } }
+            else { if (t < tExit) { tExit = t; nExit = ny0; } }
+            if (tEnter > tExit) { return vec4f(0.0, 0.0, 0.0, -1.0); }
+        }
+    }
+    {
+        let f = dot(ny1, ro) + dy1;
+        let den = dot(ny1, rd);
+        if (abs(den) < eps) { if (f > 0.0) { return vec4f(0.0, 0.0, 0.0, -1.0); } }
+        else {
+            let t = -f / den;
+            if (den < 0.0) { if (t > tEnter) { tEnter = t; nEnter = ny1; } }
+            else { if (t < tExit) { tExit = t; nExit = ny1; } }
+            if (tEnter > tExit) { return vec4f(0.0, 0.0, 0.0, -1.0); }
+        }
+    }
+
+    if (tExit <= 0.0005) { return vec4f(0.0, 0.0, 0.0, -1.0); }
+    if (tEnter > 0.0005) { return vec4f(nEnter, tEnter); }
+    return vec4f(nExit, tExit);
 }
 
 fn intersectMesh(ro: vec3f, rd: vec3f) -> vec4f {
@@ -640,11 +738,13 @@ fn tracePhotonFromLight(seed: vec3f, lambdaNm: f32) {
     for (var step = 0; step < 10; step += 1) {
         let meshHit = intersectMesh(pos, direction);
         let sphereHit = intersectSphere(pos, direction, sphereCenter, sphereRadius);
+        let prismHit = intersectPrism(pos, direction);
 
         let tGround = (GROUND_Y - pos.y) / direction.y;
         let hitGround = tGround > 0.0005;
         let hitMesh = meshHit.w > 0.0;
         let hitSphere = sphereHit.w > 0.0;
+        let hitPrism = prismHit.w > 0.0;
 
         var tClosest = 1e20;
         var hitType = -1.0;
@@ -659,6 +759,11 @@ fn tracePhotonFromLight(seed: vec3f, lambdaNm: f32) {
             tClosest = meshHit.w;
             hitType = 1.0;
             nRaw = meshHit.xyz;
+        }
+        if (hitPrism && prismHit.w < tClosest) {
+            tClosest = prismHit.w;
+            hitType = 1.0;
+            nRaw = prismHit.xyz;
         }
         if (hitGround && tGround < tClosest) {
             tClosest = tGround;
@@ -742,11 +847,13 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
         let sphereCenter = vec3f(-0.8, -0.12, 0.5);
         let sphereRadius = 0.5;
         let sphereHit = intersectSphere(origin, dir, sphereCenter, sphereRadius);
+        let prismHit = intersectPrism(origin, dir);
         
         let tGround = (-0.62 - origin.y) / dir.y;
         let hitGround = (tGround > 0.0005);
         let hitMesh = (meshHit.w > 0.0);
         let hitSphere = (sphereHit.w > 0.0);
+        let hitPrism = (prismHit.w > 0.0);
 
         var hitMat = -1.0;
         var hitPos = vec3f(0.0);
@@ -767,6 +874,13 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
             hitMat = 1.0; // Glass
             hitPos = origin + dir * meshHit.w;
             nRaw = meshHit.xyz;
+        }
+        
+        if (hitPrism && prismHit.w < tClosest) {
+            tClosest = prismHit.w;
+            hitMat = 1.0; // Glass prism
+            hitPos = origin + dir * prismHit.w;
+            nRaw = prismHit.xyz;
         }
         
         if (hitGround && tGround < tClosest) {
@@ -809,9 +923,10 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
                 let sphereCenter = vec3f(-0.8, -0.12, 0.5);
                 let sphereRadius = 0.5;
                 let sphereShadow = intersectSphere(shadowOrigin, L, sphereCenter, sphereRadius);
+                let prismShadow = intersectPrism(shadowOrigin, L);
 
                 // If glass is in the way, direct sun is blocked.
-                let blocked = (meshShadow.w > 0.0) || (sphereShadow.w > 0.0);
+                let blocked = (meshShadow.w > 0.0) || (sphereShadow.w > 0.0) || (prismShadow.w > 0.0);
 
                 if (!blocked) {
                     let lightColor = vec3f(1.0, 0.98, 0.95);
