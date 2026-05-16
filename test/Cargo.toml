@@ -1,0 +1,12 @@
+[package]
+name = "wgpu29_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { version = "1.24", features = ["derive"] }
+glam = "0.24"
+gltf = "1.4"
+pollster = "0.4"
+wgpu = "29.0"
+winit = "0.30"
