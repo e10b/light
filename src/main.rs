@@ -383,11 +383,11 @@ async fn run() {
     accel_encoder.build_acceleration_structures([model_build].iter(), iter::once(&tlas));
     queue.submit(Some(accel_encoder.finish()));
 
-    let mut camera = Camera::new(glam::Vec3::new(0.0, 1.1, 3.2));
     let projection = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_3 * 1.2, config.width as f32 / config.height as f32, 0.1, 1000.0);
 
     let sphere_pos = glam::Vec3::new(center.x + size.x * 0.6 + 2.0, center.y - size.y * 0.5 + 1.0, center.z);
     let sphere_radius = 6.0;
+    let mut camera = Camera::new(glam::Vec3::new(3.0, 23.0, 40.0));
     let mut uniforms = SceneUniforms {
         view_inv: camera.view_matrix().inverse().to_cols_array_2d(),
         proj_inv: projection.inverse().to_cols_array_2d(),
