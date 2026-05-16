@@ -195,9 +195,9 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       normal = normalize(hit_pos - sphere_center);
       albedo = uniforms.sphere_color.xyz;
     } else if (hit_type == 2u) {
-      // Triangle: approximate normal using screen-space method
-      let tangent = normalize(cross(rd, vec3<f32>(0.0, 1.0, 0.0)));
-      normal = normalize(cross(tangent, rd));
+      // Mesh hit: use a stable pseudo-normal to avoid view-dependent flips/acne.
+      // We don't have per-triangle normals in this path, so orient opposite the ray.
+      normal = normalize(-rd);
       albedo = vec3<f32>(0.8);
     } else {
       // Ground
@@ -214,8 +214,8 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     let to_light = sun_dir;
     // Shadow test
     var shadow_rq: ray_query;
-    let shadow_origin = hit_pos + normal * 0.01;
-    rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.001, 10000.0, shadow_origin, to_light));
+    let shadow_origin = hit_pos + normal * 0.02;
+    rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, 10000.0, shadow_origin, to_light));
     rayQueryProceed(&shadow_rq);
     let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
     let visible = shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE;
