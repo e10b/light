@@ -72,7 +72,8 @@ struct SceneUniforms {
     sphere_color: [f32; 4],
     sun_intensity: f32,
     frame: u32,
-    _pad: [u32; 2],
+    render_width: u32,
+    render_height: u32,
 }
 
 struct Camera {
@@ -258,7 +259,8 @@ async fn run() {
         sphere_color: [1.0, 0.1, 0.1, 0.0],
         sun_intensity: 0.8,
         frame: 0,
-        _pad: [0, 0],
+        render_width: config.width,
+        render_height: config.height,
     };
 
     let mut sun_azimuth_deg = uniforms.light_pos[2].atan2(uniforms.light_pos[0]).to_degrees();
@@ -271,6 +273,18 @@ async fn run() {
         contents: bytemuck::bytes_of(&uniforms),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
+
+    let mut accum_byte_size = (config.width as u64) * (config.height as u64) * 16;
+    let mut accum_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("accum_buf"),
+        size: accum_byte_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    {
+        let zeros = vec![0u8; accum_byte_size as usize];
+        queue.write_buffer(&accum_buf, 0, &zeros);
+    }
 
     let ubind = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("ubind"),
@@ -291,10 +305,20 @@ async fn run() {
                 ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
-    let ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let mut ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ugroup"),
         layout: &ubind,
         entries: &[
@@ -305,6 +329,10 @@ async fn run() {
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::AccelerationStructure(&tlas),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: accum_buf.as_entire_binding(),
             },
         ],
     });
@@ -381,6 +409,7 @@ async fn run() {
     let mut frame_count = 0u32;
     let mut fps_display_time = std::time::Instant::now();
     let mut last_update = std::time::Instant::now();
+    let mut accumulation_dirty = true;
 
     let _ = event_loop.run(move |event, active_loop| {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -454,7 +483,39 @@ async fn run() {
                     1000.0,
                 );
                 uniforms.proj_inv = projection.inverse().to_cols_array_2d();
+                uniforms.render_width = config.width;
+                uniforms.render_height = config.height;
+                uniforms.frame = 0;
                 queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
+                accum_byte_size = (config.width as u64) * (config.height as u64) * 16;
+                accum_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("accum_buf"),
+                    size: accum_byte_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let zeros = vec![0u8; accum_byte_size as usize];
+                queue.write_buffer(&accum_buf, 0, &zeros);
+                let ugroup_resized = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("ugroup"),
+                    layout: &ubind,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: ubuf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::AccelerationStructure(&tlas),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: accum_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                // Shadow current bind group with resized one for subsequent draws.
+                let _ = std::mem::replace(&mut ugroup, ugroup_resized);
                 surface.configure(&device, &config);
             }
             Event::DeviceEvent {
@@ -468,6 +529,7 @@ async fn run() {
                 camera.yaw -= dx as f32 * mouse_speed;
                 camera.pitch -= dy as f32 * mouse_speed;
                 camera.pitch = camera.pitch.clamp(-1.45, 1.45);
+                accumulation_dirty = true;
             }
             Event::NewEvents(start_cause) => match start_cause {
                 winit::event::StartCause::Init | winit::event::StartCause::Poll => {
@@ -484,6 +546,9 @@ async fn run() {
                     let now = std::time::Instant::now();
                     let dt = now.duration_since(last_update).as_secs_f32();
                     last_update = now;
+                    let prev_cam_pos = camera.pos;
+                    let prev_cam_yaw = camera.yaw;
+                    let prev_cam_pitch = camera.pitch;
                     let sprint = if keys_pressed.contains("Shift") { 3.0 } else { 1.0 };
                     let wants_keyboard = imgui.io().want_capture_keyboard;
 
@@ -521,8 +586,9 @@ async fn run() {
                     }
 
                     uniforms.view_inv = camera.view_matrix().inverse().to_cols_array_2d();
-                    uniforms.frame += 1;
-                    queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
+                    if camera.pos != prev_cam_pos || camera.yaw != prev_cam_yaw || camera.pitch != prev_cam_pitch {
+                        accumulation_dirty = true;
+                    }
 
                     match surface.get_current_texture() {
                         wgpu::CurrentSurfaceTexture::Success(tex) | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => {
@@ -549,8 +615,20 @@ async fn run() {
                                 sun_az.sin() * sun_el.cos(),
                             )
                             .normalize_or_zero();
+                            let old_light = uniforms.light_pos;
+                            let old_intensity = uniforms.sun_intensity;
                             uniforms.light_pos = [sun_dir.x, sun_dir.y, sun_dir.z, 1.0];
                             uniforms.sun_intensity = sun_intensity.max(0.0);
+
+                            let sun_changed = uniforms.light_pos != old_light || (uniforms.sun_intensity - old_intensity).abs() > f32::EPSILON;
+                            if accumulation_dirty || sun_changed {
+                                uniforms.frame = 0;
+                                let zeros = vec![0u8; accum_byte_size as usize];
+                                queue.write_buffer(&accum_buf, 0, &zeros);
+                                accumulation_dirty = false;
+                            } else {
+                                uniforms.frame = uniforms.frame.saturating_add(1);
+                            }
                             queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
 
                             let view = tex.texture.create_view(&wgpu::TextureViewDescriptor::default());

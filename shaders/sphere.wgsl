@@ -8,6 +8,8 @@ struct Uniforms {
   sphere_color: vec4<f32>,
   sun_intensity: f32,
   frame: u32,
+  render_width: u32,
+  render_height: u32,
 };
 
 @group(0) @binding(0)
@@ -15,6 +17,9 @@ var<uniform> uniforms: Uniforms;
 
 @group(0) @binding(1)
 var acc_struct: acceleration_structure;
+
+@group(0) @binding(2)
+var<storage, read_write> accum: array<vec4<f32>>;
 
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
@@ -129,6 +134,23 @@ fn ground_plane_intersection(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   return 1e38;
 }
 
+fn sphere_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>, radius: f32) -> f32 {
+  let oc = origin - center;
+  let a = dot(direction, direction);
+  let b = dot(oc, direction);
+  let c = dot(oc, oc) - radius * radius;
+  let disc = b * b - a * c;
+  if (disc <= 0.0) {
+    return 1e38;
+  }
+  let sq = sqrt(disc);
+  let t1 = (-b - sq) / a;
+  let t2 = (-b + sq) / a;
+  if (t1 > 0.0) { return t1; }
+  if (t2 > 0.0) { return t2; }
+  return 1e38;
+}
+
 fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32> {
   // Path tracing loop (cosine-weighted hemisphere sampling)
   var L = vec3<f32>(0.0);
@@ -218,7 +240,13 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, 10000.0, shadow_origin, to_light));
     rayQueryProceed(&shadow_rq);
     let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
-    let visible = shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE;
+    let sphere_shadow_t = sphere_intersection_t(
+      shadow_origin,
+      to_light,
+      uniforms.sphere_pos.xyz,
+      uniforms.sphere_pos.w,
+    );
+    let visible = (shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (sphere_shadow_t >= 1e37);
     if (visible) {
       let nl = max(dot(normal, to_light), 0.0);
       let sun_color = vec3<f32>(1.0, 0.98, 0.93);
@@ -280,8 +308,24 @@ fn fs_main(vertex: VertexOut) -> @location(0) vec4<f32> {
   let direction = normalize(far_world - origin);
   
   // Seed RNG with pixel coords and frame (use builtin position from vertex)
-  let frag_coord = vertex.position;
-  let seed = u32(uniforms.frame) * 1973u + u32(frag_coord.x) * 9277u + u32(frag_coord.y) * 7013u + 1u;
-  let color = trace_ray(origin, direction, seed);
-  return vec4<f32>(sqrt(color), 1.0);
+  let uv = vec2<f32>(
+    0.5 * (ndc.x + 1.0),
+    0.5 * (1.0 - ndc.y)
+  );
+  let px = u32(clamp(floor(uv.x * f32(uniforms.render_width)), 0.0, f32(uniforms.render_width - 1u)));
+  let py = u32(clamp(floor(uv.y * f32(uniforms.render_height)), 0.0, f32(uniforms.render_height - 1u)));
+  let idx = py * uniforms.render_width + px;
+
+  let seed = u32(uniforms.frame) * 1973u + px * 9277u + py * 7013u + 1u;
+  let sample_color = trace_ray(origin, direction, seed);
+
+  var accum_color = sample_color;
+  if (uniforms.frame > 0u) {
+    let prev = accum[idx].rgb;
+    let n = f32(uniforms.frame + 1u);
+    accum_color = prev + (sample_color - prev) / n;
+  }
+
+  accum[idx] = vec4<f32>(accum_color, 1.0);
+  return vec4<f32>(sqrt(max(accum_color, vec3<f32>(0.0))), 1.0);
 }
