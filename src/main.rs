@@ -1,6 +1,9 @@
 use std::iter;
 use std::path::Path;
 
+use imgui::{Condition, FontConfig, FontSource};
+use imgui_wgpu::{Renderer as ImguiRenderer, RendererConfig};
+use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use wgpu::util::DeviceExt;
 use winit::{event::*, event_loop::EventLoop, window};
 
@@ -256,6 +259,10 @@ async fn run() {
         _pad: [0, 0, 0],
     };
 
+    let mut sun_azimuth_deg = uniforms.light_pos[2].atan2(uniforms.light_pos[0]).to_degrees();
+    let sun_len_xz = (uniforms.light_pos[0] * uniforms.light_pos[0] + uniforms.light_pos[2] * uniforms.light_pos[2]).sqrt();
+    let mut sun_elevation_deg = uniforms.light_pos[1].atan2(sun_len_xz).to_degrees();
+
     let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ubuf"),
         contents: bytemuck::bytes_of(&uniforms),
@@ -344,6 +351,26 @@ async fn run() {
         cache: None,
     });
 
+    let mut imgui = imgui::Context::create();
+    imgui.set_ini_filename(None);
+    let mut platform = WinitPlatform::new(&mut imgui);
+    platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Rounded);
+    let hidpi_factor = window.scale_factor();
+    let font_size = (13.0 * hidpi_factor) as f32;
+    imgui.fonts().add_font(&[FontSource::DefaultFontData {
+        config: Some(FontConfig {
+            size_pixels: font_size,
+            ..FontConfig::default()
+        }),
+    }]);
+    imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
+
+    let renderer_config = RendererConfig {
+        texture_format: config.format,
+        ..RendererConfig::default()
+    };
+    let mut imgui_renderer = ImguiRenderer::new(&mut imgui, &device, &queue, renderer_config);
+
     let move_speed = 2.6;
     let look_speed = 0.28;
     let mouse_speed = 0.003;
@@ -354,6 +381,7 @@ async fn run() {
 
     let _ = event_loop.run(move |event, active_loop| {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        platform.handle_event(imgui.io_mut(), &window, &event);
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -430,6 +458,9 @@ async fn run() {
                 event: winit::event::DeviceEvent::MouseMotion { delta },
                 ..
             } => {
+                if imgui.io().want_capture_mouse {
+                    return;
+                }
                 let (dx, dy) = delta;
                 camera.yaw -= dx as f32 * mouse_speed;
                 camera.pitch -= dy as f32 * mouse_speed;
@@ -451,37 +482,38 @@ async fn run() {
                     let dt = now.duration_since(last_update).as_secs_f32();
                     last_update = now;
                     let sprint = if keys_pressed.contains("Shift") { 3.0 } else { 1.0 };
+                    let wants_keyboard = imgui.io().want_capture_keyboard;
 
-                    if keys_pressed.contains("w") {
+                    if !wants_keyboard && keys_pressed.contains("w") {
                         camera.pos += camera.forward() * move_speed * sprint * dt;
                     }
-                    if keys_pressed.contains("s") {
+                    if !wants_keyboard && keys_pressed.contains("s") {
                         camera.pos -= camera.forward() * move_speed * sprint * dt;
                     }
-                    if keys_pressed.contains("a") {
+                    if !wants_keyboard && keys_pressed.contains("a") {
                         camera.pos -= camera.right() * move_speed * sprint * dt;
                     }
-                    if keys_pressed.contains("d") {
+                    if !wants_keyboard && keys_pressed.contains("d") {
                         camera.pos += camera.right() * move_speed * sprint * dt;
                     }
-                    if keys_pressed.contains("Space") {
+                    if !wants_keyboard && keys_pressed.contains("Space") {
                         camera.pos.y += move_speed * sprint * dt;
                     }
-                    if keys_pressed.contains("Control") {
+                    if !wants_keyboard && keys_pressed.contains("Control") {
                         camera.pos.y -= move_speed * sprint * dt;
                     }
-                    if keys_pressed.contains("ArrowUp") {
+                    if !wants_keyboard && keys_pressed.contains("ArrowUp") {
                         camera.pitch += look_speed * dt;
                         camera.pitch = camera.pitch.min(1.45);
                     }
-                    if keys_pressed.contains("ArrowDown") {
+                    if !wants_keyboard && keys_pressed.contains("ArrowDown") {
                         camera.pitch -= look_speed * dt;
                         camera.pitch = camera.pitch.max(-1.45);
                     }
-                    if keys_pressed.contains("ArrowLeft") {
+                    if !wants_keyboard && keys_pressed.contains("ArrowLeft") {
                         camera.yaw += look_speed * dt;
                     }
-                    if keys_pressed.contains("ArrowRight") {
+                    if !wants_keyboard && keys_pressed.contains("ArrowRight") {
                         camera.yaw -= look_speed * dt;
                     }
 
@@ -491,6 +523,31 @@ async fn run() {
 
                     match surface.get_current_texture() {
                         wgpu::CurrentSurfaceTexture::Success(tex) | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => {
+                            imgui.io_mut().update_delta_time(std::time::Duration::from_secs_f32(dt.max(1.0 / 1000.0)));
+                            if platform.prepare_frame(imgui.io_mut(), &window).is_err() {
+                                tex.present();
+                                return;
+                            }
+                            let ui = imgui.frame();
+
+                            ui.window("Sun Controls")
+                                .size([300.0, 120.0], Condition::FirstUseEver)
+                                .build(|| {
+                                    ui.slider_config("Azimuth (deg)", -180.0, 180.0).build(&mut sun_azimuth_deg);
+                                    ui.slider_config("Elevation (deg)", -10.0, 89.0).build(&mut sun_elevation_deg);
+                                });
+
+                            let sun_az = sun_azimuth_deg.to_radians();
+                            let sun_el = sun_elevation_deg.to_radians();
+                            let sun_dir = glam::Vec3::new(
+                                sun_az.cos() * sun_el.cos(),
+                                sun_el.sin(),
+                                sun_az.sin() * sun_el.cos(),
+                            )
+                            .normalize_or_zero();
+                            uniforms.light_pos = [sun_dir.x, sun_dir.y, sun_dir.z, 1.0];
+                            queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
+
                             let view = tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
                             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
                             {
@@ -513,6 +570,27 @@ async fn run() {
                                 rpass.set_pipeline(&pipeline);
                                 rpass.set_bind_group(0, &ugroup, &[]);
                                 rpass.draw(0..3, 0..1);
+                            }
+                            platform.prepare_render(ui, &window);
+                            let draw_data = imgui.render();
+                            {
+                                let mut ui_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("imgui-pass"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: &view,
+                                        resolve_target: None,
+                                        depth_slice: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    multiview_mask: None,
+                                    occlusion_query_set: None,
+                                    timestamp_writes: None,
+                                });
+                                let _ = imgui_renderer.render(draw_data, &queue, &device, &mut ui_rpass);
                             }
                             queue.submit(Some(encoder.finish()));
                             tex.present();

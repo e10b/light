@@ -246,7 +246,8 @@ fn spotLight(p: vec3f, n: vec3f) -> vec3f {
     let ndotl = max(dot(n, L), 0.0);
     
     // Shadow test - trace through glass with refraction
-    let shadowRayOrigin = p + L * 0.01;
+    let shadowBiasN = select(-n, n, dot(n, L) >= 0.0);
+    let shadowRayOrigin = p + shadowBiasN * 0.01;
     
     // Check sphere first
     let sphereCenter = vec3f(-0.8, -0.12, 0.5);
@@ -918,7 +919,8 @@ fn trace(ro: vec3f, rd: vec3f, pixelJitter: vec2f, lambdaNm: f32) -> vec3f {
                 let ndotl = max(dot(n, L), 0.0);
 
                 // Shadow test along sun direction (infinite directional light)
-                let shadowOrigin = hitPos + L * 0.01;
+                let shadowBiasN = select(-n, n, dot(n, L) >= 0.0);
+                let shadowOrigin = hitPos + shadowBiasN * 0.01;
                 let meshShadow = intersectMesh(shadowOrigin, L);
                 let sphereCenter = vec3f(-0.8, -0.12, 0.5);
                 let sphereRadius = 0.5;
