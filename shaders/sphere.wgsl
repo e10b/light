@@ -497,10 +497,19 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       roughness = clamp(m.params.y, 0.001, 1.0);
       transmission = clamp(m.params.z, 0.0, 1.0);
       ior = max(m.params.w, 1.0);
-      // Decanter path: force true dielectric behavior even when source material metadata is weak.
-      transmission = max(transmission, 0.98);
-      roughness = min(roughness, 0.003);
-      albedo = mix(albedo, vec3<f32>(1.0), 0.85);
+      if (is_wine_scene) {
+        let wine_tint = vec3<f32>(0.42, 0.012, 0.022);
+        let is_wine_tinted = albedo.r > albedo.g * 4.0 && albedo.r > albedo.b * 3.0;
+        albedo = select(albedo, wine_tint, is_wine_tinted);
+        transmission = max(transmission, 0.72);
+        roughness = min(roughness, 0.012);
+        ior = select(ior, 1.36, is_wine_tinted);
+      } else {
+        // Decanter path: force true dielectric behavior even when source material metadata is weak.
+        transmission = max(transmission, 0.98);
+        roughness = min(roughness, 0.003);
+        albedo = mix(albedo, vec3<f32>(1.0), 0.85);
+      }
     } else {
       // Ground
       normal = vec3<f32>(0.0, 1.0, 0.0);

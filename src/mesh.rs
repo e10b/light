@@ -24,6 +24,12 @@ pub struct MeshData {
 
 pub fn load_gltf_mesh(path: &Path) -> Result<MeshData, Box<dyn std::error::Error>> {
     let (document, buffers, _images) = gltf::import(path)?;
+    let path_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_red_wine_asset = path_name.contains("red_wine");
 
     let mut all_vertices = Vec::new();
     let mut all_indices = Vec::new();
@@ -35,11 +41,15 @@ pub fn load_gltf_mesh(path: &Path) -> Result<MeshData, Box<dyn std::error::Error
     let mut any_likely_glass = false;
     for mat in document.materials() {
         let pbr = mat.pbr_metallic_roughness();
-        let base_color = pbr.base_color_factor();
+        let mut base_color = pbr.base_color_factor();
         let metallic = pbr.metallic_factor();
         let roughness = pbr.roughness_factor();
         let mat_name = mat.name().unwrap_or("").to_ascii_lowercase();
         let looks_glass = mat_name.contains("glass") || mat_name.contains("decanter");
+        let looks_wine = is_red_wine_asset || mat_name.contains("wine");
+        if looks_wine {
+            base_color = [0.42, 0.015, 0.025, 0.78];
+        }
         let transmission = if looks_glass || base_color[3] < 0.99 { 1.0 } else { 0.0 };
         if transmission > 0.5 {
             any_likely_glass = true;
@@ -47,7 +57,12 @@ pub fn load_gltf_mesh(path: &Path) -> Result<MeshData, Box<dyn std::error::Error
         let ior = if transmission > 0.0 { 1.52 } else { 1.0 };
         materials.push(GpuMaterial {
             base_color,
-            params: [metallic, roughness.max(0.02), transmission, ior],
+            params: [
+                metallic,
+                roughness.max(if looks_wine { 0.006 } else { 0.02 }),
+                transmission,
+                if looks_wine { 1.36 } else { ior },
+            ],
         });
     }
     if materials.is_empty() {
