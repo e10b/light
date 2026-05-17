@@ -71,6 +71,11 @@ struct Photon {
 struct PhotonMapUniforms {
   light_pos: vec4<f32>,
   emitter_center: vec4<f32>,
+  sphere_pos: vec4<f32>,
+  sphere_rot: vec4<f32>,
+  sphere_extent: vec4<f32>,
+  sphere_material: vec4<f32>,
+  sphere_enabled: vec4<u32>,
   photon_count: u32,
   voxel_size: f32,
   hash_table_size: u32,

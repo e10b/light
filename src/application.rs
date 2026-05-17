@@ -1375,6 +1375,7 @@ pub async fn run() {
                                 active_max_extent * 0.85,
                             ];
                             let mut photons_per_frame = 0u32;
+                            let mut sphere_visible_for_photons = false;
                             let full_output = egui_ctx.run(raw_input, |ctx| {
                                 let mut requested_scene = scene_kind;
                                 let current_scene_exists = match scene_kind {
@@ -2451,16 +2452,18 @@ pub async fn run() {
                                 SceneKind::Wine => wine_scene_id,
                                 SceneKind::CornellBox => cornell_scene_id,
                             };
-                            let (decanter_visible, wine_visible, cornell_visible) = if current_scene_exists {
+                            let (sphere_visible, decanter_visible, wine_visible, cornell_visible) = if current_scene_exists {
                                 let visible = main_db.scene_visible_selectable_objects(active_scene_id);
                                 (
+                                    visible.contains(&sphere_obj_id),
                                     visible.contains(&decanter_obj_id),
                                     visible.contains(&wine_obj_id),
                                     visible.contains(&cornell_obj_id),
                                 )
                             } else {
-                                (false, false, false)
+                                (false, false, false, false)
                             };
+                            sphere_visible_for_photons = sphere_visible;
                             uniforms.decanter_enabled = if decanter_visible { 1 } else { 0 };
                             uniforms.wine_enabled = if wine_visible { 1 } else { 0 };
                             uniforms.cornell_enabled = if cornell_visible { 1 } else { 0 };
@@ -2753,6 +2756,16 @@ pub async fn run() {
                                 &queue,
                                 uniforms.light_pos,
                                 photon_emitter_center,
+                                uniforms.sphere_pos,
+                                uniforms.sphere_rot,
+                                uniforms.sphere_extent,
+                                [
+                                    uniforms.sphere_color[3],
+                                    uniforms.sphere_params[1],
+                                    uniforms.sphere_params[2],
+                                    0.0,
+                                ],
+                                sphere_visible_for_photons,
                                 uniforms.frame,
                             );
                             photon_mapper.emit_photons(&mut encoder, photons_per_frame);

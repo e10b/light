@@ -3,6 +3,11 @@ enable wgpu_ray_query;
 struct PhotonMapUniforms {
   light_pos: vec4<f32>,
   emitter_center: vec4<f32>,
+  sphere_pos: vec4<f32>,
+  sphere_rot: vec4<f32>,
+  sphere_extent: vec4<f32>,
+  sphere_material: vec4<f32>,
+  sphere_enabled: vec4<u32>,
   photon_count: u32,
   voxel_size: f32,
   hash_table_size: u32,
@@ -81,6 +86,38 @@ fn ground_plane_intersection(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   return select(1e38, t, t > 0.001);
 }
 
+fn quat_mul_vec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+  let qv = q.xyz;
+  let t = 2.0 * cross(qv, v);
+  return v + q.w * t + cross(qv, t);
+}
+
+fn cube_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32>) -> f32 {
+  let bmin = center - half_extent;
+  let bmax = center + half_extent;
+  let inv_dir = 1.0 / max(abs(direction), vec3<f32>(1e-6)) * sign(direction);
+  let t0 = (bmin - origin) * inv_dir;
+  let t1 = (bmax - origin) * inv_dir;
+  let tmin3 = min(t0, t1);
+  let tmax3 = max(t0, t1);
+  let tmin = max(max(tmin3.x, tmin3.y), tmin3.z);
+  let tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
+  if (tmax < 0.0 || tmin > tmax) { return 1e38; }
+  if (tmin > 0.001) { return tmin; }
+  if (tmax > 0.001) { return tmax; }
+  return 1e38;
+}
+
+fn cube_normal(hit_pos: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32>) -> vec3<f32> {
+  let p = (hit_pos - center) / max(half_extent, vec3<f32>(1e-6));
+  let ax = abs(p.x);
+  let ay = abs(p.y);
+  let az = abs(p.z);
+  if (ax > ay && ax > az) { return vec3<f32>(sign(p.x), 0.0, 0.0); }
+  if (ay > az) { return vec3<f32>(0.0, sign(p.y), 0.0); }
+  return vec3<f32>(0.0, 0.0, sign(p.z));
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= uniforms.photon_count) { return; }
@@ -113,13 +150,50 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tri_hit = rayQueryGetCommittedIntersection(&rq);
     let tri_t = select(1e38, tri_hit.t, tri_hit.kind != RAY_QUERY_INTERSECTION_NONE);
     let ground_t = ground_plane_intersection(ro, rd);
+    var cube_t = 1e38;
+    let cube_enabled = uniforms.sphere_enabled.x != 0u;
+    let cube_center = uniforms.sphere_pos.xyz;
+    let cube_q = uniforms.sphere_rot;
+    let cube_q_inv = vec4<f32>(-cube_q.xyz, cube_q.w);
+    if (cube_enabled) {
+      let local_ro = quat_mul_vec(cube_q_inv, ro - cube_center);
+      let local_rd = quat_mul_vec(cube_q_inv, rd);
+      cube_t = cube_intersection_t(local_ro, local_rd, vec3<f32>(0.0), uniforms.sphere_extent.xyz);
+    }
 
-    if (ground_t < tri_t) {
+    if (ground_t < tri_t && ground_t < cube_t) {
       if (passed_glass) {
         let hit_pos = ro + rd * ground_t;
         write_photon(gid.x, hit_pos, -rd, lambda_nm, power);
       }
       break;
+    }
+
+    if (cube_t < tri_t) {
+      let hit_pos = ro + rd * cube_t;
+      let local_hit = quat_mul_vec(cube_q_inv, hit_pos - cube_center);
+      var normal = quat_mul_vec(cube_q, cube_normal(local_hit, vec3<f32>(0.0), uniforms.sphere_extent.xyz));
+      let transmission = clamp(uniforms.sphere_material.x, 0.0, 1.0);
+      let has_bsdf = uniforms.sphere_material.z > 0.5;
+      if (!(has_bsdf && transmission > 0.01)) {
+        if (passed_glass) {
+          write_photon(gid.x, hit_pos, -rd, lambda_nm, power);
+        }
+        break;
+      }
+      let ior = max(snell_ior_for_wavelength(lambda_nm, uniforms.sphere_material.y, 0.12), 1.01);
+      let entering = dot(rd, normal) < 0.0;
+      normal = select(-normal, normal, entering);
+      let eta = select(ior, 1.0 / ior, entering);
+      var next_dir = refract(rd, normal, eta);
+      if (dot(next_dir, next_dir) < 0.0001) {
+        next_dir = reflect(rd, normal);
+      }
+      passed_glass = true;
+      power = power * transmission;
+      rd = normalize(next_dir);
+      ro = hit_pos + rd * 0.01;
+      continue;
     }
 
     if (tri_t >= 1e37) { break; }
