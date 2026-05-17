@@ -1,8 +1,9 @@
 mod application;
 mod compute_pass;
+mod mesh;
+mod photon_mapper;
 mod quad_pass;
 mod scene;
-mod mesh;
 mod window;
 
 fn main() {

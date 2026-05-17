@@ -6,7 +6,14 @@ use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use wgpu::util::DeviceExt;
 use winit::{event::*, event_loop::EventLoop};
 
-use crate::{compute_pass, mesh::{load_gltf_mesh, Vertex}, quad_pass, scene::SceneKind, window::create_window};
+use crate::{
+    compute_pass,
+    mesh::{load_gltf_mesh, Vertex},
+    photon_mapper::PhotonMapper,
+    quad_pass,
+    scene::SceneKind,
+    window::create_window,
+};
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -77,7 +84,8 @@ pub async fn run() {
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
-            required_limits: wgpu::Limits::default().using_minimum_supported_acceleration_structure_values(),
+            required_limits: wgpu::Limits::default()
+                .using_minimum_supported_acceleration_structure_values(),
             experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
             ..Default::default()
         })
@@ -104,7 +112,11 @@ pub async fn run() {
     let model_verts = mesh.vertices;
     let model_idx = mesh.indices;
 
-    println!("Loaded {} vertices and {} indices from decanter", model_verts.len(), model_idx.len());
+    println!(
+        "Loaded {} vertices and {} indices from decanter",
+        model_verts.len(),
+        model_idx.len()
+    );
 
     let mut min_pos = glam::Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
     let mut max_pos = glam::Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
@@ -115,7 +127,7 @@ pub async fn run() {
     }
     let center = (min_pos + max_pos) * 0.5;
     let size = max_pos - min_pos;
-    let _max_extent = size.max_element();
+    let max_extent = size.max_element();
     let render_width = 1280u32;
     let render_height = 720u32;
 
@@ -183,11 +195,7 @@ pub async fn run() {
     });
     tlas[0] = Some(wgpu::TlasInstance::new(
         &model_blas,
-        [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-        ],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         0,
         0xff,
     ));
@@ -206,15 +214,27 @@ pub async fn run() {
         }]),
     };
 
-    let mut accel_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("accel") });
+    let mut accel_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("accel"),
+    });
     accel_encoder.build_acceleration_structures([model_build].iter(), iter::once(&tlas));
     queue.submit(Some(accel_encoder.finish()));
 
-    let projection = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_3 * 1.2, config.width as f32 / config.height as f32, 0.1, 1000.0);
+    let projection = glam::Mat4::perspective_rh(
+        std::f32::consts::FRAC_PI_3 * 1.2,
+        config.width as f32 / config.height as f32,
+        0.1,
+        1000.0,
+    );
 
     let mut scene_kind = SceneKind::Decanter;
-    let sphere_pos = glam::Vec3::new(center.x + size.x * 0.6 + 2.0, center.y - size.y * 0.5 + 1.0, center.z);
     let sphere_radius = 6.0;
+    let ground_y = -1.5;
+    let sphere_pos = glam::Vec3::new(
+        center.x + size.x * 0.6 + 2.0,
+        ground_y + sphere_radius,
+        center.z,
+    );
     let (camera_pos, camera_target) = scene_kind.default_camera(center);
     let mut camera = Camera::look_at(camera_pos, camera_target);
     let mut uniforms = SceneUniforms {
@@ -232,8 +252,12 @@ pub async fn run() {
         _pad: [0; 7],
     };
 
-    let mut sun_azimuth_deg = uniforms.light_pos[2].atan2(uniforms.light_pos[0]).to_degrees();
-    let sun_len_xz = (uniforms.light_pos[0] * uniforms.light_pos[0] + uniforms.light_pos[2] * uniforms.light_pos[2]).sqrt();
+    let mut sun_azimuth_deg = uniforms.light_pos[2]
+        .atan2(uniforms.light_pos[0])
+        .to_degrees();
+    let sun_len_xz = (uniforms.light_pos[0] * uniforms.light_pos[0]
+        + uniforms.light_pos[2] * uniforms.light_pos[2])
+        .sqrt();
     let mut sun_elevation_deg = uniforms.light_pos[1].atan2(sun_len_xz).to_degrees();
     let mut sun_intensity = uniforms.sun_intensity;
 
@@ -271,7 +295,9 @@ pub async fn run() {
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+                ty: wgpu::BindingType::AccelerationStructure {
+                    vertex_return: false,
+                },
                 count: None,
             },
             wgpu::BindGroupLayoutEntry {
@@ -344,11 +370,51 @@ pub async fn run() {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
     let compute_pass = compute_pass::ComputePass::new(&device, &ubind, render_width, render_height);
     let quad_pass = quad_pass::QuadPass::new(&device, surface_format, compute_pass.output_view());
+    let mut photon_mapper = PhotonMapper::new(
+        &device,
+        &queue,
+        &tlas,
+        &pos_buf,
+        &nrm_buf,
+        &idx_buf,
+        &tri_mat_buf,
+        &mat_buf,
+    );
 
     let ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ugroup"),
@@ -389,6 +455,18 @@ pub async fn run() {
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: wgpu::BindingResource::TextureView(compute_pass.output_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: photon_mapper.photon_buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: photon_mapper.hash_heads().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: photon_mapper.uniforms_buffer().as_entire_binding(),
             },
         ],
     });
@@ -437,46 +515,82 @@ pub async fn run() {
                 ElementState::Pressed => {
                     if let winit::keyboard::Key::Character(c) = &event.logical_key {
                         keys_pressed.insert(c.to_lowercase().to_string());
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
+                    {
                         keys_pressed.insert("Space".to_string());
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft)
-                        || event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftRight)
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft)
+                        || event.physical_key
+                            == winit::keyboard::PhysicalKey::Code(
+                                winit::keyboard::KeyCode::ShiftRight,
+                            )
                     {
                         keys_pressed.insert("Shift".to_string());
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft)
-                        || event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlRight)
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft)
+                        || event.physical_key
+                            == winit::keyboard::PhysicalKey::Code(
+                                winit::keyboard::KeyCode::ControlRight,
+                            )
                     {
                         keys_pressed.insert("Control".to_string());
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowUp) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowUp)
+                    {
                         keys_pressed.insert("ArrowUp".to_string());
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowDown) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowDown)
+                    {
                         keys_pressed.insert("ArrowDown".to_string());
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowLeft) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowLeft)
+                    {
                         keys_pressed.insert("ArrowLeft".to_string());
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowRight) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowRight)
+                    {
                         keys_pressed.insert("ArrowRight".to_string());
                     }
                 }
                 ElementState::Released => {
                     if let winit::keyboard::Key::Character(c) = &event.logical_key {
                         keys_pressed.remove(&c.to_lowercase().to_string());
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
+                    {
                         keys_pressed.remove("Space");
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft)
-                        || event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftRight)
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft)
+                        || event.physical_key
+                            == winit::keyboard::PhysicalKey::Code(
+                                winit::keyboard::KeyCode::ShiftRight,
+                            )
                     {
                         keys_pressed.remove("Shift");
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft)
-                        || event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlRight)
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft)
+                        || event.physical_key
+                            == winit::keyboard::PhysicalKey::Code(
+                                winit::keyboard::KeyCode::ControlRight,
+                            )
                     {
                         keys_pressed.remove("Control");
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowUp) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowUp)
+                    {
                         keys_pressed.remove("ArrowUp");
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowDown) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowDown)
+                    {
                         keys_pressed.remove("ArrowDown");
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowLeft) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowLeft)
+                    {
                         keys_pressed.remove("ArrowLeft");
-                    } else if event.physical_key == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowRight) {
+                    } else if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowRight)
+                    {
                         keys_pressed.remove("ArrowRight");
                     }
                 }
@@ -529,7 +643,11 @@ pub async fn run() {
                     let prev_cam_pos = camera.pos;
                     let prev_cam_yaw = camera.yaw;
                     let prev_cam_pitch = camera.pitch;
-                    let sprint = if keys_pressed.contains("Shift") { 3.0 } else { 1.0 };
+                    let sprint = if keys_pressed.contains("Shift") {
+                        3.0
+                    } else {
+                        1.0
+                    };
                     let wants_keyboard = imgui.io().want_capture_keyboard;
 
                     if !wants_keyboard && keys_pressed.contains("w") {
@@ -566,13 +684,21 @@ pub async fn run() {
                     }
 
                     uniforms.view_inv = camera.view_matrix().inverse().to_cols_array_2d();
-                    if camera.pos != prev_cam_pos || camera.yaw != prev_cam_yaw || camera.pitch != prev_cam_pitch {
+                    if camera.pos != prev_cam_pos
+                        || camera.yaw != prev_cam_yaw
+                        || camera.pitch != prev_cam_pitch
+                    {
                         accumulation_dirty = true;
                     }
 
                     match surface.get_current_texture() {
-                        wgpu::CurrentSurfaceTexture::Success(tex) | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => {
-                            imgui.io_mut().update_delta_time(std::time::Duration::from_secs_f32(dt.max(1.0 / 1000.0)));
+                        wgpu::CurrentSurfaceTexture::Success(tex)
+                        | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => {
+                            imgui
+                                .io_mut()
+                                .update_delta_time(std::time::Duration::from_secs_f32(
+                                    dt.max(1.0 / 1000.0),
+                                ));
                             if platform.prepare_frame(imgui.io_mut(), &window).is_err() {
                                 tex.present();
                                 return;
@@ -597,9 +723,12 @@ pub async fn run() {
                             ui.window("Sun Controls")
                                 .size([300.0, 160.0], Condition::FirstUseEver)
                                 .build(|| {
-                                    ui.slider_config("Azimuth (deg)", -180.0, 180.0).build(&mut sun_azimuth_deg);
-                                    ui.slider_config("Elevation (deg)", -10.0, 89.0).build(&mut sun_elevation_deg);
-                                    ui.slider_config("Intensity", 0.0, 5.0).build(&mut sun_intensity);
+                                    ui.slider_config("Azimuth (deg)", -180.0, 180.0)
+                                        .build(&mut sun_azimuth_deg);
+                                    ui.slider_config("Elevation (deg)", -10.0, 89.0)
+                                        .build(&mut sun_elevation_deg);
+                                    ui.slider_config("Intensity", 0.0, 5.0)
+                                        .build(&mut sun_intensity);
                                 });
 
                             if requested_scene != scene_kind {
@@ -607,7 +736,8 @@ pub async fn run() {
                                 uniforms.scene_kind = scene_kind.index();
                                 let (camera_pos, camera_target) = scene_kind.default_camera(center);
                                 camera = Camera::look_at(camera_pos, camera_target);
-                                uniforms.view_inv = camera.view_matrix().inverse().to_cols_array_2d();
+                                uniforms.view_inv =
+                                    camera.view_matrix().inverse().to_cols_array_2d();
                                 accumulation_dirty = true;
                             }
 
@@ -625,7 +755,8 @@ pub async fn run() {
                             uniforms.sun_intensity = sun_intensity.max(0.0);
                             uniforms.scene_kind = scene_kind.index();
 
-                            let sun_changed = uniforms.light_pos != old_light || (uniforms.sun_intensity - old_intensity).abs() > f32::EPSILON;
+                            let sun_changed = uniforms.light_pos != old_light
+                                || (uniforms.sun_intensity - old_intensity).abs() > f32::EPSILON;
                             if accumulation_dirty || sun_changed {
                                 uniforms.frame = 0;
                                 let zeros = vec![0u8; accum_byte_size as usize];
@@ -636,50 +767,74 @@ pub async fn run() {
                             }
                             queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
 
-                            let view = tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
-                            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
+                            let view = tex
+                                .texture
+                                .create_view(&wgpu::TextureViewDescriptor::default());
+                            let mut encoder =
+                                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("enc"),
+                                });
+                            photon_mapper.update(
+                                &queue,
+                                uniforms.light_pos,
+                                [center.x, center.y, center.z, max_extent * 0.85],
+                                uniforms.frame,
+                            );
+                            photon_mapper.emit_photons(&mut encoder, 262_144);
+                            photon_mapper.build_spatial_structure(&mut encoder);
                             {
                                 compute_pass.record(&mut encoder, &ugroup);
                             }
                             {
-                                let mut present_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("present_pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: &view,
-                                        resolve_target: None,
-                                        depth_slice: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    multiview_mask: None,
-                                    occlusion_query_set: None,
-                                    timestamp_writes: None,
-                                });
+                                let mut present_rpass =
+                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("present_pass"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: &view,
+                                                resolve_target: None,
+                                                depth_slice: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        multiview_mask: None,
+                                        occlusion_query_set: None,
+                                        timestamp_writes: None,
+                                    });
                                 quad_pass.render(&mut present_rpass);
                             }
                             platform.prepare_render(ui, &window);
                             let draw_data = imgui.render();
                             {
-                                let mut ui_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("imgui-pass"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: &view,
-                                        resolve_target: None,
-                                        depth_slice: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Load,
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    multiview_mask: None,
-                                    occlusion_query_set: None,
-                                    timestamp_writes: None,
-                                });
-                                let _ = imgui_renderer.render(draw_data, &queue, &device, &mut ui_rpass);
+                                let mut ui_rpass =
+                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("imgui-pass"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: &view,
+                                                resolve_target: None,
+                                                depth_slice: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Load,
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        multiview_mask: None,
+                                        occlusion_query_set: None,
+                                        timestamp_writes: None,
+                                    });
+                                let _ = imgui_renderer.render(
+                                    draw_data,
+                                    &queue,
+                                    &device,
+                                    &mut ui_rpass,
+                                );
                             }
                             queue.submit(Some(encoder.finish()));
                             tex.present();

@@ -47,6 +47,35 @@ var<storage, read> materials: array<MaterialData>;
 @group(0) @binding(8)
 var output_image: texture_storage_2d<rgba8unorm, write>;
 
+struct Photon {
+  position: vec3<f32>,
+  pad0: f32,
+  direction: vec3<f32>,
+  pad1: f32,
+  power: vec3<f32>,
+  pad2: f32,
+  next: u32,
+  pad3: vec3<u32>,
+};
+
+struct PhotonMapUniforms {
+  light_pos: vec4<f32>,
+  emitter_center: vec4<f32>,
+  photon_count: u32,
+  voxel_size: f32,
+  hash_table_size: u32,
+  frame: u32,
+};
+
+@group(0) @binding(9)
+var<storage, read> photons: array<Photon>;
+
+@group(0) @binding(10)
+var<storage, read> photon_hash_heads: array<u32>;
+
+@group(0) @binding(11)
+var<uniform> photon_uniforms: PhotonMapUniforms;
+
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) tex_coords: vec2<f32>,
@@ -150,6 +179,51 @@ fn randu(seed: u32) -> u32 {
 
 fn rand01(seed: u32) -> f32 {
   return f32(randu(seed) & 0x00FFFFFFu) / 16777215.0;
+}
+
+fn photon_spatial_hash(cell: vec3<i32>) -> u32 {
+  let x = u32(cell.x) * 73856093u;
+  let y = u32(cell.y) * 19349663u;
+  let z = u32(cell.z) * 83492791u;
+  return (x ^ y ^ z) % max(photon_uniforms.hash_table_size, 1u);
+}
+
+fn estimate_photon_density(position: vec3<f32>, normal: vec3<f32>, radius: f32) -> vec3<f32> {
+  let count = photon_uniforms.photon_count;
+  if (count == 0u) {
+    return vec3<f32>(0.0);
+  }
+
+  let base_cell = vec3<i32>(floor(position / photon_uniforms.voxel_size));
+  let radius2 = radius * radius;
+  var flux = vec3<f32>(0.0);
+
+  for (var oz = -1; oz <= 1; oz = oz + 1) {
+    for (var oy = -1; oy <= 1; oy = oy + 1) {
+      for (var ox = -1; ox <= 1; ox = ox + 1) {
+        var node = photon_hash_heads[photon_spatial_hash(base_cell + vec3<i32>(ox, oy, oz))];
+        var visited = 0u;
+        loop {
+          if (node == 0u || visited >= 128u) {
+            break;
+          }
+          let photon = photons[node - 1u];
+          let delta = photon.position - position;
+          let d2 = dot(delta, delta);
+          let same_side = dot(normal, photon.direction) > 0.0;
+          if (d2 <= radius2 && same_side) {
+            let kernel = 1.0 - d2 / max(radius2, 1e-5);
+            flux = flux + photon.power * kernel;
+          }
+          node = photon.next;
+          visited = visited + 1u;
+        }
+      }
+    }
+  }
+
+  let area = 3.141592653589793 * radius2;
+  return flux / max(area, 1e-4);
 }
 
 fn wl(lambda_nm: f32) -> vec3<f32> {
@@ -457,7 +531,8 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       let nl = max(dot(normal, to_light), 0.0);
       let base = select(vec3<f32>(0.08), vec3<f32>(0.05), hit_type == 1u);
       let sun_color = vec3<f32>(1.0, 0.94, 0.82);
-      L = L + throughput * (base + albedo * sun_color * nl * uniforms.sun_intensity) * spectral_weight;
+      let photon_indirect = estimate_photon_density(hit_pos, normal, photon_uniforms.voxel_size * 1.5);
+      L = L + throughput * (base + photon_indirect * albedo + albedo * sun_color * nl * uniforms.sun_intensity) * spectral_weight;
       break;
     }
 
@@ -497,7 +572,8 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
 
     // If diffuse surface is shadowed, keep only small ambient and terminate.
     if (transmission < 0.5) {
-      L = L + throughput * (vec3<f32>(0.04) * albedo) * spectral_weight;
+      let photon_indirect = estimate_photon_density(hit_pos, normal, photon_uniforms.voxel_size * 1.5);
+      L = L + throughput * ((vec3<f32>(0.04) + photon_indirect) * albedo) * spectral_weight;
       break;
     }
 
