@@ -253,7 +253,7 @@ impl MaterialGraphEditor {
                             nid,
                             "Roughness".to_string(),
                             SocketType::Scalar,
-                            SocketValue::Scalar(0.03),
+                            SocketValue::Scalar(shader_node.properties.roughness.unwrap_or(0.03)),
                             InputParamKind::ConnectionOrConstant,
                             true,
                         );
@@ -262,7 +262,7 @@ impl MaterialGraphEditor {
                             nid,
                             "Transmission".to_string(),
                             SocketType::Scalar,
-                            SocketValue::Scalar(1.0),
+                            SocketValue::Scalar(shader_node.properties.transmission.unwrap_or(1.0)),
                             InputParamKind::ConnectionOrConstant,
                             true,
                         );
@@ -271,7 +271,7 @@ impl MaterialGraphEditor {
                             nid,
                             "IOR".to_string(),
                             SocketType::Scalar,
-                            SocketValue::Scalar(1.52),
+                            SocketValue::Scalar(shader_node.properties.ior.unwrap_or(1.52)),
                             InputParamKind::ConnectionOrConstant,
                             true,
                         );
@@ -367,5 +367,46 @@ impl MaterialGraphEditor {
         preview.transmission = preview.transmission.clamp(0.0, 1.0);
         preview.ior = preview.ior.max(1.0);
         preview
+    }
+
+    pub fn commit_to_material(&self, material: &mut MaterialData) {
+        let preview = self.runtime_preview();
+        let mut bsdf_node_idx = None;
+        let mut output_node_idx = None;
+        for idx in material.graph.node_indices() {
+            match material.graph[idx].node_type {
+                NodeType::PrincipledBSDF => bsdf_node_idx = Some(idx),
+                NodeType::MaterialOutput => output_node_idx = Some(idx),
+                _ => {}
+            }
+        }
+        if let Some(bsdf_idx) = bsdf_node_idx {
+            let props = &mut material.graph[bsdf_idx].properties;
+            props.vec3_value = Some(preview.base_color);
+            props.roughness = Some(preview.roughness);
+            props.transmission = Some(preview.transmission);
+            props.ior = Some(preview.ior);
+            props.bsdf_connected = Some(preview.bsdf_connected);
+        }
+        if let (Some(bsdf_idx), Some(output_idx)) = (bsdf_node_idx, output_node_idx) {
+            let existing: Vec<_> = material
+                .graph
+                .edges_connecting(bsdf_idx, output_idx)
+                .map(|e| e.id())
+                .collect();
+            for edge_id in existing {
+                material.graph.remove_edge(edge_id);
+            }
+            if preview.bsdf_connected {
+                material.graph.add_edge(
+                    bsdf_idx,
+                    output_idx,
+                    crate::prism_file::NodeLink {
+                        output_socket: "BSDF".to_string(),
+                        input_socket: "Surface".to_string(),
+                    },
+                );
+            }
+        }
     }
 }

@@ -136,6 +136,10 @@ fn make_white_material() -> PrismMaterialData {
                 properties: NodeProperties {
                     float_value: Some(1.0),
                     vec3_value: Some([1.0, 1.0, 1.0]),
+                    roughness: None,
+                    transmission: None,
+                    ior: None,
+                    bsdf_connected: None,
                 },
             });
             g.add_edge(
@@ -161,6 +165,10 @@ fn make_glass_material() -> PrismMaterialData {
                 properties: NodeProperties {
                     float_value: None,
                     vec3_value: Some([0.98, 1.0, 1.0]),
+                    roughness: Some(0.02),
+                    transmission: Some(1.0),
+                    ior: Some(1.52),
+                    bsdf_connected: Some(true),
                 },
             });
             let n_out = g.add_node(ShaderNode {
@@ -180,8 +188,47 @@ fn make_glass_material() -> PrismMaterialData {
     }
 }
 
-fn material_is_glass(name: &str) -> bool {
-    name.eq_ignore_ascii_case("glass")
+fn preview_from_material_data(material: Option<&PrismMaterialData>) -> RuntimeMaterialPreview {
+    let mut out = RuntimeMaterialPreview::default();
+    let Some(material) = material else {
+        return out;
+    };
+    let mut bsdf_idx = None;
+    let mut out_idx = None;
+    for idx in material.graph.node_indices() {
+        match material.graph[idx].node_type {
+            NodeType::PrincipledBSDF => bsdf_idx = Some(idx),
+            NodeType::MaterialOutput => out_idx = Some(idx),
+            _ => {}
+        }
+    }
+    if let Some(bi) = bsdf_idx {
+        let props = &material.graph[bi].properties;
+        if let Some(v) = props.vec3_value {
+            out.base_color = v;
+        }
+        if let Some(v) = props.roughness {
+            out.roughness = v;
+        }
+        if let Some(v) = props.transmission {
+            out.transmission = v;
+        }
+        if let Some(v) = props.ior {
+            out.ior = v;
+        }
+    }
+    if let (Some(bi), Some(oi)) = (bsdf_idx, out_idx) {
+        out.bsdf_connected = material.graph.edges_connecting(bi, oi).any(|edge| {
+            edge.weight().output_socket == "BSDF" && edge.weight().input_socket == "Surface"
+        });
+        if let Some(v) = material.graph[bi].properties.bsdf_connected {
+            out.bsdf_connected = v;
+        }
+    }
+    out.roughness = out.roughness.clamp(0.001, 1.0);
+    out.transmission = out.transmission.clamp(0.0, 1.0);
+    out.ior = out.ior.max(1.0);
+    out
 }
 
 fn build_prism_database_from_main(
@@ -216,14 +263,9 @@ fn build_prism_database_from_main(
         std::collections::HashMap::new();
     for (oid, obj) in &main_db.objects {
         let mesh_link = obj.mesh_id.and_then(|m| mesh_map.get(&m).copied());
-        let object_material = if obj.mesh_id.is_some() {
-            object_material_names
-                .get(oid)
-                .and_then(|name| material_map.get(name).copied())
-                .or_else(|| material_map.get("White").copied())
-        } else {
-            None
-        };
+        let object_material = object_material_names
+            .get(oid)
+            .and_then(|name| material_map.get(name).copied());
         let h = out.objects.insert(PrismObjectData {
             name: obj.name.clone(),
             transform_matrix: transform_to_matrix(&obj.transform),
@@ -1426,6 +1468,14 @@ pub async fn run() {
                                                     object_material_names.clear();
                                                     material_library.clear();
                                                     material_library.insert("White".to_string(), make_white_material());
+                                                    material_library.insert("Glass".to_string(), make_glass_material());
+                                                    object_material_names.insert(sphere_obj_id, "Glass".to_string());
+                                                    object_material_names.insert(decanter_obj_id, "Glass".to_string());
+                                                    object_material_names.insert(wine_obj_id, "Glass".to_string());
+                                                    object_material_names.insert(cornell_obj_id, "White".to_string());
+                                                    for (_mh, mat) in loaded.materials.iter() {
+                                                        material_library.insert(mat.name.clone(), mat.clone());
+                                                    }
                                                     for (_sh, scene) in loaded.scenes.iter() {
                                                         let scene_name = scene.name.to_ascii_lowercase();
                                                         let local_master = main_db.create_collection(format!("{}Master", scene.name));
@@ -1672,31 +1722,23 @@ pub async fn run() {
                                                         .selected_text(&mat_name)
                                                         .show_ui(ui, |ui| {
                                                             for key in material_library.keys() {
-                                                                ui.selectable_value(
-                                                                    &mut mat_name,
-                                                                    key.clone(),
-                                                                    key,
-                                                                );
+                                                                ui.selectable_value(&mut mat_name, key.clone(), key);
                                                             }
-                                                            ui.selectable_value(
-                                                                &mut mat_name,
-                                                                "White".to_string(),
-                                                                "White",
-                                                            );
                                                         });
                                                     object_material_names.insert(obj_id, mat_name.clone());
                                                     if let Some(mat) = material_library.get(&mat_name) {
-                                                        let graph_key = format!("{}::{mat_name}", obj_id.0);
+                                                        let graph_key = mat_name.clone();
                                                         ui.label(format!("Graph: {}", mat.name));
                                                         material_editor.load_material(&graph_key, mat);
                                                         egui::Frame::default().show(ui, |ui| {
                                                             ui.set_min_height(280.0);
                                                             material_editor.show(ui);
                                                         });
-                                                        material_runtime_overrides.insert(
-                                                            mat_name.clone(),
-                                                            material_editor.runtime_preview(),
-                                                        );
+                                                        if let Some(mat_mut) = material_library.get_mut(&mat_name) {
+                                                            material_editor.commit_to_material(mat_mut);
+                                                        }
+                                                        material_runtime_overrides
+                                                            .insert(mat_name.clone(), material_editor.runtime_preview());
                                                     } else {
                                                         ui.label("White fallback (no material graph).");
                                                     }
@@ -2430,19 +2472,7 @@ pub async fn run() {
                             let sphere_preview = material_runtime_overrides
                                 .get(&sphere_mat)
                                 .copied()
-                                .unwrap_or_else(|| {
-                                    if material_is_glass(&sphere_mat) {
-                                        RuntimeMaterialPreview {
-                                            bsdf_connected: true,
-                                            base_color: [0.98, 1.0, 1.0],
-                                            roughness: 0.02,
-                                            transmission: 1.0,
-                                            ior: 1.52,
-                                        }
-                                    } else {
-                                        RuntimeMaterialPreview::default()
-                                    }
-                                });
+                                .unwrap_or_else(|| preview_from_material_data(material_library.get(&sphere_mat)));
                             uniforms.sphere_color = [
                                 sphere_preview.base_color[0],
                                 sphere_preview.base_color[1],
@@ -2464,10 +2494,18 @@ pub async fn run() {
                                 .get(&decanter_obj_id)
                                 .cloned()
                                 .unwrap_or_else(|| "White".to_string());
+                            let decanter_preview = material_runtime_overrides
+                                .get(&decanter_mat)
+                                .copied()
+                                .unwrap_or_else(|| preview_from_material_data(material_library.get(&decanter_mat)));
                             let wine_mat = object_material_names
                                 .get(&wine_obj_id)
                                 .cloned()
                                 .unwrap_or_else(|| "White".to_string());
+                            let wine_preview = material_runtime_overrides
+                                .get(&wine_mat)
+                                .copied()
+                                .unwrap_or_else(|| preview_from_material_data(material_library.get(&wine_mat)));
                             let cornell_mat = object_material_names
                                 .get(&cornell_obj_id)
                                 .cloned()
@@ -2475,19 +2513,7 @@ pub async fn run() {
                             let cornell_preview = material_runtime_overrides
                                 .get(&cornell_mat)
                                 .copied()
-                                .unwrap_or_else(|| {
-                                    if material_is_glass(&cornell_mat) {
-                                        RuntimeMaterialPreview {
-                                            bsdf_connected: true,
-                                            base_color: [0.98, 1.0, 1.0],
-                                            roughness: 0.02,
-                                            transmission: 1.0,
-                                            ior: 1.52,
-                                        }
-                                    } else {
-                                        RuntimeMaterialPreview::default()
-                                    }
-                                });
+                                .unwrap_or_else(|| preview_from_material_data(material_library.get(&cornell_mat)));
                             uniforms.cornell_color = [
                                 cornell_preview.base_color[0],
                                 cornell_preview.base_color[1],
@@ -2504,8 +2530,9 @@ pub async fn run() {
                                 if cornell_preview.bsdf_connected { 1.0 } else { 0.0 },
                                 0.0,
                             ];
-                            let material_signature =
-                                format!("{sphere_mat}|{decanter_mat}|{wine_mat}|{cornell_mat}");
+                            let material_signature = format!(
+                                "{sphere_mat}:{sphere_preview:?}|{decanter_mat}:{decanter_preview:?}|{wine_mat}:{wine_preview:?}|{cornell_mat}:{cornell_preview:?}"
+                            );
                             if material_signature != last_material_signature {
                                 let set_range = |materials: &mut [crate::mesh::GpuMaterial],
                                                  start: usize,
@@ -2552,44 +2579,14 @@ pub async fn run() {
                                     &mut mesh.materials,
                                     decanter_material_start,
                                     decanter_material_count,
-                                    material_runtime_overrides
-                                        .get(&decanter_mat)
-                                        .copied()
-                                        .unwrap_or_else(|| {
-                                            if material_is_glass(&decanter_mat) {
-                                                RuntimeMaterialPreview {
-                                                    bsdf_connected: true,
-                                                    base_color: [0.98, 1.0, 1.0],
-                                                    roughness: 0.02,
-                                                    transmission: 1.0,
-                                                    ior: 1.52,
-                                                }
-                                            } else {
-                                                RuntimeMaterialPreview::default()
-                                            }
-                                        }),
+                                    decanter_preview,
                                     false,
                                 );
                                 set_range(
                                     &mut mesh.materials,
                                     wine_material_start,
                                     wine_material_count,
-                                    material_runtime_overrides
-                                        .get(&wine_mat)
-                                        .copied()
-                                        .unwrap_or_else(|| {
-                                            if material_is_glass(&wine_mat) {
-                                                RuntimeMaterialPreview {
-                                                    bsdf_connected: true,
-                                                    base_color: [0.62, 0.11, 0.16],
-                                                    roughness: 0.01,
-                                                    transmission: 1.0,
-                                                    ior: 1.36,
-                                                }
-                                            } else {
-                                                RuntimeMaterialPreview::default()
-                                            }
-                                        }),
+                                    wine_preview,
                                     true,
                                 );
                                 queue.write_buffer(&mat_buf, 0, bytemuck::cast_slice(&mesh.materials));

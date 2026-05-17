@@ -70,6 +70,10 @@ pub enum NodeType {
 pub struct NodeProperties {
     pub float_value: Option<f32>,
     pub vec3_value: Option<[f32; 3]>,
+    pub roughness: Option<f32>,
+    pub transmission: Option<f32>,
+    pub ior: Option<f32>,
+    pub bsdf_connected: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
