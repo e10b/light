@@ -1,14 +1,16 @@
 pub struct ComputePass {
     pipeline: wgpu::ComputePipeline,
-    _texture: wgpu::Texture,
-    texture_view: wgpu::TextureView,
+    _color_texture: wgpu::Texture,
+    color_texture_view: wgpu::TextureView,
+    _selection_mask_texture: wgpu::Texture,
+    selection_mask_texture_view: wgpu::TextureView,
     width: u32,
     height: u32,
 }
 
 impl ComputePass {
     pub fn new(device: &wgpu::Device, bind_group_layout: &wgpu::BindGroupLayout, width: u32, height: u32) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("compute_output_texture"),
             size: wgpu::Extent3d {
                 width,
@@ -24,7 +26,23 @@ impl ComputePass {
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_texture_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let selection_mask_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("selection_mask_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let selection_mask_texture_view =
+            selection_mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("compute_pathtracer"),
@@ -48,15 +66,21 @@ impl ComputePass {
 
         Self {
             pipeline,
-            _texture: texture,
-            texture_view,
+            _color_texture: color_texture,
+            color_texture_view,
+            _selection_mask_texture: selection_mask_texture,
+            selection_mask_texture_view,
             width,
             height,
         }
     }
 
     pub fn output_view(&self) -> &wgpu::TextureView {
-        &self.texture_view
+        &self.color_texture_view
+    }
+
+    pub fn selection_mask_view(&self) -> &wgpu::TextureView {
+        &self.selection_mask_texture_view
     }
 
     pub fn record(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup) {

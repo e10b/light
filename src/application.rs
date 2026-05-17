@@ -619,11 +619,26 @@ pub async fn run() {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 12,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
         ],
     });
 
     let compute_pass = compute_pass::ComputePass::new(&device, &ubind, render_width, render_height);
-    let quad_pass = quad_pass::QuadPass::new(&device, surface_format, compute_pass.output_view());
+    let quad_pass = quad_pass::QuadPass::new(
+        &device,
+        surface_format,
+        compute_pass.output_view(),
+        compute_pass.selection_mask_view(),
+    );
     let mut photon_mapper = PhotonMapper::new(
         &device,
         &queue,
@@ -686,6 +701,10 @@ pub async fn run() {
             wgpu::BindGroupEntry {
                 binding: 11,
                 resource: photon_mapper.uniforms_buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(compute_pass.selection_mask_view()),
             },
         ],
     });

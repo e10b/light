@@ -78,6 +78,9 @@ var<storage, read> photon_hash_heads: array<u32>;
 @group(0) @binding(11)
 var<uniform> photon_uniforms: PhotonMapUniforms;
 
+@group(0) @binding(12)
+var selection_mask_out: texture_storage_2d<rgba8unorm, write>;
+
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) tex_coords: vec2<f32>,
@@ -471,7 +474,6 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     var roughness = 0.2;
     var transmission = 0.0;
     var ior = 1.5;
-    var selected_hit = false;
 
     if (hit_type == 1u) {
       // Sphere: allow glass behavior via sphere_color.w toggle
@@ -481,7 +483,6 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       roughness = 0.0025;
       transmission = clamp(uniforms.sphere_color.w, 0.0, 1.0);
       ior = 1.52;
-      selected_hit = uniforms.selected_object == 1u;
     } else if (hit_type == 2u) {
       // True triangle normal/material from ray-query primitive + barycentrics.
       let prim = tri_hit.primitive_index;
@@ -514,10 +515,6 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
         roughness = min(roughness, 0.003);
         albedo = mix(albedo, vec3<f32>(1.0), 0.85);
       }
-      let within_wine = distance(hit_pos, uniforms.mesh_center.xyz) <= uniforms.mesh_center.w;
-      let within_decanter = distance(hit_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
-      selected_hit = (uniforms.selected_object == 2u && within_wine)
-        || (uniforms.selected_object == 3u && within_decanter);
     } else {
       // Ground
       normal = vec3<f32>(0.0, 1.0, 0.0);
@@ -536,11 +533,6 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       ior = 1.0;
     }
 
-    if (bounce == 1u && selected_hit) {
-      let outline = pow(1.0 - abs(dot(normalize(normal), normalize(-rd))), 5.0);
-      let orange = vec3<f32>(1.0, 0.42, 0.08);
-      L = L + throughput * orange * (0.08 + outline * 1.2);
-    }
 
     // Decanter uses directional sun; Wine uses a local spotlight aimed at the glass.
     let spot_position = uniforms.light_pos.xyz;
@@ -649,6 +641,62 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
   return L;
 }
 
+fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
+  if (uniforms.selected_object == 0u) {
+    return 0.0;
+  }
+  let is_wine_scene = uniforms.scene_kind == 2u;
+  var ro = origin;
+  let rd = direction;
+
+  let sph = uniforms.sphere_pos;
+  let sphere_center = sph.xyz;
+  let sphere_r = sph.w;
+  let oc = ro - sphere_center;
+  let a = dot(rd, rd);
+  let b = dot(oc, rd);
+  let c = dot(oc, oc) - sphere_r * sphere_r;
+  var t_sphere = 1e38;
+  let disc = b * b - a * c;
+  if (!is_wine_scene && disc > 0.0) {
+    let sq = sqrt(disc);
+    let t1 = (-b - sq) / a;
+    let t2 = (-b + sq) / a;
+    if (t1 > 0.001) { t_sphere = t1; } else if (t2 > 0.001) { t_sphere = t2; }
+  }
+
+  var rq: ray_query;
+  rayQueryInitialize(&rq, acc_struct, RayDesc(0u, 0xFFu, 0.001, 1000.0, ro, rd));
+  rayQueryProceed(&rq);
+  let tri_hit = rayQueryGetCommittedIntersection(&rq);
+  var t_tri = 1e38;
+  if (tri_hit.kind != RAY_QUERY_INTERSECTION_NONE) { t_tri = tri_hit.t; }
+
+  let t_ground = ground_plane_intersection(ro, rd);
+  var hit_t = 1e38;
+  var hit_type = 0u;
+  if (t_sphere < hit_t) { hit_t = t_sphere; hit_type = 1u; }
+  if (t_tri < hit_t) { hit_t = t_tri; hit_type = 2u; }
+  if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
+  if (hit_type == 0u || hit_type == 3u) {
+    return 0.0;
+  }
+  if (hit_type == 1u) {
+    return select(0.0, 1.0, uniforms.selected_object == 1u);
+  }
+
+  let hit_pos = ro + rd * hit_t;
+  let within_wine = distance(hit_pos, uniforms.mesh_center.xyz) <= uniforms.mesh_center.w;
+  let within_decanter = distance(hit_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
+  if (uniforms.selected_object == 2u && within_wine) {
+    return 1.0;
+  }
+  if (uniforms.selected_object == 3u && within_decanter) {
+    return 1.0;
+  }
+  return 0.0;
+}
+
 @fragment
 fn fs_main(vertex: VertexOut) -> @location(0) vec4<f32> {
   // Normalize screen coordinates to [-1, 1], flip Y to fix upside-down rendering
@@ -715,6 +763,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let seed = uniforms.frame * 1973u + px * 9277u + py * 7013u + 1u;
   let sample_color = trace_ray(origin, direction, seed);
+  let selected_mask = selection_mask_ray(origin, direction);
 
   var accum_color = sample_color;
   if (uniforms.frame > 0u) {
@@ -725,4 +774,5 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   accum[idx] = vec4<f32>(accum_color, 1.0);
   textureStore(output_image, vec2<i32>(i32(px), i32(py)), vec4<f32>(sqrt(max(accum_color, vec3<f32>(0.0))), 1.0));
+  textureStore(selection_mask_out, vec2<i32>(i32(px), i32(py)), vec4<f32>(selected_mask, 0.0, 0.0, 1.0));
 }

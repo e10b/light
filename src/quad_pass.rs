@@ -5,7 +5,12 @@ pub struct QuadPass {
 }
 
 impl QuadPass {
-    pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat, source_view: &wgpu::TextureView) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        source_view: &wgpu::TextureView,
+        selection_mask_view: &wgpu::TextureView,
+    ) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("present_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -43,6 +48,16 @@ impl QuadPass {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -99,6 +114,10 @@ impl QuadPass {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(selection_mask_view),
                 },
             ],
         });
