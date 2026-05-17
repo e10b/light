@@ -54,6 +54,7 @@ enum GizmoTargetKind {
     Sphere,
     Decanter,
     WineGlass,
+    SunLamp,
     WineSpotlight,
 }
 
@@ -187,6 +188,25 @@ fn world_ray_from_cursor(
     let origin = (view_inv * glam::Vec4::new(0.0, 0.0, 0.0, 1.0)).truncate();
     let far_world = (view_inv * glam::Vec4::new(far_pos.x, far_pos.y, far_pos.z, 1.0)).truncate();
     (origin, (far_world - origin).normalize_or_zero())
+}
+
+fn world_to_screen(
+    point: glam::Vec3,
+    view: glam::Mat4,
+    proj: glam::Mat4,
+    viewport: [f32; 2],
+) -> Option<[f32; 2]> {
+    let clip = proj * view * glam::Vec4::new(point.x, point.y, point.z, 1.0);
+    if clip.w.abs() < 1e-6 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if ndc.z < -1.0 || ndc.z > 1.0 {
+        return None;
+    }
+    let x = (ndc.x * 0.5 + 0.5) * viewport[0];
+    let y = (1.0 - (ndc.y * 0.5 + 0.5)) * viewport[1];
+    Some([x, y])
 }
 
 fn intersect_sphere(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, radius: f32) -> Option<f32> {
@@ -476,6 +496,17 @@ pub async fn run() {
         .sqrt();
     let mut sun_elevation_deg = uniforms.light_pos[1].atan2(sun_len_xz).to_degrees();
     let mut sun_intensity = uniforms.sun_intensity;
+    let mut sun_lamp_distance = decanter_max_extent.max(8.0) * 2.2;
+    let mut sun_empty_rotation = glam::Quat::IDENTITY;
+    let mut sun_empty_scale = glam::Vec3::ONE;
+    let mut sun_empty_position = active_center
+        + glam::Vec3::new(
+            sun_azimuth_deg.to_radians().cos() * sun_elevation_deg.to_radians().cos(),
+            sun_elevation_deg.to_radians().sin(),
+            sun_azimuth_deg.to_radians().sin() * sun_elevation_deg.to_radians().cos(),
+        )
+        .normalize_or_zero()
+            * sun_lamp_distance;
     let mut wine_spotlight_azimuth_deg = -55.0;
     let mut wine_spotlight_elevation_deg = 54.0;
     let mut wine_spotlight_distance = wine_max_extent.max(10.0) * 1.4;
@@ -1012,6 +1043,10 @@ pub async fn run() {
                                         gizmo_target = GizmoTargetKind::WineGlass;
                                     }
                                     ui.same_line();
+                                    if ui.radio_button_bool("Sun Lamp", gizmo_target == GizmoTargetKind::SunLamp) {
+                                        gizmo_target = GizmoTargetKind::SunLamp;
+                                    }
+                                    ui.same_line();
                                     if ui.radio_button_bool("Spotlight", gizmo_target == GizmoTargetKind::WineSpotlight) {
                                         gizmo_target = GizmoTargetKind::WineSpotlight;
                                     }
@@ -1056,6 +1091,12 @@ pub async fn run() {
                                     {
                                         gizmo_target = GizmoTargetKind::WineGlass;
                                     }
+                                    if ui.selectable_config("Sun Lamp")
+                                        .selected(gizmo_target == GizmoTargetKind::SunLamp)
+                                        .build()
+                                    {
+                                        gizmo_target = GizmoTargetKind::SunLamp;
+                                    }
                                     if ui.selectable_config("Spotlight")
                                         .selected(gizmo_target == GizmoTargetKind::WineSpotlight)
                                         .build()
@@ -1063,48 +1104,6 @@ pub async fn run() {
                                         gizmo_target = GizmoTargetKind::WineSpotlight;
                                     }
                                 });
-
-                            if ui.is_mouse_clicked(MouseButton::Left) && !ui.io().want_capture_mouse {
-                                let display_size = ui.io().display_size;
-                                let (ro, rd) = world_ray_from_cursor(
-                                    ui.io().mouse_pos,
-                                    [display_size[0].max(1.0), display_size[1].max(1.0)],
-                                    camera.view_matrix().inverse(),
-                                    projection.inverse(),
-                                );
-                                let sphere_center =
-                                    glam::Vec3::new(uniforms.sphere_pos[0], uniforms.sphere_pos[1], uniforms.sphere_pos[2]);
-                                let decanter_center_now = decanter_center + decanter_translation;
-                                let wine_center_now = wine_center + wine_translation;
-                                let sphere_hit = intersect_sphere(ro, rd, sphere_center, uniforms.sphere_pos[3]);
-                                let decanter_hit = intersect_sphere(
-                                    ro,
-                                    rd,
-                                    decanter_center_now,
-                                    (decanter_max_extent * decanter_scale.max_element() * 0.55).max(0.25),
-                                );
-                                let wine_hit = intersect_sphere(ro, rd, wine_center_now, (wine_max_extent * 0.55).max(0.25));
-                                let mut best = gizmo_target;
-                                let mut best_t = f32::INFINITY;
-                                if let Some(t) = sphere_hit {
-                                    if t < best_t {
-                                        best_t = t;
-                                        best = GizmoTargetKind::Sphere;
-                                    }
-                                }
-                                if let Some(t) = decanter_hit {
-                                    if t < best_t {
-                                        best_t = t;
-                                        best = GizmoTargetKind::Decanter;
-                                    }
-                                }
-                                if let Some(t) = wine_hit {
-                                    if t < best_t {
-                                        best = GizmoTargetKind::WineGlass;
-                                    }
-                                }
-                                gizmo_target = best;
-                            }
 
                             if requested_scene != scene_kind {
                                 scene_kind = requested_scene;
@@ -1135,6 +1134,18 @@ pub async fn run() {
                                 camera = Camera::look_at(camera_pos, camera_target);
                                 uniforms.view_inv =
                                     camera.view_matrix().inverse().to_cols_array_2d();
+                                if scene_kind != SceneKind::Wine {
+                                    let sun_dir_reset = glam::Vec3::new(
+                                        sun_azimuth_deg.to_radians().cos()
+                                            * sun_elevation_deg.to_radians().cos(),
+                                        sun_elevation_deg.to_radians().sin(),
+                                        sun_azimuth_deg.to_radians().sin()
+                                            * sun_elevation_deg.to_radians().cos(),
+                                    )
+                                    .normalize_or_zero();
+                                    sun_empty_position =
+                                        active_center + sun_dir_reset * sun_lamp_distance.max(1.0);
+                                }
                                 accumulation_dirty = true;
                             }
 
@@ -1146,6 +1157,11 @@ pub async fn run() {
                                 sun_az.sin() * sun_el.cos(),
                             )
                             .normalize_or_zero();
+                            let sun_lamp_pos = if scene_kind == SceneKind::Wine {
+                                active_center + sun_dir * sun_lamp_distance.max(1.0)
+                            } else {
+                                sun_empty_position
+                            };
                             let old_light = uniforms.light_pos;
                             let old_intensity = uniforms.sun_intensity;
                             uniforms.light_pos = if scene_kind == SceneKind::Wine {
@@ -1157,7 +1173,11 @@ pub async fn run() {
                                 );
                                 [spot_position.x, spot_position.y, spot_position.z, -1.0]
                             } else {
-                                [sun_dir.x, sun_dir.y, sun_dir.z, 1.0]
+                                let d = (sun_lamp_pos - active_center).normalize_or_zero();
+                                sun_azimuth_deg = d.z.atan2(d.x).to_degrees();
+                                let len_xz = (d.x * d.x + d.z * d.z).sqrt().max(1e-5);
+                                sun_elevation_deg = d.y.atan2(len_xz).to_degrees();
+                                [d.x, d.y, d.z, 1.0]
                             };
 
                             let view = camera.view_matrix();
@@ -1299,6 +1319,26 @@ pub async fn run() {
                                         ),
                                     )
                                 }
+                                GizmoTargetKind::SunLamp => {
+                                    GizmoTransform::from_scale_rotation_translation(
+                                        transform_gizmo::math::DVec3::new(
+                                            sun_empty_scale.x as f64,
+                                            sun_empty_scale.y as f64,
+                                            sun_empty_scale.z as f64,
+                                        ),
+                                        transform_gizmo::math::DQuat::from_xyzw(
+                                            sun_empty_rotation.x as f64,
+                                            sun_empty_rotation.y as f64,
+                                            sun_empty_rotation.z as f64,
+                                            sun_empty_rotation.w as f64,
+                                        ),
+                                        transform_gizmo::math::DVec3::new(
+                                            sun_lamp_pos.x as f64,
+                                            sun_lamp_pos.y as f64,
+                                            sun_lamp_pos.z as f64,
+                                        ),
+                                    )
+                                }
                                 GizmoTargetKind::WineSpotlight => {
                                     GizmoTransform::from_scale_rotation_translation(
                                         transform_gizmo::math::DVec3::ONE,
@@ -1365,6 +1405,22 @@ pub async fn run() {
                                         );
                                         geometry_dirty = true;
                                     }
+                                    GizmoTargetKind::SunLamp => {
+                                        sun_empty_position = translation;
+                                        let to_sun = sun_empty_position - active_center;
+                                        sun_lamp_distance = to_sun.length().max(1.0);
+                                        sun_empty_rotation = glam::Quat::from_array([
+                                            new_t.rotation.v.x as f32,
+                                            new_t.rotation.v.y as f32,
+                                            new_t.rotation.v.z as f32,
+                                            new_t.rotation.s as f32,
+                                        ]);
+                                        sun_empty_scale = glam::Vec3::new(
+                                            (new_t.scale.x as f32).clamp(0.1, 8.0),
+                                            (new_t.scale.y as f32).clamp(0.1, 8.0),
+                                            (new_t.scale.z as f32).clamp(0.1, 8.0),
+                                        );
+                                    }
                                     GizmoTargetKind::WineSpotlight => {
                                         uniforms.light_pos[0] = translation.x;
                                         uniforms.light_pos[1] = translation.y;
@@ -1372,6 +1428,62 @@ pub async fn run() {
                                     }
                                 }
                                 accumulation_dirty = true;
+                            }
+
+                            if ui.is_mouse_clicked(MouseButton::Left)
+                                && !ui.io().want_capture_mouse
+                                && !gizmo.is_focused()
+                                && !ui.is_mouse_dragging(MouseButton::Left)
+                            {
+                                let display_size = ui.io().display_size;
+                                let (ro, rd) = world_ray_from_cursor(
+                                    ui.io().mouse_pos,
+                                    [display_size[0].max(1.0), display_size[1].max(1.0)],
+                                    camera.view_matrix().inverse(),
+                                    projection.inverse(),
+                                );
+                                let sphere_center = glam::Vec3::new(
+                                    uniforms.sphere_pos[0],
+                                    uniforms.sphere_pos[1],
+                                    uniforms.sphere_pos[2],
+                                );
+                                let decanter_center_now = decanter_center + decanter_translation;
+                                let wine_center_now = wine_center + wine_translation;
+                                let sphere_hit =
+                                    intersect_sphere(ro, rd, sphere_center, uniforms.sphere_pos[3]);
+                                let decanter_hit = intersect_sphere(
+                                    ro,
+                                    rd,
+                                    decanter_center_now,
+                                    (decanter_max_extent * decanter_scale.max_element() * 0.55)
+                                        .max(0.25),
+                                );
+                                let wine_hit = intersect_sphere(
+                                    ro,
+                                    rd,
+                                    wine_center_now,
+                                    (wine_max_extent * 0.55).max(0.25),
+                                );
+                                let mut best = gizmo_target;
+                                let mut best_t = f32::INFINITY;
+                                if let Some(t) = sphere_hit {
+                                    if t < best_t {
+                                        best_t = t;
+                                        best = GizmoTargetKind::Sphere;
+                                    }
+                                }
+                                if let Some(t) = decanter_hit {
+                                    if t < best_t {
+                                        best_t = t;
+                                        best = GizmoTargetKind::Decanter;
+                                    }
+                                }
+                                if let Some(t) = wine_hit {
+                                    if t < best_t {
+                                        best = GizmoTargetKind::WineGlass;
+                                    }
+                                }
+                                gizmo_target = best;
                             }
 
                             {
@@ -1396,6 +1508,23 @@ pub async fn run() {
                                     .filled(true)
                                     .build();
                                 }
+
+                                if scene_kind != SceneKind::Wine {
+                                    let display = [display_size[0].max(1.0), display_size[1].max(1.0)];
+                                    let sun_screen = world_to_screen(sun_lamp_pos, view, projection, display);
+                                    let center_screen = world_to_screen(active_center, view, projection, display);
+                                    if let (Some(s), Some(cn)) = (sun_screen, center_screen) {
+                                        let selected = gizmo_target == GizmoTargetKind::SunLamp;
+                                        let line_color = if selected {
+                                            imgui::ImColor32::from_rgba_f32s(1.0, 0.62, 0.15, 1.0)
+                                        } else {
+                                            imgui::ImColor32::from_rgba_f32s(1.0, 0.95, 0.6, 0.9)
+                                        };
+                                        fg.add_line([s[0], s[1]], [cn[0], cn[1]], line_color).thickness(2.0).build();
+                                        fg.add_circle([s[0], s[1]], 8.0, line_color).thickness(2.0).build();
+                                        fg.add_circle([s[0], s[1]], 3.0, line_color).filled(true).build();
+                                    }
+                                }
                             }
                             uniforms.sun_intensity = sun_intensity.max(0.0);
                             uniforms.scene_kind = scene_kind.index();
@@ -1415,6 +1544,7 @@ pub async fn run() {
                                 GizmoTargetKind::Sphere => 1,
                                 GizmoTargetKind::Decanter => 3,
                                 GizmoTargetKind::WineGlass => 2,
+                                GizmoTargetKind::SunLamp => 0,
                                 GizmoTargetKind::WineSpotlight => 0,
                             };
 
