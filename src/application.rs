@@ -1182,7 +1182,7 @@ pub async fn run() {
                     let prev_cam_yaw = camera.yaw;
                     let prev_cam_pitch = camera.pitch;
                     let sprint = if keys_pressed.contains("Shift") {
-                        3.0
+                        12.0
                     } else {
                         1.0
                     };
