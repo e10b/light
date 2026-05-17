@@ -19,11 +19,9 @@ struct PhotonMapUniforms {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Photon {
     position: [f32; 3],
-    _pad0: f32,
+    wavelength_nm: f32,
     direction: [f32; 3],
-    _pad1: f32,
-    power: [f32; 3],
-    _pad2: f32,
+    power: f32,
     next: u32,
     _pad3: [u32; 3],
 }

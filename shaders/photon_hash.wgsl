@@ -9,11 +9,9 @@ struct PhotonMapUniforms {
 
 struct Photon {
   position: vec3<f32>,
-  pad0: f32,
+  wavelength_nm: f32,
   direction: vec3<f32>,
-  pad1: f32,
-  power: vec3<f32>,
-  pad2: f32,
+  power: f32,
   next: u32,
   pad3: vec3<u32>,
 };

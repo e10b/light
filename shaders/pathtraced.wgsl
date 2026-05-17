@@ -61,11 +61,9 @@ var output_image: texture_storage_2d<rgba8unorm, write>;
 
 struct Photon {
   position: vec3<f32>,
-  pad0: f32,
+  wavelength_nm: f32,
   direction: vec3<f32>,
-  pad1: f32,
-  power: vec3<f32>,
-  pad2: f32,
+  power: f32,
   next: u32,
   pad3: vec3<u32>,
 };
@@ -228,7 +226,7 @@ fn estimate_photon_density(position: vec3<f32>, normal: vec3<f32>, radius: f32) 
           let same_side = dot(normal, photon.direction) > 0.0;
           if (d2 <= radius2 && same_side) {
             let kernel = 1.0 - d2 / max(radius2, 1e-5);
-            flux = flux + photon.power * kernel;
+            flux = flux + wl(photon.wavelength_nm) * photon.power * kernel;
           }
           node = photon.next;
           visited = visited + 1u;

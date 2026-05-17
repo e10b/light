@@ -11,11 +11,9 @@ struct PhotonMapUniforms {
 
 struct Photon {
   position: vec3<f32>,
-  pad0: f32,
+  wavelength_nm: f32,
   direction: vec3<f32>,
-  pad1: f32,
-  power: vec3<f32>,
-  pad2: f32,
+  power: f32,
   next: u32,
   pad3: vec3<u32>,
 };
@@ -56,8 +54,22 @@ fn disk_sample(seed: u32, radius: f32) -> vec2<f32> {
   return vec2<f32>(cos(phi), sin(phi)) * r;
 }
 
-fn write_photon(slot: u32, position: vec3<f32>, direction: vec3<f32>, power: vec3<f32>) {
+fn wl(lambda_nm: f32) -> vec3<f32> {
+  let t = clamp((lambda_nm - 380.0) / 400.0, 0.0, 1.0);
+  let r = smoothstep(0.45, 0.85, t) + (1.0 - smoothstep(0.0, 0.15, t)) * 0.35;
+  let g = smoothstep(0.1, 0.45, t) * (1.0 - smoothstep(0.65, 0.9, t));
+  let b = (1.0 - smoothstep(0.2, 0.55, t)) + smoothstep(0.88, 1.0, t) * 0.2;
+  return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn snell_ior_for_wavelength(lambda_nm: f32, base_ior: f32, dispersion: f32) -> f32 {
+  let x = (lambda_nm - 550.0) / 170.0;
+  return base_ior + dispersion * (-x + 0.2 * x * x);
+}
+
+fn write_photon(slot: u32, position: vec3<f32>, direction: vec3<f32>, wavelength_nm: f32, power: f32) {
   photons[slot].position = position;
+  photons[slot].wavelength_nm = wavelength_nm;
   photons[slot].direction = direction;
   photons[slot].power = power;
   photons[slot].next = 0u;
@@ -89,9 +101,10 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   var ro = select(center - light_axis * 70.0 + tangent * disk.x + bitangent * disk.y, spot_position, is_spotlight);
   var rd = normalize(select(light_axis, center + tangent * aperture.x + bitangent * aperture.y - spot_position, is_spotlight));
-  var power = vec3<f32>(1.0, 0.9, 0.72) * 0.035;
+  let lambda_nm = 380.0 + 400.0 * rand01(gid.x * 8191u + uniforms.frame * 131u + 17u);
+  var power = 0.035;
   var passed_glass = false;
-  write_photon(gid.x, center, vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0));
+  write_photon(gid.x, center, vec3<f32>(0.0, 1.0, 0.0), lambda_nm, 0.0);
 
   for (var bounce = 0u; bounce < 8u; bounce = bounce + 1u) {
     var rq: ray_query;
@@ -104,7 +117,7 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (ground_t < tri_t) {
       if (passed_glass) {
         let hit_pos = ro + rd * ground_t;
-        write_photon(gid.x, hit_pos, -rd, power);
+        write_photon(gid.x, hit_pos, -rd, lambda_nm, power);
       }
       break;
     }
@@ -120,7 +133,7 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = 1.0 - bary.x - bary.y;
     var normal = normalize(mesh_normals[i0].xyz * w + mesh_normals[i1].xyz * bary.x + mesh_normals[i2].xyz * bary.y);
     let mat = materials[mesh_triangle_material[prim]];
-    let ior = max(mat.params.w, 1.01);
+    let ior = max(snell_ior_for_wavelength(lambda_nm, mat.params.w, 0.12), 1.01);
 
     let entering = dot(rd, normal) < 0.0;
     normal = select(-normal, normal, entering);
@@ -131,7 +144,8 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     passed_glass = true;
-    power = power * mix(vec3<f32>(0.9), max(mat.base_color.rgb, vec3<f32>(0.85)), 0.3);
+    let spectral_filter = dot(max(mat.base_color.rgb, vec3<f32>(0.05)), wl(lambda_nm)) / max(dot(vec3<f32>(1.0), wl(lambda_nm)), 0.001);
+    power = power * mix(0.9, clamp(spectral_filter, 0.05, 1.0), 0.3);
     rd = normalize(next_dir);
     ro = hit_pos + rd * 0.01;
   }
