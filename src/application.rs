@@ -12,6 +12,7 @@ use crate::{
     blender_data::{Id, MainDatabase, Transform as DbTransform},
     compute_pass,
     mesh::{load_gltf_mesh, MeshData, Vertex},
+    material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     prism_file::{
         load_prism_database, save_prism_file, CollectionData as PrismCollectionData,
         MaterialData as PrismMaterialData,
@@ -33,11 +34,14 @@ struct SceneUniforms {
     light_pos: [f32; 4],
     sphere_pos: [f32; 4],
     sphere_color: [f32; 4],
+    sphere_params: [f32; 4],
     sphere_rot: [f32; 4],
     sphere_extent: [f32; 4],
     mesh_center: [f32; 4],
     decanter_center: [f32; 4],
     cornell_center: [f32; 4],
+    cornell_color: [f32; 4],
+    cornell_params: [f32; 4],
     sun_intensity: f32,
     frame: u32,
     scene_kind: u32,
@@ -118,11 +122,75 @@ fn transform_to_matrix(t: &DbTransform) -> [f32; 16] {
     glam::Mat4::from_scale_rotation_translation(t.scale, t.rotation, t.location).to_cols_array()
 }
 
+fn make_white_material() -> PrismMaterialData {
+    PrismMaterialData {
+        name: "White".to_string(),
+        graph: {
+            let mut g = petgraph::graph::DiGraph::new();
+            let n_out = g.add_node(ShaderNode {
+                node_type: NodeType::MaterialOutput,
+                properties: NodeProperties::default(),
+            });
+            let n_in = g.add_node(ShaderNode {
+                node_type: NodeType::FloatInput,
+                properties: NodeProperties {
+                    float_value: Some(1.0),
+                    vec3_value: Some([1.0, 1.0, 1.0]),
+                },
+            });
+            g.add_edge(
+                n_in,
+                n_out,
+                crate::prism_file::NodeLink {
+                    output_socket: "Value".to_string(),
+                    input_socket: "Surface".to_string(),
+                },
+            );
+            g
+        },
+    }
+}
+
+fn make_glass_material() -> PrismMaterialData {
+    PrismMaterialData {
+        name: "Glass".to_string(),
+        graph: {
+            let mut g = petgraph::graph::DiGraph::new();
+            let n_bsdf = g.add_node(ShaderNode {
+                node_type: NodeType::PrincipledBSDF,
+                properties: NodeProperties {
+                    float_value: None,
+                    vec3_value: Some([0.98, 1.0, 1.0]),
+                },
+            });
+            let n_out = g.add_node(ShaderNode {
+                node_type: NodeType::MaterialOutput,
+                properties: NodeProperties::default(),
+            });
+            g.add_edge(
+                n_bsdf,
+                n_out,
+                crate::prism_file::NodeLink {
+                    output_socket: "BSDF".to_string(),
+                    input_socket: "Surface".to_string(),
+                },
+            );
+            g
+        },
+    }
+}
+
+fn material_is_glass(name: &str) -> bool {
+    name.eq_ignore_ascii_case("glass")
+}
+
 fn build_prism_database_from_main(
     main_db: &MainDatabase,
     decanter_scene_id: Id,
     wine_scene_id: Id,
     cornell_scene_id: Id,
+    object_material_names: &std::collections::HashMap<Id, String>,
+    material_library: &std::collections::HashMap<String, PrismMaterialData>,
 ) -> PrismDatabase {
     let mut out = PrismDatabase::new();
 
@@ -137,49 +205,45 @@ fn build_prism_database_from_main(
         mesh_map.insert(*mid, h);
     }
 
-    let default_mat = out.materials.insert(PrismMaterialData {
-        name: "DefaultMaterial".to_string(),
-        graph: {
-            let mut g = petgraph::graph::DiGraph::new();
-            let n_in = g.add_node(ShaderNode {
-                node_type: NodeType::FloatInput,
-                properties: NodeProperties {
-                    float_value: Some(0.5),
-                    vec3_value: None,
-                },
-            });
-            let n_out = g.add_node(ShaderNode {
-                node_type: NodeType::MaterialOutput,
-                properties: NodeProperties::default(),
-            });
-            g.add_edge(
-                n_in,
-                n_out,
-                crate::prism_file::NodeLink {
-                    output_socket: "Value".to_string(),
-                    input_socket: "Surface".to_string(),
-                },
-            );
-            g
-        },
-    });
-
-    for mesh in out.meshes.values_mut() {
-        mesh.material_slots.push(Some(default_mat));
+    let mut material_map: std::collections::HashMap<String, crate::prism_file::MaterialHandle> =
+        std::collections::HashMap::new();
+    for (name, material) in material_library {
+        let h = out.materials.insert(material.clone());
+        material_map.insert(name.clone(), h);
     }
 
     let mut object_map: std::collections::HashMap<Id, crate::prism_file::ObjectHandle> =
         std::collections::HashMap::new();
     for (oid, obj) in &main_db.objects {
         let mesh_link = obj.mesh_id.and_then(|m| mesh_map.get(&m).copied());
+        let object_material = if obj.mesh_id.is_some() {
+            object_material_names
+                .get(oid)
+                .and_then(|name| material_map.get(name).copied())
+                .or_else(|| material_map.get("White").copied())
+        } else {
+            None
+        };
         let h = out.objects.insert(PrismObjectData {
             name: obj.name.clone(),
             transform_matrix: transform_to_matrix(&obj.transform),
             data_link: mesh_link
                 .map(PrismObjectDataLink::Mesh)
                 .unwrap_or(PrismObjectDataLink::None),
+            material_link: object_material,
         });
         object_map.insert(*oid, h);
+        if let (Some(mesh_id), Some(mat_handle)) = (obj.mesh_id, object_material) {
+            if let Some(mesh_h) = mesh_map.get(&mesh_id).copied() {
+                if let Some(mesh) = out.meshes.get_mut(mesh_h) {
+                    if mesh.material_slots.is_empty() {
+                        mesh.material_slots.push(Some(mat_handle));
+                    } else {
+                        mesh.material_slots[0] = Some(mat_handle);
+                    }
+                }
+            }
+        }
     }
 
     let mut collection_map: std::collections::HashMap<Id, crate::prism_file::CollectionHandle> =
@@ -496,6 +560,8 @@ pub async fn run() {
     let decanter_path = std::path::Path::new("res/wine_decanter_and_glass.glb");
     let wine_path = std::path::Path::new("res/red_wine_glass.glb");
     let mut mesh = load_gltf_mesh(decanter_path).expect("Failed to load decanter model");
+    let decanter_material_start = 0usize;
+    let decanter_material_count = mesh.materials.len();
     let decanter_vertex_start = 0usize;
     let decanter_vertex_count = mesh.positions4.len();
     let decanter_base_positions: Vec<glam::Vec3> = mesh
@@ -528,6 +594,8 @@ pub async fn run() {
     let wine_vertex_start = mesh.positions4.len();
     let wine_vertex_count = wine_mesh.positions4.len();
     append_mesh(&mut mesh, wine_mesh);
+    let wine_material_start = decanter_material_start + decanter_material_count;
+    let wine_material_count = mesh.materials.len().saturating_sub(wine_material_start);
     let wine_base_positions: Vec<glam::Vec3> =
         mesh.positions4[wine_vertex_start..wine_vertex_start + wine_vertex_count]
             .iter()
@@ -564,6 +632,17 @@ pub async fn run() {
     let decanter_obj_id = main_db.create_object("Decanter", Some(decanter_mesh_id), DbTransform::default());
     let wine_obj_id = main_db.create_object("WineGlass", Some(wine_mesh_id), DbTransform::default());
     let cornell_obj_id = main_db.create_object("CornellBox", Some(cornell_mesh_id), DbTransform::default());
+    let mut material_library: std::collections::HashMap<String, PrismMaterialData> =
+        std::collections::HashMap::new();
+    material_library.insert("White".to_string(), make_white_material());
+    material_library.insert("Glass".to_string(), make_glass_material());
+    let mut object_material_names: std::collections::HashMap<Id, String> =
+        std::collections::HashMap::new();
+    object_material_names.insert(sphere_obj_id, "Glass".to_string());
+    object_material_names.insert(decanter_obj_id, "Glass".to_string());
+    object_material_names.insert(wine_obj_id, "Glass".to_string());
+    object_material_names.insert(cornell_obj_id, "White".to_string());
+    let mut last_material_signature = String::new();
 
     let mut object_target_by_id: std::collections::HashMap<Id, GizmoTargetKind> =
         std::collections::HashMap::new();
@@ -624,7 +703,7 @@ pub async fn run() {
     let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_materials_buf"),
         contents: bytemuck::cast_slice(&mesh.materials),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
 
     let model_blas_desc = wgpu::BlasTriangleGeometrySizeDescriptor {
@@ -698,11 +777,14 @@ pub async fn run() {
         light_pos: [10.0, 8.0, 10.0, 1.0],
         sphere_pos: [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius],
         sphere_color: [0.98, 1.0, 1.0, 1.0],
+        sphere_params: [0.02, 1.52, 1.0, 0.0],
         sphere_rot: [0.0, 0.0, 0.0, 1.0],
         sphere_extent: [sphere_radius, sphere_radius, sphere_radius, 0.0],
         mesh_center: [wine_center.x, wine_center.y, wine_center.z, wine_max_extent * 0.8],
         decanter_center: [decanter_center.x, decanter_center.y, decanter_center.z, decanter_max_extent * 0.7],
         cornell_center: [0.0, 0.5, -1.0, 1.0],
+        cornell_color: [1.0, 1.0, 1.0, 0.0],
+        cornell_params: [0.7, 1.0, 0.0, 0.0],
         sun_intensity: 0.8,
         frame: 0,
         scene_kind: scene_kind.index(),
@@ -1022,6 +1104,9 @@ pub async fn run() {
     let mut mouse_left_down = false;
     let mut mouse_left_clicked = false;
     let mut mouse_left_dragging = false;
+    let mut material_editor = MaterialGraphEditor::new();
+    let mut material_runtime_overrides: std::collections::HashMap<String, RuntimeMaterialPreview> =
+        std::collections::HashMap::new();
 
     let _ = event_loop.run(move |event, active_loop| {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -1338,6 +1423,9 @@ pub async fn run() {
                                                     decanter_scene_id = Id(0);
                                                     wine_scene_id = Id(0);
                                                     cornell_scene_id = Id(0);
+                                                    object_material_names.clear();
+                                                    material_library.clear();
+                                                    material_library.insert("White".to_string(), make_white_material());
                                                     for (_sh, scene) in loaded.scenes.iter() {
                                                         let scene_name = scene.name.to_ascii_lowercase();
                                                         let local_master = main_db.create_collection(format!("{}Master", scene.name));
@@ -1415,6 +1503,26 @@ pub async fn run() {
                                                             spot_empty_rotation = r;
                                                             spot_empty_scale = s;
                                                         }
+                                                        if let Some(mh) = obj.material_link {
+                                                            if let Some(mat) = loaded.materials.get(mh) {
+                                                                material_library.insert(mat.name.clone(), mat.clone());
+                                                                let target_id = if lname.contains("decanter") {
+                                                                    Some(decanter_obj_id)
+                                                                } else if lname.contains("wine") {
+                                                                    Some(wine_obj_id)
+                                                                } else if lname.contains("sphere") || lname.contains("cube") {
+                                                                    Some(sphere_obj_id)
+                                                                } else if lname.contains("cornell") {
+                                                                    Some(cornell_obj_id)
+                                                                } else {
+                                                                    None
+                                                                };
+                                                                if let Some(tid) = target_id {
+                                                                    object_material_names
+                                                                        .insert(tid, mat.name.clone());
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                     if decanter_scene_id.0 != 0 {
                                                         requested_scene = SceneKind::Decanter;
@@ -1435,6 +1543,8 @@ pub async fn run() {
                                                 decanter_scene_id,
                                                 wine_scene_id,
                                                 cornell_scene_id,
+                                                &object_material_names,
+                                                &material_library,
                                             );
                                             match save_prism_file(std::path::Path::new("res/scenes.prism"), &prism_db, false) {
                                                 Ok(_) => project_status = "Saved: res/scenes.prism".to_string(),
@@ -1537,6 +1647,63 @@ pub async fn run() {
                                                     wine_spotlight_distance,
                                                 );
                                             }
+                                        });
+                                        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                                            ui.separator();
+                                            ui.collapsing("Shader Graph", |ui| {
+                                                let selected_object_id = if has_selection {
+                                                    match gizmo_target {
+                                                        GizmoTargetKind::Sphere => Some(sphere_obj_id),
+                                                        GizmoTargetKind::Decanter => Some(decanter_obj_id),
+                                                        GizmoTargetKind::WineGlass => Some(wine_obj_id),
+                                                        GizmoTargetKind::CornellBox => Some(cornell_obj_id),
+                                                        GizmoTargetKind::SunLamp => Some(sun_obj_id),
+                                                        GizmoTargetKind::WineSpotlight => Some(spot_obj_id),
+                                                    }
+                                                } else {
+                                                    None
+                                                };
+                                                if let Some(obj_id) = selected_object_id {
+                                                    let mut mat_name = object_material_names
+                                                        .get(&obj_id)
+                                                        .cloned()
+                                                        .unwrap_or_else(|| "White".to_string());
+                                                    egui::ComboBox::from_label("Material")
+                                                        .selected_text(&mat_name)
+                                                        .show_ui(ui, |ui| {
+                                                            for key in material_library.keys() {
+                                                                ui.selectable_value(
+                                                                    &mut mat_name,
+                                                                    key.clone(),
+                                                                    key,
+                                                                );
+                                                            }
+                                                            ui.selectable_value(
+                                                                &mut mat_name,
+                                                                "White".to_string(),
+                                                                "White",
+                                                            );
+                                                        });
+                                                    object_material_names.insert(obj_id, mat_name.clone());
+                                                    if let Some(mat) = material_library.get(&mat_name) {
+                                                        let graph_key = format!("{}::{mat_name}", obj_id.0);
+                                                        ui.label(format!("Graph: {}", mat.name));
+                                                        material_editor.load_material(&graph_key, mat);
+                                                        egui::Frame::default().show(ui, |ui| {
+                                                            ui.set_min_height(280.0);
+                                                            material_editor.show(ui);
+                                                        });
+                                                        material_runtime_overrides.insert(
+                                                            mat_name.clone(),
+                                                            material_editor.runtime_preview(),
+                                                        );
+                                                    } else {
+                                                        ui.label("White fallback (no material graph).");
+                                                    }
+                                                } else {
+                                                    ui.label("No object selected.");
+                                                }
+                                            });
                                         });
                                     });
 
@@ -2256,6 +2423,179 @@ pub async fn run() {
                             uniforms.wine_enabled = if wine_visible { 1 } else { 0 };
                             uniforms.cornell_enabled = if cornell_visible { 1 } else { 0 };
                             uniforms.mesh_enabled = if decanter_visible || wine_visible { 1 } else { 0 };
+                            let sphere_mat = object_material_names
+                                .get(&sphere_obj_id)
+                                .cloned()
+                                .unwrap_or_else(|| "White".to_string());
+                            let sphere_preview = material_runtime_overrides
+                                .get(&sphere_mat)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    if material_is_glass(&sphere_mat) {
+                                        RuntimeMaterialPreview {
+                                            bsdf_connected: true,
+                                            base_color: [0.98, 1.0, 1.0],
+                                            roughness: 0.02,
+                                            transmission: 1.0,
+                                            ior: 1.52,
+                                        }
+                                    } else {
+                                        RuntimeMaterialPreview::default()
+                                    }
+                                });
+                            uniforms.sphere_color = [
+                                sphere_preview.base_color[0],
+                                sphere_preview.base_color[1],
+                                sphere_preview.base_color[2],
+                                if sphere_preview.bsdf_connected {
+                                    sphere_preview.transmission
+                                } else {
+                                    0.0
+                                },
+                            ];
+                            uniforms.sphere_params = [
+                                sphere_preview.roughness,
+                                sphere_preview.ior,
+                                if sphere_preview.bsdf_connected { 1.0 } else { 0.0 },
+                                0.0,
+                            ];
+
+                            let decanter_mat = object_material_names
+                                .get(&decanter_obj_id)
+                                .cloned()
+                                .unwrap_or_else(|| "White".to_string());
+                            let wine_mat = object_material_names
+                                .get(&wine_obj_id)
+                                .cloned()
+                                .unwrap_or_else(|| "White".to_string());
+                            let cornell_mat = object_material_names
+                                .get(&cornell_obj_id)
+                                .cloned()
+                                .unwrap_or_else(|| "White".to_string());
+                            let cornell_preview = material_runtime_overrides
+                                .get(&cornell_mat)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    if material_is_glass(&cornell_mat) {
+                                        RuntimeMaterialPreview {
+                                            bsdf_connected: true,
+                                            base_color: [0.98, 1.0, 1.0],
+                                            roughness: 0.02,
+                                            transmission: 1.0,
+                                            ior: 1.52,
+                                        }
+                                    } else {
+                                        RuntimeMaterialPreview::default()
+                                    }
+                                });
+                            uniforms.cornell_color = [
+                                cornell_preview.base_color[0],
+                                cornell_preview.base_color[1],
+                                cornell_preview.base_color[2],
+                                if cornell_preview.bsdf_connected {
+                                    cornell_preview.transmission
+                                } else {
+                                    0.0
+                                },
+                            ];
+                            uniforms.cornell_params = [
+                                cornell_preview.roughness,
+                                cornell_preview.ior,
+                                if cornell_preview.bsdf_connected { 1.0 } else { 0.0 },
+                                0.0,
+                            ];
+                            let material_signature =
+                                format!("{sphere_mat}|{decanter_mat}|{wine_mat}|{cornell_mat}");
+                            if material_signature != last_material_signature {
+                                let set_range = |materials: &mut [crate::mesh::GpuMaterial],
+                                                 start: usize,
+                                                 count: usize,
+                                                 preview: RuntimeMaterialPreview,
+                                                 wine_style: bool| {
+                                    let end = (start + count).min(materials.len());
+                                    for m in &mut materials[start..end] {
+                                        if preview.bsdf_connected {
+                                            if wine_style {
+                                                m.base_color = [
+                                                    preview.base_color[0],
+                                                    preview.base_color[1],
+                                                    preview.base_color[2],
+                                                    0.78,
+                                                ];
+                                                m.params = [
+                                                    0.0,
+                                                    preview.roughness.min(0.06),
+                                                    preview.transmission.max(0.72),
+                                                    preview.ior.max(1.0),
+                                                ];
+                                            } else {
+                                                m.base_color = [
+                                                    preview.base_color[0],
+                                                    preview.base_color[1],
+                                                    preview.base_color[2],
+                                                    1.0,
+                                                ];
+                                                m.params = [
+                                                    0.0,
+                                                    preview.roughness,
+                                                    preview.transmission,
+                                                    preview.ior,
+                                                ];
+                                            }
+                                        } else {
+                                            m.base_color = [1.0, 1.0, 1.0, 1.0];
+                                            m.params = [0.0, 0.65, 0.0, 1.0];
+                                        }
+                                    }
+                                };
+                                set_range(
+                                    &mut mesh.materials,
+                                    decanter_material_start,
+                                    decanter_material_count,
+                                    material_runtime_overrides
+                                        .get(&decanter_mat)
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            if material_is_glass(&decanter_mat) {
+                                                RuntimeMaterialPreview {
+                                                    bsdf_connected: true,
+                                                    base_color: [0.98, 1.0, 1.0],
+                                                    roughness: 0.02,
+                                                    transmission: 1.0,
+                                                    ior: 1.52,
+                                                }
+                                            } else {
+                                                RuntimeMaterialPreview::default()
+                                            }
+                                        }),
+                                    false,
+                                );
+                                set_range(
+                                    &mut mesh.materials,
+                                    wine_material_start,
+                                    wine_material_count,
+                                    material_runtime_overrides
+                                        .get(&wine_mat)
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            if material_is_glass(&wine_mat) {
+                                                RuntimeMaterialPreview {
+                                                    bsdf_connected: true,
+                                                    base_color: [0.62, 0.11, 0.16],
+                                                    roughness: 0.01,
+                                                    transmission: 1.0,
+                                                    ior: 1.36,
+                                                }
+                                            } else {
+                                                RuntimeMaterialPreview::default()
+                                            }
+                                        }),
+                                    true,
+                                );
+                                queue.write_buffer(&mat_buf, 0, bytemuck::cast_slice(&mesh.materials));
+                                last_material_signature = material_signature;
+                                accumulation_dirty = true;
+                            }
                             if current_scene_exists {
                                 if scene_kind == SceneKind::Wine && wine_visible {
                                     photon_emitter_center = [

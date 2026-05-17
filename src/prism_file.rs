@@ -22,6 +22,7 @@ pub struct ObjectData {
     pub name: String,
     pub transform_matrix: [f32; 16],
     pub data_link: ObjectDataLink,
+    pub material_link: Option<MaterialHandle>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -57,7 +58,7 @@ pub struct NodeLink {
     pub input_socket: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NodeType {
     FloatInput,
     VectorMath,
@@ -123,6 +124,7 @@ struct StableObjectData {
     name: String,
     transform_matrix: [f32; 16],
     data_link: StableObjectDataLink,
+    material_link: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -242,6 +244,9 @@ pub fn save_prism_file(path: &Path, db: &PrismDatabase, compress: bool) -> std::
                 ObjectDataLink::Light => StableObjectDataLink::Light,
                 ObjectDataLink::None => StableObjectDataLink::None,
             },
+            material_link: o
+                .material_link
+                .and_then(|mh| ctx.material_ids.get(&mh).copied()),
         })
         .collect();
     blocks.push(PrismFileBlock {
@@ -455,6 +460,7 @@ pub fn load_prism_database(path: &Path, compressed: bool) -> std::io::Result<Pri
             name: o.name.clone(),
             transform_matrix: o.transform_matrix,
             data_link: link,
+            material_link: o.material_link.and_then(|mid| mat_by_id.get(&mid).copied()),
         });
         obj_by_id.insert(o.id, h);
     }

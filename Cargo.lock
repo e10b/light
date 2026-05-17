@@ -617,6 +617,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_node_editor"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9a3af92c887b58734bc4bd6e0351b051dbe7036ce3744c16f7173bf288bdd1f"
+dependencies = [
+ "egui",
+ "slotmap",
+ "smallvec",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "emath"
 version = "0.33.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3196,6 +3208,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "egui_node_editor",
  "glam 0.24.2",
  "gltf",
  "petgraph",

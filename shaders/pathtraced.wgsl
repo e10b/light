@@ -6,11 +6,14 @@ struct Uniforms {
   light_pos: vec4<f32>,
   sphere_pos: vec4<f32>,
   sphere_color: vec4<f32>,
+  sphere_params: vec4<f32>,
   sphere_rot: vec4<f32>,
   sphere_extent: vec4<f32>,
   mesh_center: vec4<f32>,
   decanter_center: vec4<f32>,
   cornell_center: vec4<f32>,
+  cornell_color: vec4<f32>,
+  cornell_params: vec4<f32>,
   sun_intensity: f32,
   frame: u32,
   scene_kind: u32,
@@ -557,9 +560,15 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       normal = quat_mul_vec(qh, local_n);
       albedo = max(uniforms.sphere_color.xyz, vec3<f32>(0.001));
       metallic = 0.0;
-      roughness = 0.0025;
+      roughness = uniforms.sphere_params.x;
       transmission = clamp(uniforms.sphere_color.w, 0.0, 1.0);
-      ior = 1.52;
+      ior = max(uniforms.sphere_params.y, 1.0);
+      if (uniforms.sphere_params.z < 0.5) {
+        albedo = vec3<f32>(1.0);
+        roughness = 0.65;
+        transmission = 0.0;
+        ior = 1.0;
+      }
     } else if (hit_type == 2u) {
       // True triangle normal/material from ray-query primitive + barycentrics.
       let prim = tri_prim;
@@ -594,11 +603,17 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       }
     } else if (hit_type == 4u) {
       normal = cube_normal(hit_pos, uniforms.cornell_center.xyz, vec3<f32>(uniforms.cornell_center.w));
-      albedo = vec3<f32>(0.82, 0.82, 0.82);
+      albedo = uniforms.cornell_color.xyz;
       metallic = 0.0;
-      roughness = 0.7;
-      transmission = 0.0;
-      ior = 1.0;
+      roughness = uniforms.cornell_params.x;
+      transmission = clamp(uniforms.cornell_color.w, 0.0, 1.0);
+      ior = max(uniforms.cornell_params.y, 1.0);
+      if (uniforms.cornell_params.z < 0.5) {
+        albedo = vec3<f32>(1.0);
+        roughness = 0.65;
+        transmission = 0.0;
+        ior = 1.0;
+      }
     } else {
       // Ground
       normal = vec3<f32>(0.0, 1.0, 0.0);
