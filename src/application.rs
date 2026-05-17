@@ -35,6 +35,7 @@ struct SceneUniforms {
     sphere_color: [f32; 4],
     mesh_center: [f32; 4],
     decanter_center: [f32; 4],
+    cornell_center: [f32; 4],
     sun_intensity: f32,
     frame: u32,
     scene_kind: u32,
@@ -42,7 +43,10 @@ struct SceneUniforms {
     render_height: u32,
     selected_object: u32,
     mesh_enabled: u32,
-    _pad: [u32; 5],
+    decanter_enabled: u32,
+    wine_enabled: u32,
+    cornell_enabled: u32,
+    _pad: [u32; 2],
 }
 
 struct Camera {
@@ -80,7 +84,11 @@ fn target_allowed_in_scene(scene_kind: SceneKind, target: GizmoTargetKind) -> bo
     match scene_kind {
         SceneKind::Decanter => matches!(
             target,
-            GizmoTargetKind::Sphere | GizmoTargetKind::Decanter | GizmoTargetKind::SunLamp
+            GizmoTargetKind::Sphere
+                | GizmoTargetKind::Decanter
+                | GizmoTargetKind::WineGlass
+                | GizmoTargetKind::CornellBox
+                | GizmoTargetKind::SunLamp
         ),
         SceneKind::Wine => matches!(target, GizmoTargetKind::WineGlass | GizmoTargetKind::WineSpotlight),
         SceneKind::CornellBox => matches!(target, GizmoTargetKind::CornellBox),
@@ -684,6 +692,7 @@ pub async fn run() {
         sphere_color: [0.98, 1.0, 1.0, 1.0],
         mesh_center: [wine_center.x, wine_center.y, wine_center.z, wine_max_extent * 0.8],
         decanter_center: [decanter_center.x, decanter_center.y, decanter_center.z, decanter_max_extent * 0.7],
+        cornell_center: [0.0, 0.5, -1.0, 1.0],
         sun_intensity: 0.8,
         frame: 0,
         scene_kind: scene_kind.index(),
@@ -691,7 +700,10 @@ pub async fn run() {
         render_height,
         selected_object: 1,
         mesh_enabled: 0,
-        _pad: [0; 5],
+        decanter_enabled: 0,
+        wine_enabled: 0,
+        cornell_enabled: 0,
+        _pad: [0; 2],
     };
 
     let mut sun_azimuth_deg = uniforms.light_pos[2]
@@ -1257,6 +1269,16 @@ pub async fn run() {
                                                     if ui.button("Decanter").clicked() {
                                                         main_db.collection_link_object(decanter_master, decanter_obj_id);
                                                         main_db.ensure_scene_base(scene_id, decanter_obj_id, true, true);
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Wine Glass").clicked() {
+                                                        main_db.collection_link_object(decanter_master, wine_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, wine_obj_id, true, true);
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Cornell Box").clicked() {
+                                                        main_db.collection_link_object(decanter_master, cornell_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, cornell_obj_id, true, true);
                                                         ui.close();
                                                     }
                                                 }
@@ -1894,6 +1916,7 @@ pub async fn run() {
                                 let sphere_allowed = selectable_ids.contains(&sphere_obj_id);
                                 let decanter_allowed = selectable_ids.contains(&decanter_obj_id);
                                 let wine_allowed = selectable_ids.contains(&wine_obj_id);
+                                let cornell_allowed = selectable_ids.contains(&cornell_obj_id);
                                 let sun_allowed = selectable_ids.contains(&sun_obj_id);
                                 let spot_allowed = selectable_ids.contains(&spot_obj_id);
                                 let (ro, rd) = world_ray_from_cursor(
@@ -1925,12 +1948,22 @@ pub async fn run() {
                                 } else {
                                     None
                                 };
-                                let wine_hit = if scene_kind == SceneKind::Wine && wine_allowed {
+                                let wine_hit = if wine_allowed {
                                     intersect_sphere(
                                         ro,
                                         rd,
                                         wine_center_now,
                                         (wine_max_extent * 0.55).max(0.25),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let cornell_hit = if cornell_allowed {
+                                    intersect_sphere(
+                                        ro,
+                                        rd,
+                                        active_center + cornell_translation,
+                                        (2.0 * cornell_scale.max_element()).max(0.25),
                                     )
                                 } else {
                                     None
@@ -1963,6 +1996,12 @@ pub async fn run() {
                                     if t < best_t {
                                         best_t = t;
                                         best = Some(GizmoTargetKind::WineGlass);
+                                    }
+                                }
+                                if let Some(t) = cornell_hit {
+                                    if t < best_t {
+                                        best_t = t;
+                                        best = Some(GizmoTargetKind::CornellBox);
                                     }
                                 }
                                 if let Some(t) = sun_hit {
@@ -2072,12 +2111,18 @@ pub async fn run() {
                                 decanter_center.z + decanter_translation.z,
                                 decanter_max_extent * decanter_scale.max_element() * 0.7,
                             ];
+                            uniforms.cornell_center = [
+                                active_center.x + cornell_translation.x,
+                                active_center.y + cornell_translation.y,
+                                active_center.z + cornell_translation.z,
+                                cornell_scale.max_element().max(0.1),
+                            ];
                             uniforms.selected_object = if has_selection {
                                 match gizmo_target {
                                     GizmoTargetKind::Sphere => 1,
                                     GizmoTargetKind::Decanter => 3,
                                     GizmoTargetKind::WineGlass => 2,
-                                    GizmoTargetKind::CornellBox => 0,
+                                    GizmoTargetKind::CornellBox => 4,
                                     GizmoTargetKind::SunLamp => 0,
                                     GizmoTargetKind::WineSpotlight => 0,
                                 }
@@ -2089,15 +2134,20 @@ pub async fn run() {
                                 SceneKind::Wine => wine_scene_id,
                                 SceneKind::CornellBox => cornell_scene_id,
                             };
-                            let mesh_visible = if current_scene_exists {
+                            let (decanter_visible, wine_visible, cornell_visible) = if current_scene_exists {
                                 let visible = main_db.scene_visible_selectable_objects(active_scene_id);
-                                visible.contains(&decanter_obj_id)
-                                    || visible.contains(&wine_obj_id)
-                                    || visible.contains(&cornell_obj_id)
+                                (
+                                    visible.contains(&decanter_obj_id),
+                                    visible.contains(&wine_obj_id),
+                                    visible.contains(&cornell_obj_id),
+                                )
                             } else {
-                                false
+                                (false, false, false)
                             };
-                            uniforms.mesh_enabled = if mesh_visible { 1 } else { 0 };
+                            uniforms.decanter_enabled = if decanter_visible { 1 } else { 0 };
+                            uniforms.wine_enabled = if wine_visible { 1 } else { 0 };
+                            uniforms.cornell_enabled = if cornell_visible { 1 } else { 0 };
+                            uniforms.mesh_enabled = if decanter_visible || wine_visible { 1 } else { 0 };
 
                             if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
                                 obj.transform.location = glam::Vec3::new(

@@ -8,6 +8,7 @@ struct Uniforms {
   sphere_color: vec4<f32>,
   mesh_center: vec4<f32>,
   decanter_center: vec4<f32>,
+  cornell_center: vec4<f32>,
   sun_intensity: f32,
   frame: u32,
   scene_kind: u32,
@@ -15,6 +16,9 @@ struct Uniforms {
   render_height: u32,
   selected_object: u32,
   mesh_enabled: u32,
+  decanter_enabled: u32,
+  wine_enabled: u32,
+  cornell_enabled: u32,
   pad: vec2<u32>,
 };
 
@@ -485,15 +489,29 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
         tri_bary = tri_hit.barycentrics;
       }
     }
+    if (t_tri < 1e37) {
+      let tri_pos = ro + rd * t_tri;
+      let in_wine = uniforms.wine_enabled != 0u && distance(tri_pos, uniforms.mesh_center.xyz) <= uniforms.mesh_center.w;
+      let in_decanter = uniforms.decanter_enabled != 0u && distance(tri_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
+      if (!in_wine && !in_decanter) {
+        t_tri = 1e38;
+      }
+    }
+
+    var t_cornell = 1e38;
+    if (!is_wine_scene && uniforms.cornell_enabled != 0u) {
+      t_cornell = cube_intersection_t(ro, rd, uniforms.cornell_center.xyz, uniforms.cornell_center.w);
+    }
 
     // Ground plane
     let t_ground = ground_plane_intersection(ro, rd);
 
     // Choose nearest
     var hit_t = 1e38;
-    var hit_type = 0u; // 0=none,1=cube,2=tri,3=ground
+    var hit_type = 0u; // 0=none,1=cube,2=tri,3=ground,4=cornell object
     if (t_cube < hit_t) { hit_t = t_cube; hit_type = 1u; }
     if (t_tri < hit_t) { hit_t = t_tri; hit_type = 2u; }
+    if (t_cornell < hit_t) { hit_t = t_cornell; hit_type = 4u; }
     if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
 
     if (hit_type == 0u) {
@@ -555,6 +573,13 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
         roughness = min(roughness, 0.003);
         albedo = mix(albedo, vec3<f32>(1.0), 0.85);
       }
+    } else if (hit_type == 4u) {
+      normal = cube_normal(hit_pos, uniforms.cornell_center.xyz, uniforms.cornell_center.w);
+      albedo = vec3<f32>(0.82, 0.82, 0.82);
+      metallic = 0.0;
+      roughness = 0.7;
+      transmission = 0.0;
+      ior = 1.0;
     } else {
       // Ground
       normal = vec3<f32>(0.0, 1.0, 0.0);
@@ -708,18 +733,34 @@ fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
     let tri_hit = rayQueryGetCommittedIntersection(&rq);
     if (tri_hit.kind != RAY_QUERY_INTERSECTION_NONE) { t_tri = tri_hit.t; }
   }
+  if (t_tri < 1e37) {
+    let tri_pos = ro + rd * t_tri;
+    let in_wine = uniforms.wine_enabled != 0u && distance(tri_pos, uniforms.mesh_center.xyz) <= uniforms.mesh_center.w;
+    let in_decanter = uniforms.decanter_enabled != 0u && distance(tri_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
+    if (!in_wine && !in_decanter) {
+      t_tri = 1e38;
+    }
+  }
+  var t_cornell = 1e38;
+  if (!is_wine_scene && uniforms.cornell_enabled != 0u) {
+    t_cornell = cube_intersection_t(ro, rd, uniforms.cornell_center.xyz, uniforms.cornell_center.w);
+  }
 
   let t_ground = ground_plane_intersection(ro, rd);
   var hit_t = 1e38;
   var hit_type = 0u;
   if (t_cube < hit_t) { hit_t = t_cube; hit_type = 1u; }
   if (t_tri < hit_t) { hit_t = t_tri; hit_type = 2u; }
+  if (t_cornell < hit_t) { hit_t = t_cornell; hit_type = 4u; }
   if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
   if (hit_type == 0u || hit_type == 3u) {
     return 0.0;
   }
   if (hit_type == 1u) {
     return select(0.0, 1.0, uniforms.selected_object == 1u);
+  }
+  if (hit_type == 4u) {
+    return select(0.0, 1.0, uniforms.selected_object == 4u);
   }
 
   let hit_pos = ro + rd * hit_t;
