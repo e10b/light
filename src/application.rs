@@ -1034,6 +1034,36 @@ pub async fn run() {
                                     }
                                 });
 
+                            ui.window("Objects")
+                                .size([220.0, 180.0], Condition::FirstUseEver)
+                                .build(|| {
+                                    ui.text("Select Object");
+                                    if ui.selectable_config("Sphere")
+                                        .selected(gizmo_target == GizmoTargetKind::Sphere)
+                                        .build()
+                                    {
+                                        gizmo_target = GizmoTargetKind::Sphere;
+                                    }
+                                    if ui.selectable_config("Decanter")
+                                        .selected(gizmo_target == GizmoTargetKind::Decanter)
+                                        .build()
+                                    {
+                                        gizmo_target = GizmoTargetKind::Decanter;
+                                    }
+                                    if ui.selectable_config("Wine Glass")
+                                        .selected(gizmo_target == GizmoTargetKind::WineGlass)
+                                        .build()
+                                    {
+                                        gizmo_target = GizmoTargetKind::WineGlass;
+                                    }
+                                    if ui.selectable_config("Spotlight")
+                                        .selected(gizmo_target == GizmoTargetKind::WineSpotlight)
+                                        .build()
+                                    {
+                                        gizmo_target = GizmoTargetKind::WineSpotlight;
+                                    }
+                                });
+
                             if ui.is_mouse_clicked(MouseButton::Left) && !ui.io().want_capture_mouse {
                                 let display_size = ui.io().display_size;
                                 let (ro, rd) = world_ray_from_cursor(
