@@ -1,8 +1,8 @@
 use std::iter;
 
-use imgui::{Condition, FontConfig, FontSource, MouseButton};
-use imgui_wgpu::{Renderer as ImguiRenderer, RendererConfig};
-use imgui_winit_support::{HiDpiMode, WinitPlatform};
+use egui::{Color32, Pos2, Stroke, ViewportId};
+use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
+use egui_winit::State as EguiWinitState;
 use transform_gizmo::config::TransformPivotPoint;
 use transform_gizmo::{math::Transform as GizmoTransform, prelude::*};
 use wgpu::util::DeviceExt;
@@ -954,25 +954,21 @@ pub async fn run() {
         ],
     });
 
-    let mut imgui = imgui::Context::create();
-    imgui.set_ini_filename(None);
-    let mut platform = WinitPlatform::new(&mut imgui);
-    platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Rounded);
-    let hidpi_factor = window.scale_factor();
-    let font_size = (13.0 * hidpi_factor) as f32;
-    imgui.fonts().add_font(&[FontSource::DefaultFontData {
-        config: Some(FontConfig {
-            size_pixels: font_size,
-            ..FontConfig::default()
-        }),
-    }]);
-    imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-
-    let renderer_config = RendererConfig {
-        texture_format: config.format,
-        ..RendererConfig::default()
-    };
-    let mut imgui_renderer = ImguiRenderer::new(&mut imgui, &device, &queue, renderer_config);
+    let egui_ctx = egui::Context::default();
+    let mut egui_visuals = egui::Visuals::dark();
+    egui_visuals.panel_fill = Color32::from_rgb(42, 43, 46);
+    egui_visuals.window_fill = Color32::from_rgb(49, 50, 54);
+    egui_visuals.extreme_bg_color = Color32::from_rgb(28, 29, 31);
+    egui_ctx.set_visuals(egui_visuals);
+    let mut egui_state = EguiWinitState::new(
+        egui_ctx.clone(),
+        ViewportId::ROOT,
+        window.as_ref(),
+        Some(window.scale_factor() as f32),
+        window.theme(),
+        None,
+    );
+    let mut egui_renderer = EguiRenderer::new(&device, config.format, RendererOptions::default());
 
     let move_speed = 2.6;
     let look_speed = 0.28;
@@ -999,10 +995,36 @@ pub async fn run() {
     let mut wine_scale = glam::Vec3::ONE;
     let mut geometry_dirty = false;
     let mut project_status = String::new();
+    let mut mouse_pos = [0.0f32, 0.0f32];
+    let mut mouse_left_down = false;
+    let mut mouse_left_clicked = false;
+    let mut mouse_left_dragging = false;
 
     let _ = event_loop.run(move |event, active_loop| {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-        platform.handle_event(imgui.io_mut(), &window, &event);
+        if let Event::WindowEvent { event, .. } = &event {
+            let _ = egui_state.on_window_event(window.as_ref(), event);
+            match event {
+                WindowEvent::CursorMoved { position, .. } => {
+                    mouse_pos = [position.x as f32, position.y as f32];
+                    if mouse_left_down {
+                        mouse_left_dragging = true;
+                    }
+                }
+                WindowEvent::MouseInput {
+                    state,
+                    button: winit::event::MouseButton::Left,
+                    ..
+                } => {
+                    mouse_left_down = *state == ElementState::Pressed;
+                    if *state == ElementState::Pressed {
+                        mouse_left_clicked = true;
+                        mouse_left_dragging = false;
+                    }
+                }
+                _ => {}
+            }
+        }
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -1116,7 +1138,7 @@ pub async fn run() {
                 event: winit::event::DeviceEvent::MouseMotion { delta },
                 ..
             } => {
-                if imgui.io().want_capture_mouse || !keys_pressed.contains("v") {
+                if egui_ctx.is_pointer_over_area() || !keys_pressed.contains("v") {
                     return;
                 }
                 let (dx, dy) = delta;
@@ -1148,7 +1170,7 @@ pub async fn run() {
                     } else {
                         1.0
                     };
-                    let wants_keyboard = imgui.io().want_capture_keyboard;
+                    let wants_keyboard = egui_ctx.wants_keyboard_input();
 
                     if !wants_keyboard && keys_pressed.contains("w") {
                         camera.pos += camera.forward() * move_speed * sprint * dt;
@@ -1194,413 +1216,262 @@ pub async fn run() {
                     match surface.get_current_texture() {
                         wgpu::CurrentSurfaceTexture::Success(tex)
                         | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => {
-                            imgui
-                                .io_mut()
-                                .update_delta_time(std::time::Duration::from_secs_f32(
-                                    dt.max(1.0 / 1000.0),
-                                ));
-                            if platform.prepare_frame(imgui.io_mut(), &window).is_err() {
-                                tex.present();
-                                return;
-                            }
-                            let ui = imgui.frame();
+                            let raw_input = egui_state.take_egui_input(window.as_ref());
+                            let mut sun_changed = false;
+                            let full_output = egui_ctx.run(raw_input, |ctx| {
+                                let mut requested_scene = scene_kind;
+                                let current_scene_exists = match scene_kind {
+                                    SceneKind::Decanter => decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id),
+                                    SceneKind::Wine => wine_scene_id.0 != 0 && main_db.scenes.contains_key(&wine_scene_id),
+                                    SceneKind::CornellBox => cornell_scene_id.0 != 0 && main_db.scenes.contains_key(&cornell_scene_id),
+                                };
+                                let has_decanter = decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id);
+                                let has_wine = wine_scene_id.0 != 0 && main_db.scenes.contains_key(&wine_scene_id);
+                                let has_cornell = cornell_scene_id.0 != 0 && main_db.scenes.contains_key(&cornell_scene_id);
 
-                            let mut requested_scene = scene_kind;
-                            let current_scene_exists = match scene_kind {
-                                SceneKind::Decanter => {
-                                    decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id)
-                                }
-                                SceneKind::Wine => {
-                                    wine_scene_id.0 != 0 && main_db.scenes.contains_key(&wine_scene_id)
-                                }
-                                SceneKind::CornellBox => {
-                                    cornell_scene_id.0 != 0 && main_db.scenes.contains_key(&cornell_scene_id)
-                                }
-                            };
-
-                            ui.window("Scene")
-                                .size([280.0, 160.0], Condition::FirstUseEver)
-                                .build(|| {
-                                    let has_decanter = decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id);
-                                    let has_wine = wine_scene_id.0 != 0 && main_db.scenes.contains_key(&wine_scene_id);
-                                    let has_cornell = cornell_scene_id.0 != 0 && main_db.scenes.contains_key(&cornell_scene_id);
-
-                                    if ui.button("Add Decanter Scene") {
-                                        if !has_decanter {
-                                            decanter_master = main_db.create_collection("DecanterMaster");
-                                            main_db.collection_link_object(decanter_master, sphere_obj_id);
-                                            main_db.collection_link_object(decanter_master, sun_obj_id);
-                                            main_db.collection_link_object(decanter_master, decanter_obj_id);
-                                            decanter_scene_id = main_db.create_scene("Decanter", decanter_master);
-                                            for oid in [sphere_obj_id, sun_obj_id, decanter_obj_id] {
-                                                main_db.ensure_scene_base(decanter_scene_id, oid, true, true);
-                                            }
-                                        }
-                                        requested_scene = SceneKind::Decanter;
-                                    }
-                                    ui.same_line();
-                                    if ui.button("Add Wine Scene") {
-                                        if !has_wine {
-                                            wine_master = main_db.create_collection("WineMaster");
-                                            main_db.collection_link_object(wine_master, spot_obj_id);
-                                            main_db.collection_link_object(wine_master, wine_obj_id);
-                                            wine_scene_id = main_db.create_scene("Wine", wine_master);
-                                            for oid in [spot_obj_id, wine_obj_id] {
-                                                main_db.ensure_scene_base(wine_scene_id, oid, true, true);
-                                            }
-                                        }
-                                        requested_scene = SceneKind::Wine;
-                                    }
-                                    ui.same_line();
-                                    if ui.button("Add Cornell Scene") {
-                                        if !has_cornell {
-                                            cornell_master = main_db.create_collection("CornellMaster");
-                                            main_db.collection_link_object(cornell_master, sphere_obj_id);
-                                            main_db.collection_link_object(cornell_master, cornell_obj_id);
-                                            cornell_scene_id = main_db.create_scene("Cornell", cornell_master);
-                                            for oid in [sphere_obj_id, cornell_obj_id] {
-                                                main_db.ensure_scene_base(cornell_scene_id, oid, true, true);
-                                            }
-                                        }
-                                        requested_scene = SceneKind::CornellBox;
-                                    }
-
-                                    if has_decanter {
-                                        if ui.button("Use Decanter") {
+                                egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.strong("Prism");
+                                        ui.separator();
+                                        if ui.button("New Cube Scene").clicked() {
                                             requested_scene = SceneKind::Decanter;
                                         }
-                                        ui.same_line();
-                                    }
-                                    if has_wine {
-                                        if ui.button("Use Wine") {
-                                            requested_scene = SceneKind::Wine;
-                                        }
-                                        ui.same_line();
-                                    }
-                                    if has_cornell {
-                                        if ui.button("Use Cornell") {
-                                            requested_scene = SceneKind::CornellBox;
-                                        }
-                                    }
-                                    if ui.button("Open Scene") {
-                                        ui.open_popup("open_scene_popup");
-                                    }
-                                    ui.same_line();
-                                    if ui.button("Open Prism File") {
-                                        match load_prism_database(std::path::Path::new("res/scenes.prism"), false) {
-                                            Ok(loaded) => {
-                                                main_db.collections.clear();
-                                                main_db.scenes.clear();
-                                                main_db.view_layers.clear();
-                                                decanter_master = Id(0);
-                                                wine_master = Id(0);
-                                                cornell_master = Id(0);
-                                                decanter_scene_id = Id(0);
-                                                wine_scene_id = Id(0);
-                                                cornell_scene_id = Id(0);
-
-                                                for (_sh, scene) in loaded.scenes.iter() {
-                                                    let scene_name = scene.name.to_ascii_lowercase();
-                                                    let local_master = main_db.create_collection(format!(
-                                                        "{}Master",
-                                                        scene.name
-                                                    ));
-                                                    let local_scene = main_db.create_scene(&scene.name, local_master);
-                                                if scene_name.contains("decanter") || scene_name == "scene" {
-                                                        decanter_master = local_master;
-                                                        decanter_scene_id = local_scene;
-                                                    } else if scene_name.contains("wine") {
-                                                        wine_master = local_master;
-                                                        wine_scene_id = local_scene;
-                                                    } else if scene_name.contains("cornell") {
-                                                        cornell_master = local_master;
-                                                        cornell_scene_id = local_scene;
+                                        ui.menu_button("Add", |ui| {
+                                            let scene_id = match scene_kind {
+                                                SceneKind::Decanter => decanter_scene_id,
+                                                SceneKind::Wine => wine_scene_id,
+                                                SceneKind::CornellBox => cornell_scene_id,
+                                            };
+                                            match scene_kind {
+                                                SceneKind::Decanter => {
+                                                    if ui.button("Cube").clicked() {
+                                                        main_db.collection_link_object(decanter_master, sphere_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        ui.close();
                                                     }
-
-                                                    if let Some(master_col) =
-                                                        loaded.collections.get(scene.master_collection)
-                                                    {
-                                                        for obj_handle in &master_col.objects {
-                                                            if let Some(obj) = loaded.objects.get(*obj_handle) {
-                                                                let name = obj.name.to_ascii_lowercase();
-                                                                let oid = if name.contains("decanter") {
-                                                                    Some(decanter_obj_id)
-                                                                } else if name.contains("wine") {
-                                                                    Some(wine_obj_id)
-                                                                } else if name.contains("spot") {
-                                                                    Some(spot_obj_id)
-                                                                } else if name.contains("sun") {
-                                                                    Some(sun_obj_id)
-                                                                } else if name.contains("cornell") {
-                                                                    Some(cornell_obj_id)
-                                                                } else if name.contains("sphere")
-                                                                    || name.contains("cube")
-                                                                {
-                                                                    Some(sphere_obj_id)
-                                                                } else {
-                                                                    None
-                                                                };
-                                                                if let Some(local_obj_id) = oid {
-                                                                    main_db.collection_link_object(
-                                                                        local_master,
-                                                                        local_obj_id,
-                                                                    );
-                                                                    main_db.ensure_scene_base(
-                                                                        local_scene,
-                                                                        local_obj_id,
-                                                                        true,
-                                                                        true,
-                                                                    );
+                                                    if ui.button("Sun Lamp").clicked() {
+                                                        main_db.collection_link_object(decanter_master, sun_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, sun_obj_id, true, true);
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Decanter").clicked() {
+                                                        main_db.collection_link_object(decanter_master, decanter_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, decanter_obj_id, true, true);
+                                                        ui.close();
+                                                    }
+                                                }
+                                                SceneKind::Wine => {
+                                                    if ui.button("Wine Glass").clicked() {
+                                                        main_db.collection_link_object(wine_master, wine_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, wine_obj_id, true, true);
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Spotlight").clicked() {
+                                                        main_db.collection_link_object(wine_master, spot_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, spot_obj_id, true, true);
+                                                        ui.close();
+                                                    }
+                                                }
+                                                SceneKind::CornellBox => {
+                                                    if ui.button("Cornell Box").clicked() {
+                                                        main_db.collection_link_object(cornell_master, cornell_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, cornell_obj_id, true, true);
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Cube").clicked() {
+                                                        main_db.collection_link_object(cornell_master, sphere_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        ui.close();
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        if ui.button("Open").clicked() {
+                                            match load_prism_database(std::path::Path::new("res/scenes.prism"), false) {
+                                                Ok(loaded) => {
+                                                    main_db.collections.clear();
+                                                    main_db.scenes.clear();
+                                                    main_db.view_layers.clear();
+                                                    decanter_master = Id(0);
+                                                    wine_master = Id(0);
+                                                    cornell_master = Id(0);
+                                                    decanter_scene_id = Id(0);
+                                                    wine_scene_id = Id(0);
+                                                    cornell_scene_id = Id(0);
+                                                    for (_sh, scene) in loaded.scenes.iter() {
+                                                        let scene_name = scene.name.to_ascii_lowercase();
+                                                        let local_master = main_db.create_collection(format!("{}Master", scene.name));
+                                                        let local_scene = main_db.create_scene(&scene.name, local_master);
+                                                        if scene_name.contains("decanter") || scene_name == "scene" {
+                                                            decanter_master = local_master;
+                                                            decanter_scene_id = local_scene;
+                                                        } else if scene_name.contains("wine") {
+                                                            wine_master = local_master;
+                                                            wine_scene_id = local_scene;
+                                                        } else if scene_name.contains("cornell") {
+                                                            cornell_master = local_master;
+                                                            cornell_scene_id = local_scene;
+                                                        }
+                                                        if let Some(master_col) = loaded.collections.get(scene.master_collection) {
+                                                            for obj_handle in &master_col.objects {
+                                                                if let Some(obj) = loaded.objects.get(*obj_handle) {
+                                                                    let name = obj.name.to_ascii_lowercase();
+                                                                    let oid = if name.contains("decanter") {
+                                                                        Some(decanter_obj_id)
+                                                                    } else if name.contains("wine") {
+                                                                        Some(wine_obj_id)
+                                                                    } else if name.contains("spot") {
+                                                                        Some(spot_obj_id)
+                                                                    } else if name.contains("sun") {
+                                                                        Some(sun_obj_id)
+                                                                    } else if name.contains("cornell") {
+                                                                        Some(cornell_obj_id)
+                                                                    } else if name.contains("sphere") || name.contains("cube") {
+                                                                        Some(sphere_obj_id)
+                                                                    } else {
+                                                                        None
+                                                                    };
+                                                                    if let Some(local_obj_id) = oid {
+                                                                        main_db.collection_link_object(local_master, local_obj_id);
+                                                                        main_db.ensure_scene_base(local_scene, local_obj_id, true, true);
+                                                                    }
                                                                 }
                                                             }
                                                         }
                                                     }
-                                                }
-
-                                                for (_oh, obj) in loaded.objects.iter() {
-                                                    let m = glam::Mat4::from_cols_array(&obj.transform_matrix);
-                                                    let (s, r, t) = m.to_scale_rotation_translation();
-                                                    let lname = obj.name.to_ascii_lowercase();
-                                                    if lname.contains("sphere") {
-                                                        uniforms.sphere_pos[0] = t.x;
-                                                        uniforms.sphere_pos[1] = t.y;
-                                                        uniforms.sphere_pos[2] = t.z;
-                                                        sphere_rotation = r;
-                                                        sphere_radius_scale = s.x.max(0.01);
-                                                        uniforms.sphere_pos[3] = sphere_radius * sphere_radius_scale;
-                                                    } else if lname.contains("decanter") {
-                                                        decanter_translation = t - decanter_center;
-                                                        decanter_rotation = r;
-                                                        decanter_scale = s;
-                                                        geometry_dirty = true;
-                                                    } else if lname.contains("wine") {
-                                                        wine_translation = t - wine_center;
-                                                        wine_rotation = r;
-                                                        wine_scale = s;
-                                                        geometry_dirty = true;
-                                                    } else if lname.contains("sun") {
-                                                        sun_empty_position = t;
-                                                        sun_empty_rotation = r;
-                                                        sun_empty_scale = s;
-                                                    } else if lname.contains("spot") {
-                                                        spot_empty_position = t;
-                                                        spot_empty_rotation = r;
-                                                        spot_empty_scale = s;
+                                                    for (_oh, obj) in loaded.objects.iter() {
+                                                        let m = glam::Mat4::from_cols_array(&obj.transform_matrix);
+                                                        let (s, r, t) = m.to_scale_rotation_translation();
+                                                        let lname = obj.name.to_ascii_lowercase();
+                                                        if lname.contains("sphere") || lname.contains("cube") {
+                                                            uniforms.sphere_pos[0] = t.x;
+                                                            uniforms.sphere_pos[1] = t.y;
+                                                            uniforms.sphere_pos[2] = t.z;
+                                                            sphere_rotation = r;
+                                                            sphere_radius_scale = s.x.max(0.01);
+                                                            uniforms.sphere_pos[3] = sphere_radius * sphere_radius_scale;
+                                                        } else if lname.contains("decanter") {
+                                                            decanter_translation = t - decanter_center;
+                                                            decanter_rotation = r;
+                                                            decanter_scale = s;
+                                                            geometry_dirty = true;
+                                                        } else if lname.contains("wine") {
+                                                            wine_translation = t - wine_center;
+                                                            wine_rotation = r;
+                                                            wine_scale = s;
+                                                            geometry_dirty = true;
+                                                        } else if lname.contains("sun") {
+                                                            sun_empty_position = t;
+                                                            sun_empty_rotation = r;
+                                                            sun_empty_scale = s;
+                                                        } else if lname.contains("spot") {
+                                                            spot_empty_position = t;
+                                                            spot_empty_rotation = r;
+                                                            spot_empty_scale = s;
+                                                        }
                                                     }
+                                                    if decanter_scene_id.0 != 0 {
+                                                        requested_scene = SceneKind::Decanter;
+                                                    } else if wine_scene_id.0 != 0 {
+                                                        requested_scene = SceneKind::Wine;
+                                                    } else if cornell_scene_id.0 != 0 {
+                                                        requested_scene = SceneKind::CornellBox;
+                                                    }
+                                                    accumulation_dirty = true;
+                                                    project_status = "Opened: res/scenes.prism".to_string();
                                                 }
-
-                                                if decanter_scene_id.0 != 0 {
-                                                    requested_scene = SceneKind::Decanter;
-                                                } else if wine_scene_id.0 != 0 {
-                                                    requested_scene = SceneKind::Wine;
-                                                } else if cornell_scene_id.0 != 0 {
-                                                    requested_scene = SceneKind::CornellBox;
-                                                }
-                                                accumulation_dirty = true;
-                                                project_status = "Opened and applied: res/scenes.prism".to_string();
-                                            }
-                                            Err(e) => {
-                                                project_status =
-                                                    format!("Open failed (res/scenes.prism): {e}");
+                                                Err(e) => project_status = format!("Open failed (res/scenes.prism): {e}"),
                                             }
                                         }
-                                    }
-                                    ui.popup("open_scene_popup", || {
-                                        if has_decanter && ui.selectable("Decanter") {
-                                            requested_scene = SceneKind::Decanter;
-                                        }
-                                        if has_wine && ui.selectable("Wine") {
-                                            requested_scene = SceneKind::Wine;
-                                        }
-                                        if has_cornell && ui.selectable("Cornell") {
-                                            requested_scene = SceneKind::CornellBox;
-                                        }
-                                        if !has_decanter && !has_wine && !has_cornell {
-                                            ui.text("No scenes available");
+                                        if ui.button("Save").clicked() {
+                                            let prism_db = build_prism_database_from_main(
+                                                &main_db,
+                                                decanter_scene_id,
+                                                wine_scene_id,
+                                                cornell_scene_id,
+                                            );
+                                            match save_prism_file(std::path::Path::new("res/scenes.prism"), &prism_db, false) {
+                                                Ok(_) => project_status = "Saved: res/scenes.prism".to_string(),
+                                                Err(e) => project_status = format!("Save failed: {e}"),
+                                            }
                                         }
                                     });
-                                    ui.text(format!(
-                                        "Active: {}",
-                                        if current_scene_exists {
-                                            scene_kind.label()
-                                        } else {
-                                            "None"
-                                        }
-                                    ));
-                                    let scene_id = match scene_kind {
-                                        SceneKind::Decanter => decanter_scene_id,
-                                        SceneKind::Wine => wine_scene_id,
-                                        SceneKind::CornellBox => cornell_scene_id,
-                                    };
-                                    let scene_object_count =
-                                        main_db.scene_visible_selectable_objects(scene_id).len();
-                                    ui.text(format!("DB Objects: {}", scene_object_count));
                                 });
 
-                            ui.window("Sun Controls")
-                                .size([300.0, 160.0], Condition::FirstUseEver)
-                                .build(|| {
-                                    ui.slider_config("Azimuth (deg)", -180.0, 180.0)
-                                        .build(&mut sun_azimuth_deg);
-                                    ui.slider_config("Elevation (deg)", -10.0, 89.0)
-                                        .build(&mut sun_elevation_deg);
-                                    ui.slider_config("Intensity", 0.0, 5.0)
-                                        .build(&mut sun_intensity);
-                                });
-
-                            ui.window("Wine Spotlight")
-                                .size([300.0, 150.0], Condition::FirstUseEver)
-                                .build(|| {
-                                    let az_changed = ui
-                                        .slider_config("Azimuth (deg)", -180.0, 180.0)
-                                        .build(&mut wine_spotlight_azimuth_deg);
-                                    let el_changed = ui
-                                        .slider_config("Elevation (deg)", 5.0, 85.0)
-                                        .build(&mut wine_spotlight_elevation_deg);
-                                    let dist_changed = ui
-                                        .slider_config("Distance", 2.0, wine_max_extent.max(10.0) * 4.0)
-                                        .build(&mut wine_spotlight_distance);
-                                    if scene_kind == SceneKind::Wine
-                                        && (az_changed || el_changed || dist_changed)
-                                    {
-                                        spot_empty_position = wine_spotlight_position(
-                                            active_center,
-                                            wine_spotlight_azimuth_deg,
-                                            wine_spotlight_elevation_deg,
-                                            wine_spotlight_distance,
-                                        );
-                                    }
-                                });
-
-                            ui.window("Transform Gizmo")
-                                .size([330.0, 120.0], Condition::FirstUseEver)
-                                .build(|| {
-                                    if !target_allowed_in_scene(scene_kind, gizmo_target) {
-                                        gizmo_target = default_target_for_scene(scene_kind);
-                                    }
-                                    ui.text(format!("Target: {}", target_label(gizmo_target)));
-
-                                    ui.text("Mode");
-                                    if ui.radio_button_bool(
-                                        "Translate",
-                                        gizmo_mode == GizmoModeKind::Translate,
-                                    ) {
-                                        gizmo_mode = GizmoModeKind::Translate;
-                                    }
-                                    ui.same_line();
-                                    if ui.radio_button_bool("Rotate", gizmo_mode == GizmoModeKind::Rotate)
-                                    {
-                                        gizmo_mode = GizmoModeKind::Rotate;
-                                    }
-                                    ui.same_line();
-                                    if ui.radio_button_bool("Scale", gizmo_mode == GizmoModeKind::Scale) {
-                                        gizmo_mode = GizmoModeKind::Scale;
-                                    }
-                                });
-
-                            ui.window("Objects")
-                                .size([220.0, 180.0], Condition::FirstUseEver)
-                                .build(|| {
-                                    if ui.button("Save Project (.prism)") {
-                                        let prism_db = build_prism_database_from_main(
-                                            &main_db,
-                                            decanter_scene_id,
-                                            wine_scene_id,
-                                            cornell_scene_id,
-                                        );
-                                        match save_prism_file(std::path::Path::new("res/scenes.prism"), &prism_db, false)
-                                        {
-                                            Ok(_) => project_status = "Saved: res/scenes.prism".to_string(),
-                                            Err(e) => project_status = format!("Save failed: {e}"),
-                                        }
-                                    }
-                                    let active_scene_id = match scene_kind {
-                                        SceneKind::Decanter => decanter_scene_id,
-                                        SceneKind::Wine => wine_scene_id,
-                                        SceneKind::CornellBox => cornell_scene_id,
-                                    };
-                                    let active_scene_exists =
-                                        active_scene_id.0 != 0 && main_db.scenes.contains_key(&active_scene_id);
-                                    if ui.button("Add Object") && active_scene_exists {
-                                        ui.open_popup("add_object_popup");
-                                    }
-                                    ui.popup("add_object_popup", || {
+                                egui::SidePanel::left("outliner")
+                                    .resizable(true)
+                                    .default_width(230.0)
+                                    .show(ctx, |ui| {
+                                        ui.heading("Outliner");
+                                        ui.horizontal(|ui| {
+                                            if has_decanter && ui.selectable_label(scene_kind == SceneKind::Decanter, "Scene").clicked() {
+                                                requested_scene = SceneKind::Decanter;
+                                            }
+                                            if has_wine && ui.selectable_label(scene_kind == SceneKind::Wine, "Wine").clicked() {
+                                                requested_scene = SceneKind::Wine;
+                                            }
+                                            if has_cornell && ui.selectable_label(scene_kind == SceneKind::CornellBox, "Cornell").clicked() {
+                                                requested_scene = SceneKind::CornellBox;
+                                            }
+                                        });
+                                        ui.separator();
                                         let scene_id = match scene_kind {
                                             SceneKind::Decanter => decanter_scene_id,
                                             SceneKind::Wine => wine_scene_id,
                                             SceneKind::CornellBox => cornell_scene_id,
                                         };
-                                        match scene_kind {
-                                            SceneKind::Decanter => {
-                                                if ui.selectable("Cube") {
-                                                    main_db.collection_link_object(decanter_master, sphere_obj_id);
-                                                    main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                        for object_id in main_db.scene_visible_selectable_objects(scene_id) {
+                                            if let Some(target) = object_target_by_id.get(&object_id).copied() {
+                                                if !target_allowed_in_scene(scene_kind, target) {
+                                                    continue;
                                                 }
-                                                if ui.selectable("Decanter") {
-                                                    main_db.collection_link_object(decanter_master, decanter_obj_id);
-                                                    main_db.ensure_scene_base(scene_id, decanter_obj_id, true, true);
-                                                }
-                                                if ui.selectable("Sun Lamp") {
-                                                    main_db.collection_link_object(decanter_master, sun_obj_id);
-                                                    main_db.ensure_scene_base(scene_id, sun_obj_id, true, true);
+                                                let label = main_db.objects.get(&object_id).map(|o| o.name.as_str()).unwrap_or("Object");
+                                                if ui.selectable_label(has_selection && gizmo_target == target, label).clicked() {
+                                                    gizmo_target = target;
+                                                    has_selection = true;
                                                 }
                                             }
-                                            SceneKind::Wine => {
-                                                if ui.selectable("Wine Glass") {
-                                                    main_db.collection_link_object(wine_master, wine_obj_id);
-                                                    main_db.ensure_scene_base(scene_id, wine_obj_id, true, true);
-                                                }
-                                                if ui.selectable("Spotlight") {
-                                                    main_db.collection_link_object(wine_master, spot_obj_id);
-                                                    main_db.ensure_scene_base(scene_id, spot_obj_id, true, true);
-                                                }
-                                            }
-                                            SceneKind::CornellBox => {
-                                                if ui.selectable("Cornell Box") {
-                                                    main_db.collection_link_object(cornell_master, cornell_obj_id);
-                                                    main_db.ensure_scene_base(scene_id, cornell_obj_id, true, true);
-                                                }
-                                                if ui.selectable("Cube") {
-                                                    main_db.collection_link_object(cornell_master, sphere_obj_id);
-                                                    main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
-                                                }
-                                            }
+                                        }
+                                        if !project_status.is_empty() {
+                                            ui.separator();
+                                            ui.label(&project_status);
                                         }
                                     });
-                                    if !project_status.is_empty() {
-                                        ui.text_wrapped(&project_status);
-                                    }
-                                    if !active_scene_exists {
-                                        ui.text_wrapped("No scene yet. Add a scene first.");
-                                        return;
-                                    }
-                                    ui.text("Select Object");
-                                    let scene_id = match scene_kind {
-                                        SceneKind::Decanter => decanter_scene_id,
-                                        SceneKind::Wine => wine_scene_id,
-                                        SceneKind::CornellBox => cornell_scene_id,
-                                    };
-                                    for object_id in main_db.scene_visible_selectable_objects(scene_id) {
-                                        if let Some(target) = object_target_by_id.get(&object_id).copied() {
-                                            if !target_allowed_in_scene(scene_kind, target) {
-                                                continue;
-                                            }
-                                            let label = main_db
-                                                .objects
-                                                .get(&object_id)
-                                                .map(|o| o.name.as_str())
-                                                .unwrap_or("Object");
-                                            if ui
-                                                .selectable_config(label)
-                                                .selected(has_selection && gizmo_target == target)
-                                                .build()
-                                            {
-                                                gizmo_target = target;
-                                                has_selection = true;
-                                            }
+
+                                egui::SidePanel::right("properties")
+                                    .resizable(true)
+                                    .default_width(300.0)
+                                    .show(ctx, |ui| {
+                                        ui.heading("Properties");
+                                        if !target_allowed_in_scene(scene_kind, gizmo_target) {
+                                            gizmo_target = default_target_for_scene(scene_kind);
                                         }
-                                    }
-                                });
+                                        ui.label(format!("Selected: {}", if has_selection { target_label(gizmo_target) } else { "None" }));
+                                        ui.horizontal(|ui| {
+                                            ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Translate, "Move");
+                                            ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Rotate, "Rotate");
+                                            ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Scale, "Scale");
+                                        });
+                                        ui.separator();
+                                        ui.collapsing("Sun", |ui| {
+                                            ui.add(egui::Slider::new(&mut sun_azimuth_deg, -180.0..=180.0).text("Azimuth"));
+                                            ui.add(egui::Slider::new(&mut sun_elevation_deg, -10.0..=89.0).text("Elevation"));
+                                            ui.add(egui::Slider::new(&mut sun_intensity, 0.0..=5.0).text("Intensity"));
+                                        });
+                                        ui.collapsing("Spotlight", |ui| {
+                                            let az_changed = ui.add(egui::Slider::new(&mut wine_spotlight_azimuth_deg, -180.0..=180.0).text("Azimuth")).changed();
+                                            let el_changed = ui.add(egui::Slider::new(&mut wine_spotlight_elevation_deg, 5.0..=85.0).text("Elevation")).changed();
+                                            let dist_changed = ui.add(egui::Slider::new(&mut wine_spotlight_distance, 2.0..=wine_max_extent.max(10.0) * 4.0).text("Distance")).changed();
+                                            if scene_kind == SceneKind::Wine && (az_changed || el_changed || dist_changed) {
+                                                spot_empty_position = wine_spotlight_position(
+                                                    active_center,
+                                                    wine_spotlight_azimuth_deg,
+                                                    wine_spotlight_elevation_deg,
+                                                    wine_spotlight_distance,
+                                                );
+                                            }
+                                        });
+                                    });
 
                             let requested_scene_exists = match requested_scene {
                                 SceneKind::Decanter => decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id),
@@ -1701,17 +1572,23 @@ pub async fn run() {
                                 0.1,
                                 1000.0,
                             );
-                            let display_size = ui.io().display_size;
+                            let pixels_per_point = ctx.pixels_per_point().max(1.0);
+                            let screen_rect = ctx.input(|i| i.screen_rect());
+                            let display_size = [screen_rect.width().max(1.0), screen_rect.height().max(1.0)];
+                            let pointer_pos = ctx
+                                .input(|i| i.pointer.hover_pos())
+                                .map(|p| [p.x, p.y])
+                                .unwrap_or([mouse_pos[0] / pixels_per_point, mouse_pos[1] / pixels_per_point]);
+                            let pointer_captured = ctx.is_pointer_over_area();
                             let viewport = Rect::from_min_max(
                                 [0.0, 0.0].into(),
                                 [display_size[0].max(1.0), display_size[1].max(1.0)].into(),
                             );
-                            let cursor = ui.io().mouse_pos;
                             let interaction = GizmoInteraction {
-                                cursor_pos: (cursor[0], cursor[1]),
-                                hovered: !ui.io().want_capture_mouse,
-                                drag_started: ui.is_mouse_clicked(MouseButton::Left),
-                                dragging: ui.is_mouse_down(MouseButton::Left),
+                                cursor_pos: (pointer_pos[0], pointer_pos[1]),
+                                hovered: !pointer_captured,
+                                drag_started: mouse_left_clicked,
+                                dragging: mouse_left_down,
                             };
                             let gizmo_modes = match gizmo_mode {
                                 GizmoModeKind::Translate => GizmoMode::all_translate(),
@@ -1771,7 +1648,7 @@ pub async fn run() {
                                 snap_distance: 0.5,
                                 snap_scale: 0.1,
                                 visuals: GizmoVisuals::default(),
-                                pixels_per_point: ui.io().display_framebuffer_scale[0].max(1.0),
+                                pixels_per_point,
                             });
 
                             let target_transform = match gizmo_target {
@@ -2003,10 +1880,10 @@ pub async fn run() {
                                 }
                             }
 
-                            if ui.is_mouse_clicked(MouseButton::Left)
-                                && !ui.io().want_capture_mouse
+                            if mouse_left_clicked
+                                && !pointer_captured
                                 && !gizmo.is_focused()
-                                && !ui.is_mouse_dragging(MouseButton::Left)
+                                && !mouse_left_dragging
                             {
                                 let scene_id = match scene_kind {
                                     SceneKind::Decanter => decanter_scene_id,
@@ -2019,9 +1896,8 @@ pub async fn run() {
                                 let wine_allowed = selectable_ids.contains(&wine_obj_id);
                                 let sun_allowed = selectable_ids.contains(&sun_obj_id);
                                 let spot_allowed = selectable_ids.contains(&spot_obj_id);
-                                let display_size = ui.io().display_size;
                                 let (ro, rd) = world_ray_from_cursor(
-                                    ui.io().mouse_pos,
+                                    pointer_pos,
                                     [display_size[0].max(1.0), display_size[1].max(1.0)],
                                     camera.view_matrix().inverse(),
                                     projection.inverse(),
@@ -2110,7 +1986,10 @@ pub async fn run() {
 
                             if has_selection {
                                 let draw_data = gizmo.draw();
-                                let fg = ui.get_foreground_draw_list();
+                                let painter = ctx.layer_painter(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    egui::Id::new("gizmo_overlay"),
+                                ));
                                 for idx in (0..draw_data.indices.len()).step_by(3) {
                                     let i0 = draw_data.indices[idx] as usize;
                                     let i1 = draw_data.indices[idx + 1] as usize;
@@ -2119,16 +1998,21 @@ pub async fn run() {
                                     let p1 = draw_data.vertices[i1];
                                     let p2 = draw_data.vertices[i2];
                                     let c = draw_data.colors[i0];
-                                    let color =
-                                        imgui::ImColor32::from_rgba_f32s(c[0], c[1], c[2], c[3]);
-                                    fg.add_triangle(
-                                        [p0[0], p0[1]],
-                                        [p1[0], p1[1]],
-                                        [p2[0], p2[1]],
+                                    let color = Color32::from_rgba_unmultiplied(
+                                        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                        (c[3].clamp(0.0, 1.0) * 255.0) as u8,
+                                    );
+                                    painter.add(egui::Shape::convex_polygon(
+                                        vec![
+                                            Pos2::new(p0[0], p0[1]),
+                                            Pos2::new(p1[0], p1[1]),
+                                            Pos2::new(p2[0], p2[1]),
+                                        ],
                                         color,
-                                    )
-                                    .filled(true)
-                                    .build();
+                                        Stroke::NONE,
+                                    ));
                                 }
 
                                 if current_scene_exists && scene_kind != SceneKind::Wine {
@@ -2138,13 +2022,16 @@ pub async fn run() {
                                     if let (Some(s), Some(cn)) = (sun_screen, center_screen) {
                                         let selected = gizmo_target == GizmoTargetKind::SunLamp;
                                         let line_color = if selected {
-                                            imgui::ImColor32::from_rgba_f32s(1.0, 0.62, 0.15, 1.0)
+                                            Color32::from_rgb(255, 158, 38)
                                         } else {
-                                            imgui::ImColor32::from_rgba_f32s(1.0, 0.95, 0.6, 0.9)
+                                            Color32::from_rgb(255, 242, 153)
                                         };
-                                        fg.add_line([s[0], s[1]], [cn[0], cn[1]], line_color).thickness(2.0).build();
-                                        fg.add_circle([s[0], s[1]], 8.0, line_color).thickness(2.0).build();
-                                        fg.add_circle([s[0], s[1]], 3.0, line_color).filled(true).build();
+                                        painter.line_segment(
+                                            [Pos2::new(s[0], s[1]), Pos2::new(cn[0], cn[1])],
+                                            Stroke::new(2.0, line_color),
+                                        );
+                                        painter.circle_stroke(Pos2::new(s[0], s[1]), 8.0, Stroke::new(2.0, line_color));
+                                        painter.circle_filled(Pos2::new(s[0], s[1]), 3.0, line_color);
                                     }
                                 } else if current_scene_exists {
                                     let display = [display_size[0].max(1.0), display_size[1].max(1.0)];
@@ -2154,19 +2041,16 @@ pub async fn run() {
                                     if let (Some(s), Some(tg)) = (spot_screen, target_screen) {
                                         let selected = gizmo_target == GizmoTargetKind::WineSpotlight;
                                         let line_color = if selected {
-                                            imgui::ImColor32::from_rgba_f32s(1.0, 0.62, 0.15, 1.0)
+                                            Color32::from_rgb(255, 158, 38)
                                         } else {
-                                            imgui::ImColor32::from_rgba_f32s(1.0, 0.95, 0.6, 0.9)
+                                            Color32::from_rgb(255, 242, 153)
                                         };
-                                        fg.add_line([s[0], s[1]], [tg[0], tg[1]], line_color)
-                                            .thickness(2.0)
-                                            .build();
-                                        fg.add_circle([s[0], s[1]], 8.0, line_color)
-                                            .thickness(2.0)
-                                            .build();
-                                        fg.add_circle([s[0], s[1]], 3.0, line_color)
-                                            .filled(true)
-                                            .build();
+                                        painter.line_segment(
+                                            [Pos2::new(s[0], s[1]), Pos2::new(tg[0], tg[1])],
+                                            Stroke::new(2.0, line_color),
+                                        );
+                                        painter.circle_stroke(Pos2::new(s[0], s[1]), 8.0, Stroke::new(2.0, line_color));
+                                        painter.circle_filled(Pos2::new(s[0], s[1]), 3.0, line_color);
                                     }
                                 }
                             }
@@ -2250,8 +2134,19 @@ pub async fn run() {
                                 obj.transform.scale = cornell_scale;
                             }
 
-                            let sun_changed = uniforms.light_pos != old_light
+                            sun_changed = uniforms.light_pos != old_light
                                 || (uniforms.sun_intensity - old_intensity).abs() > f32::EPSILON;
+                            });
+                            let egui::FullOutput {
+                                platform_output,
+                                textures_delta,
+                                shapes,
+                                pixels_per_point,
+                                ..
+                            } = full_output;
+                            egui_state.handle_platform_output(window.as_ref(), platform_output);
+                            let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+
                             if accumulation_dirty || sun_changed {
                                 if geometry_dirty {
                                     update_mesh_transform(
@@ -2324,6 +2219,20 @@ pub async fn run() {
                                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                                     label: Some("enc"),
                                 });
+                            let screen_descriptor = ScreenDescriptor {
+                                size_in_pixels: [config.width, config.height],
+                                pixels_per_point,
+                            };
+                            for (id, image_delta) in &textures_delta.set {
+                                egui_renderer.update_texture(&device, &queue, *id, image_delta);
+                            }
+                            egui_renderer.update_buffers(
+                                &device,
+                                &queue,
+                                &mut encoder,
+                                &clipped_primitives,
+                                &screen_descriptor,
+                            );
                             photon_mapper.update(
                                 &queue,
                                 uniforms.light_pos,
@@ -2362,12 +2271,10 @@ pub async fn run() {
                                     });
                                 quad_pass.render(&mut present_rpass);
                             }
-                            platform.prepare_render(ui, &window);
-                            let draw_data = imgui.render();
                             {
                                 let mut ui_rpass =
                                     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                        label: Some("imgui-pass"),
+                                        label: Some("egui-pass"),
                                         color_attachments: &[Some(
                                             wgpu::RenderPassColorAttachment {
                                                 view: &view,
@@ -2384,14 +2291,20 @@ pub async fn run() {
                                         occlusion_query_set: None,
                                         timestamp_writes: None,
                                     });
-                                let _ = imgui_renderer.render(
-                                    draw_data,
-                                    &queue,
-                                    &device,
-                                    &mut ui_rpass,
+                                egui_renderer.render(
+                                    &mut ui_rpass.forget_lifetime(),
+                                    &clipped_primitives,
+                                    &screen_descriptor,
                                 );
                             }
                             queue.submit(Some(encoder.finish()));
+                            for id in &textures_delta.free {
+                                egui_renderer.free_texture(id);
+                            }
+                            mouse_left_clicked = false;
+                            if !mouse_left_down {
+                                mouse_left_dragging = false;
+                            }
                             tex.present();
                         }
                         _ => {}
