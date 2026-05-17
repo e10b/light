@@ -14,7 +14,6 @@ struct Uniforms {
   sun_intensity: f32,
   frame: u32,
   scene_kind: u32,
-  render_mode: u32,
   render_width: u32,
   render_height: u32,
   selected_object: u32,
@@ -727,10 +726,6 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
   return L;
 }
 
-fn trace_raytraced(origin: vec3<f32>, direction: vec3<f32>, seed: u32) -> vec3<f32> {
-  return trace_ray(origin, direction, seed);
-}
-
 fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   if (uniforms.scene_kind == 99u) {
     return 0.0;
@@ -833,16 +828,11 @@ fn fs_main(vertex: VertexOut) -> @location(0) vec4<f32> {
   let py = u32(clamp(floor(uv.y * f32(uniforms.render_height)), 0.0, f32(uniforms.render_height - 1u)));
   let idx = py * uniforms.render_width + px;
 
-  let path_seed = u32(uniforms.frame) * 1973u + px * 9277u + py * 7013u + 1u;
-  let ray_seed = px * 9277u + py * 7013u + 17u;
-  let sample_color = select(
-    trace_ray(origin, direction, path_seed),
-    trace_raytraced(origin, direction, ray_seed),
-    uniforms.render_mode == 1u
-  );
+  let seed = u32(uniforms.frame) * 1973u + px * 9277u + py * 7013u + 1u;
+  let sample_color = trace_ray(origin, direction, seed);
 
   var accum_color = sample_color;
-  if (uniforms.render_mode == 0u && uniforms.frame > 0u) {
+  if (uniforms.frame > 0u) {
     let prev = accum[idx].rgb;
     let n = f32(uniforms.frame + 1u);
     accum_color = prev + (sample_color - prev) / n;
@@ -875,17 +865,12 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let far_world = (uniforms.view_inv * vec4<f32>(far_pos, 1.0)).xyz;
   let direction = normalize(far_world - origin);
 
-  let path_seed = uniforms.frame * 1973u + px * 9277u + py * 7013u + 1u;
-  let ray_seed = px * 9277u + py * 7013u + 17u;
-  let sample_color = select(
-    trace_ray(origin, direction, path_seed),
-    trace_raytraced(origin, direction, ray_seed),
-    uniforms.render_mode == 1u
-  );
+  let seed = uniforms.frame * 1973u + px * 9277u + py * 7013u + 1u;
+  let sample_color = trace_ray(origin, direction, seed);
   let selected_mask = selection_mask_ray(origin, direction);
 
   var accum_color = sample_color;
-  if (uniforms.render_mode == 0u && uniforms.frame > 0u) {
+  if (uniforms.frame > 0u) {
     let prev = accum[idx].rgb;
     let n = f32(uniforms.frame + 1u);
     accum_color = prev + (sample_color - prev) / n;

@@ -1,11 +1,18 @@
 pub struct ComputePass {
-    pipeline: wgpu::ComputePipeline,
+    pathtraced_pipeline: wgpu::ComputePipeline,
+    raytraced_pipeline: wgpu::ComputePipeline,
     _color_texture: wgpu::Texture,
     color_texture_view: wgpu::TextureView,
     _selection_mask_texture: wgpu::Texture,
     selection_mask_texture_view: wgpu::TextureView,
     width: u32,
     height: u32,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum RenderPath {
+    Pathtraced,
+    Raytraced,
 }
 
 impl ComputePass {
@@ -44,9 +51,13 @@ impl ComputePass {
         let selection_mask_texture_view =
             selection_mask_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let pathtraced_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("compute_pathtracer"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sphere.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/pathtraced.wgsl").into()),
+        });
+        let raytraced_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("compute_raytracer"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/raytraced.wgsl").into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -55,17 +66,26 @@ impl ComputePass {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("compute_pipeline"),
+        let pathtraced_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("compute_pathtraced_pipeline"),
             layout: Some(&pipeline_layout),
-            module: &shader,
+            module: &pathtraced_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let raytraced_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("compute_raytraced_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &raytraced_shader,
             entry_point: Some("cs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
 
         Self {
-            pipeline,
+            pathtraced_pipeline,
+            raytraced_pipeline,
             _color_texture: color_texture,
             color_texture_view,
             _selection_mask_texture: selection_mask_texture,
@@ -83,12 +103,21 @@ impl ComputePass {
         &self.selection_mask_texture_view
     }
 
-    pub fn record(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup) {
+    pub fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        render_path: RenderPath,
+    ) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("compute_pass"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&self.pipeline);
+        let pipeline = match render_path {
+            RenderPath::Pathtraced => &self.pathtraced_pipeline,
+            RenderPath::Raytraced => &self.raytraced_pipeline,
+        };
+        cpass.set_pipeline(pipeline);
         cpass.set_bind_group(0, bind_group, &[]);
         let workgroup_size = 8;
         let dispatch_x = self.width.div_ceil(workgroup_size);

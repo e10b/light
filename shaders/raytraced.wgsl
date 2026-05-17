@@ -14,7 +14,6 @@ struct Uniforms {
   sun_intensity: f32,
   frame: u32,
   scene_kind: u32,
-  render_mode: u32,
   render_width: u32,
   render_height: u32,
   selected_object: u32,
@@ -727,8 +726,167 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
   return L;
 }
 
-fn trace_raytraced(origin: vec3<f32>, direction: vec3<f32>, seed: u32) -> vec3<f32> {
-  return trace_ray(origin, direction, seed);
+fn trace_raytraced(origin: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
+  if (uniforms.scene_kind == 99u) {
+    return vec3<f32>(0.0);
+  }
+  let is_wine_scene = uniforms.scene_kind == 2u;
+
+  let ro = origin;
+  let rd = direction;
+
+  let sph = uniforms.sphere_pos;
+  let cube_center = sph.xyz;
+  let q = uniforms.sphere_rot;
+  let q_inv = vec4<f32>(-q.xyz, q.w);
+  let cube_half_vec = uniforms.sphere_extent.xyz;
+  var t_cube = 1e38;
+  if (!is_wine_scene) {
+    let local_ro = quat_mul_vec(q_inv, ro - cube_center);
+    let local_rd = quat_mul_vec(q_inv, rd);
+    let t_local = cube_intersection_t(local_ro, local_rd, vec3<f32>(0.0), cube_half_vec);
+    if (t_local < 1e37) { t_cube = t_local; }
+  }
+
+  var t_tri = 1e38;
+  var tri_prim = 0u;
+  var tri_bary = vec2<f32>(0.0);
+  if (uniforms.mesh_enabled != 0u) {
+    var rq: ray_query;
+    rayQueryInitialize(&rq, acc_struct, RayDesc(0u, 0xFFu, 0.001, 1000.0, ro, rd));
+    rayQueryProceed(&rq);
+    let tri_hit = rayQueryGetCommittedIntersection(&rq);
+    if (tri_hit.kind != RAY_QUERY_INTERSECTION_NONE) {
+      t_tri = tri_hit.t;
+      tri_prim = tri_hit.primitive_index;
+      tri_bary = tri_hit.barycentrics;
+    }
+  }
+  if (t_tri < 1e37) {
+    let tri_pos = ro + rd * t_tri;
+    let in_wine = uniforms.wine_enabled != 0u && distance(tri_pos, uniforms.mesh_center.xyz) <= uniforms.mesh_center.w;
+    let in_decanter = uniforms.decanter_enabled != 0u && distance(tri_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
+    if (!in_wine && !in_decanter) {
+      t_tri = 1e38;
+    }
+  }
+
+  var t_cornell = 1e38;
+  if (!is_wine_scene && uniforms.cornell_enabled != 0u) {
+    t_cornell = cube_intersection_t(ro, rd, uniforms.cornell_center.xyz, vec3<f32>(uniforms.cornell_center.w));
+  }
+  let t_ground = ground_plane_intersection(ro, rd);
+
+  var hit_t = 1e38;
+  var hit_type = 0u; // 0=none,1=cube,2=tri,3=ground,4=cornell
+  if (t_cube < hit_t) { hit_t = t_cube; hit_type = 1u; }
+  if (t_tri < hit_t) { hit_t = t_tri; hit_type = 2u; }
+  if (t_cornell < hit_t) { hit_t = t_cornell; hit_type = 4u; }
+  if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
+
+  if (hit_type == 0u) {
+    return select(sky(rd) * 0.9, vec3<f32>(0.0), is_wine_scene);
+  }
+
+  let hit_pos = ro + rd * hit_t;
+  var normal = vec3<f32>(0.0, 1.0, 0.0);
+  var albedo = vec3<f32>(0.8);
+  var transmission = 0.0;
+  var ior = 1.5;
+
+  if (hit_type == 1u) {
+    let local_hit = quat_mul_vec(q_inv, hit_pos - cube_center);
+    let local_n = cube_normal(local_hit, vec3<f32>(0.0), uniforms.sphere_extent.xyz);
+    normal = quat_mul_vec(q, local_n);
+    albedo = max(uniforms.sphere_color.xyz, vec3<f32>(0.001));
+    transmission = clamp(uniforms.sphere_color.w, 0.0, 1.0);
+    ior = 1.52;
+  } else if (hit_type == 2u) {
+    let prim = tri_prim;
+    let i0 = mesh_indices[prim * 3u + 0u];
+    let i1 = mesh_indices[prim * 3u + 1u];
+    let i2 = mesh_indices[prim * 3u + 2u];
+    let bary = tri_bary;
+    let w = 1.0 - bary.x - bary.y;
+    let n0 = mesh_normals[i0].xyz;
+    let n1 = mesh_normals[i1].xyz;
+    let n2 = mesh_normals[i2].xyz;
+    normal = normalize(n0 * w + n1 * bary.x + n2 * bary.y);
+    let m = materials[mesh_triangle_material[prim]];
+    albedo = m.base_color.rgb;
+    transmission = clamp(m.params.z, 0.0, 1.0);
+    ior = max(m.params.w, 1.0);
+    if (is_wine_scene) {
+      let is_wine_tinted = transmission > 0.02;
+      albedo = select(albedo, vec3<f32>(0.62, 0.11, 0.16), is_wine_tinted);
+      transmission = max(transmission, 0.72);
+      ior = select(ior, 1.36, is_wine_tinted);
+    } else {
+      transmission = max(transmission, 0.98);
+      albedo = mix(albedo, vec3<f32>(1.0), 0.85);
+    }
+  } else if (hit_type == 4u) {
+    normal = cube_normal(hit_pos, uniforms.cornell_center.xyz, vec3<f32>(uniforms.cornell_center.w));
+    albedo = vec3<f32>(0.82);
+  } else {
+    normal = vec3<f32>(0.0, 1.0, 0.0);
+    if (is_wine_scene) {
+      albedo = vec3<f32>(0.035, 0.03, 0.024);
+    } else {
+      let grid_scale = 2.0;
+      let grid_x = i32(floor(hit_pos.x / grid_scale)) & 1;
+      let grid_z = i32(floor(hit_pos.z / grid_scale)) & 1;
+      albedo = select(vec3<f32>(0.3), vec3<f32>(0.7), (grid_x ^ grid_z) == 0);
+    }
+  }
+
+  let spot_position = uniforms.light_pos.xyz;
+  let spot_target = uniforms.mesh_center.xyz;
+  let spot_to_hit = hit_pos - spot_position;
+  let spot_distance = length(spot_to_hit);
+  let spot_axis = normalize(spot_target - spot_position);
+  let spot_cos = dot(normalize(spot_to_hit), spot_axis);
+  let spot_shape = smoothstep(cos(24.0 * 3.141592653589793 / 180.0), cos(8.0 * 3.141592653589793 / 180.0), spot_cos);
+  let wine_to_light = normalize(spot_position - hit_pos);
+  let sun_dir = normalize(uniforms.light_pos.xyz);
+  let to_light = select(sun_dir, wine_to_light, is_wine_scene);
+  let light_tmax = select(10000.0, max(spot_distance - 0.05, 0.05), is_wine_scene);
+
+  var shadow_rq: ray_query;
+  let shadow_origin = hit_pos + normal * 0.02;
+  rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, light_tmax, shadow_origin, to_light));
+  rayQueryProceed(&shadow_rq);
+  let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
+  var cube_shadow_t = 1e38;
+  if (!is_wine_scene) {
+    let local_shadow_origin = quat_mul_vec(q_inv, shadow_origin - cube_center);
+    let local_to_light = quat_mul_vec(q_inv, to_light);
+    let t_local_sh = cube_intersection_t(local_shadow_origin, local_to_light, vec3<f32>(0.0), cube_half_vec);
+    if (t_local_sh < 1e37) { cube_shadow_t = t_local_sh; }
+  }
+  let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (cube_shadow_t >= 1e37);
+
+  var direct = vec3<f32>(0.0);
+  if (visible || (is_wine_scene && hit_type == 3u)) {
+    let nl = max(dot(normalize(normal), to_light), 0.0);
+    let light_color = select(vec3<f32>(1.0, 0.94, 0.82), vec3<f32>(1.0, 0.82, 0.58) * spot_shape * 7.5, is_wine_scene);
+    direct = albedo * light_color * nl * uniforms.sun_intensity;
+  }
+
+  if (transmission < 0.5) {
+    let ambient = select(vec3<f32>(0.05), vec3<f32>(0.01), is_wine_scene);
+    return direct + ambient * albedo;
+  }
+
+  let v = normalize(-rd);
+  let n = normalize(normal);
+  let cos_i = clamp(dot(v, n), 0.0, 1.0);
+  let fresnel = schlick(cos_i, 1.0, ior);
+  let refl_dir = reflect(rd, n);
+  let refr_dir = refract(rd, n, 1.0 / ior);
+  let refl_col = select(sky(refl_dir) * 0.9, vec3<f32>(0.02, 0.01, 0.01), is_wine_scene);
+  let refr_col = select(sky(refr_dir) * 0.7, albedo * vec3<f32>(0.12, 0.04, 0.04), is_wine_scene);
+  return mix(refr_col, refl_col, fresnel) + direct * 0.15;
 }
 
 fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
@@ -833,21 +991,9 @@ fn fs_main(vertex: VertexOut) -> @location(0) vec4<f32> {
   let py = u32(clamp(floor(uv.y * f32(uniforms.render_height)), 0.0, f32(uniforms.render_height - 1u)));
   let idx = py * uniforms.render_width + px;
 
-  let path_seed = u32(uniforms.frame) * 1973u + px * 9277u + py * 7013u + 1u;
-  let ray_seed = px * 9277u + py * 7013u + 17u;
-  let sample_color = select(
-    trace_ray(origin, direction, path_seed),
-    trace_raytraced(origin, direction, ray_seed),
-    uniforms.render_mode == 1u
-  );
+  let sample_color = trace_raytraced(origin, direction);
 
   var accum_color = sample_color;
-  if (uniforms.render_mode == 0u && uniforms.frame > 0u) {
-    let prev = accum[idx].rgb;
-    let n = f32(uniforms.frame + 1u);
-    accum_color = prev + (sample_color - prev) / n;
-  }
-
   accum[idx] = vec4<f32>(accum_color, 1.0);
   return vec4<f32>(sqrt(max(accum_color, vec3<f32>(0.0))), 1.0);
 }
@@ -875,22 +1021,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let far_world = (uniforms.view_inv * vec4<f32>(far_pos, 1.0)).xyz;
   let direction = normalize(far_world - origin);
 
-  let path_seed = uniforms.frame * 1973u + px * 9277u + py * 7013u + 1u;
-  let ray_seed = px * 9277u + py * 7013u + 17u;
-  let sample_color = select(
-    trace_ray(origin, direction, path_seed),
-    trace_raytraced(origin, direction, ray_seed),
-    uniforms.render_mode == 1u
-  );
+  let sample_color = trace_raytraced(origin, direction);
   let selected_mask = selection_mask_ray(origin, direction);
 
   var accum_color = sample_color;
-  if (uniforms.render_mode == 0u && uniforms.frame > 0u) {
-    let prev = accum[idx].rgb;
-    let n = f32(uniforms.frame + 1u);
-    accum_color = prev + (sample_color - prev) / n;
-  }
-
   accum[idx] = vec4<f32>(accum_color, 1.0);
   textureStore(output_image, vec2<i32>(i32(px), i32(py)), vec4<f32>(sqrt(max(accum_color, vec3<f32>(0.0))), 1.0));
   textureStore(selection_mask_out, vec2<i32>(i32(px), i32(py)), vec4<f32>(selected_mask, 0.0, 0.0, 1.0));

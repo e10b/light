@@ -48,7 +48,7 @@ struct SceneUniforms {
     decanter_enabled: u32,
     wine_enabled: u32,
     cornell_enabled: u32,
-    _pad: [u32; 2],
+    _pad: [u32; 5],
 }
 
 struct Camera {
@@ -62,6 +62,12 @@ enum GizmoModeKind {
     Translate,
     Rotate,
     Scale,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum RenderModeKind {
+    Pathtraced,
+    Raytraced,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -707,7 +713,7 @@ pub async fn run() {
         decanter_enabled: 0,
         wine_enabled: 0,
         cornell_enabled: 0,
-        _pad: [0; 2],
+        _pad: [0; 5],
     };
 
     let mut sun_azimuth_deg = uniforms.light_pos[2]
@@ -994,6 +1000,7 @@ pub async fn run() {
     let mut fps_display_time = std::time::Instant::now();
     let mut last_update = std::time::Instant::now();
     let mut accumulation_dirty = true;
+    let mut render_mode = RenderModeKind::Pathtraced;
     let mut gizmo = Gizmo::default();
     let mut gizmo_mode = GizmoModeKind::Translate;
     let mut gizmo_target = default_target_for_scene(scene_kind);
@@ -1475,6 +1482,27 @@ pub async fn run() {
                                     .default_width(300.0)
                                     .show(ctx, |ui| {
                                         ui.heading("Properties");
+                                        ui.horizontal(|ui| {
+                                            ui.label("Render");
+                                            let path_clicked = ui
+                                                .selectable_value(
+                                                    &mut render_mode,
+                                                    RenderModeKind::Pathtraced,
+                                                    "Pathtraced",
+                                                )
+                                                .changed();
+                                            let ray_clicked = ui
+                                                .selectable_value(
+                                                    &mut render_mode,
+                                                    RenderModeKind::Raytraced,
+                                                    "Raytraced",
+                                                )
+                                                .changed();
+                                            if path_clicked || ray_clicked {
+                                                accumulation_dirty = true;
+                                            }
+                                        });
+                                        ui.separator();
                                         if !target_allowed_in_scene(scene_kind, gizmo_target) {
                                             gizmo_target = default_target_for_scene(scene_kind);
                                         }
@@ -2370,7 +2398,14 @@ pub async fn run() {
                             photon_mapper.emit_photons(&mut encoder, 262_144);
                             photon_mapper.build_spatial_structure(&mut encoder);
                             {
-                                compute_pass.record(&mut encoder, &ugroup);
+                                compute_pass.record(
+                                    &mut encoder,
+                                    &ugroup,
+                                    match render_mode {
+                                        RenderModeKind::Pathtraced => compute_pass::RenderPath::Pathtraced,
+                                        RenderModeKind::Raytraced => compute_pass::RenderPath::Raytraced,
+                                    },
+                                );
                             }
                             {
                                 let mut present_rpass =
