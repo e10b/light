@@ -1241,6 +1241,13 @@ pub async fn run() {
                         | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => {
                             let raw_input = egui_state.take_egui_input(window.as_ref());
                             let mut sun_changed = false;
+                            let mut photon_emitter_center = [
+                                active_center.x,
+                                active_center.y,
+                                active_center.z,
+                                active_max_extent * 0.85,
+                            ];
+                            let mut photons_per_frame = 0u32;
                             let full_output = egui_ctx.run(raw_input, |ctx| {
                                 let mut requested_scene = scene_kind;
                                 let current_scene_exists = match scene_kind {
@@ -2249,6 +2256,27 @@ pub async fn run() {
                             uniforms.wine_enabled = if wine_visible { 1 } else { 0 };
                             uniforms.cornell_enabled = if cornell_visible { 1 } else { 0 };
                             uniforms.mesh_enabled = if decanter_visible || wine_visible { 1 } else { 0 };
+                            if current_scene_exists {
+                                if scene_kind == SceneKind::Wine && wine_visible {
+                                    photon_emitter_center = [
+                                        uniforms.mesh_center[0],
+                                        uniforms.mesh_center[1],
+                                        uniforms.mesh_center[2],
+                                        uniforms.mesh_center[3].max(0.25),
+                                    ];
+                                    photons_per_frame = 262_144;
+                                } else if scene_kind == SceneKind::Decanter
+                                    && (decanter_visible || wine_visible)
+                                {
+                                    photon_emitter_center = [
+                                        uniforms.decanter_center[0],
+                                        uniforms.decanter_center[1],
+                                        uniforms.decanter_center[2],
+                                        uniforms.decanter_center[3].max(0.25),
+                                    ];
+                                    photons_per_frame = 262_144;
+                                }
+                            }
 
                             if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
                                 obj.transform.location = glam::Vec3::new(
@@ -2387,15 +2415,10 @@ pub async fn run() {
                             photon_mapper.update(
                                 &queue,
                                 uniforms.light_pos,
-                                [
-                                    active_center.x,
-                                    active_center.y,
-                                    active_center.z,
-                                    active_max_extent * 0.85,
-                                ],
+                                photon_emitter_center,
                                 uniforms.frame,
                             );
-                            photon_mapper.emit_photons(&mut encoder, 262_144);
+                            photon_mapper.emit_photons(&mut encoder, photons_per_frame);
                             photon_mapper.build_spatial_structure(&mut encoder);
                             {
                                 compute_pass.record(
