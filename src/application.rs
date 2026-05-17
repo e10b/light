@@ -33,6 +33,8 @@ struct SceneUniforms {
     light_pos: [f32; 4],
     sphere_pos: [f32; 4],
     sphere_color: [f32; 4],
+    sphere_rot: [f32; 4],
+    sphere_extent: [f32; 4],
     mesh_center: [f32; 4],
     decanter_center: [f32; 4],
     cornell_center: [f32; 4],
@@ -387,9 +389,9 @@ fn intersect_sphere(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, rad
     }
 }
 
-fn intersect_cube(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, half_extent: f32) -> Option<f32> {
-    let min = center - glam::Vec3::splat(half_extent);
-    let max = center + glam::Vec3::splat(half_extent);
+fn intersect_cube(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, half_extent: glam::Vec3) -> Option<f32> {
+    let min = center - half_extent;
+    let max = center + half_extent;
     let inv = glam::Vec3::new(
         if dir.x.abs() > 1e-6 { 1.0 / dir.x } else { f32::INFINITY },
         if dir.y.abs() > 1e-6 { 1.0 / dir.y } else { f32::INFINITY },
@@ -690,6 +692,8 @@ pub async fn run() {
         light_pos: [10.0, 8.0, 10.0, 1.0],
         sphere_pos: [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius],
         sphere_color: [0.98, 1.0, 1.0, 1.0],
+        sphere_rot: [0.0, 0.0, 0.0, 1.0],
+        sphere_extent: [sphere_radius, sphere_radius, sphere_radius, 0.0],
         mesh_center: [wine_center.x, wine_center.y, wine_center.z, wine_max_extent * 0.8],
         decanter_center: [decanter_center.x, decanter_center.y, decanter_center.z, decanter_max_extent * 0.7],
         cornell_center: [0.0, 0.5, -1.0, 1.0],
@@ -995,7 +999,7 @@ pub async fn run() {
     let mut gizmo_target = default_target_for_scene(scene_kind);
     let mut has_selection = true;
     let mut sphere_rotation = glam::Quat::IDENTITY;
-    let mut sphere_radius_scale = 1.0f32;
+    let mut sphere_scale = glam::Vec3::ONE;
     let mut decanter_rotation = glam::Quat::IDENTITY;
     let mut decanter_translation = glam::Vec3::ZERO;
     let mut decanter_scale = glam::Vec3::ONE;
@@ -1370,8 +1374,14 @@ pub async fn run() {
                                                             uniforms.sphere_pos[1] = t.y;
                                                             uniforms.sphere_pos[2] = t.z;
                                                             sphere_rotation = r;
-                                                            sphere_radius_scale = s.x.max(0.01);
-                                                            uniforms.sphere_pos[3] = sphere_radius * sphere_radius_scale;
+                                                            uniforms.sphere_rot = [sphere_rotation.x, sphere_rotation.y, sphere_rotation.z, sphere_rotation.w];
+                                                            sphere_scale = s.max(glam::Vec3::splat(0.01));
+                                                            uniforms.sphere_extent = [
+                                                                sphere_radius * sphere_scale.x,
+                                                                sphere_radius * sphere_scale.y,
+                                                                sphere_radius * sphere_scale.z,
+                                                                0.0,
+                                                            ];
                                                         } else if lname.contains("decanter") {
                                                             decanter_translation = t - decanter_center;
                                                             decanter_rotation = r;
@@ -1520,8 +1530,14 @@ pub async fn run() {
                                 active_max_extent = next_extent;
                                 let sphere_pos =
                                     sphere_position_for(active_center, next_size, sphere_radius);
-                                uniforms.sphere_pos =
-                                    [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius * sphere_radius_scale];
+                                        uniforms.sphere_pos =
+                                    [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius];
+                                uniforms.sphere_extent = [
+                                    sphere_radius * sphere_scale.x,
+                                    sphere_radius * sphere_scale.y,
+                                    sphere_radius * sphere_scale.z,
+                                    0.0,
+                                ];
                                 uniforms.mesh_center = [
                                     wine_center.x + wine_translation.x,
                                     wine_center.y + wine_translation.y,
@@ -1676,9 +1692,9 @@ pub async fn run() {
                             let target_transform = match gizmo_target {
                                 GizmoTargetKind::Sphere => GizmoTransform::from_scale_rotation_translation(
                                     transform_gizmo::math::DVec3::new(
-                                        sphere_radius_scale as f64,
-                                        sphere_radius_scale as f64,
-                                        sphere_radius_scale as f64,
+                                        sphere_scale.x as f64,
+                                        sphere_scale.y as f64,
+                                        sphere_scale.z as f64,
                                     ),
                                     transform_gizmo::math::DQuat::from_xyzw(
                                         sphere_rotation.x as f64,
@@ -1799,11 +1815,44 @@ pub async fn run() {
                                     gizmo.update(interaction, &[target_transform])
                                 {
                                     let new_t = transforms[0];
-                                    let translation = glam::Vec3::new(
+                                    let mut translation = glam::Vec3::new(
                                         new_t.translation.x as f32,
                                         new_t.translation.y as f32,
                                         new_t.translation.z as f32,
                                     );
+                                    // If Shift is held, make gizmo translations faster (scale deltas)
+                                    if keys_pressed.contains("Shift") {
+                                        match gizmo_target {
+                                            GizmoTargetKind::Sphere => {
+                                                let cur = glam::Vec3::new(
+                                                    uniforms.sphere_pos[0],
+                                                    uniforms.sphere_pos[1],
+                                                    uniforms.sphere_pos[2],
+                                                );
+                                                translation = cur + (translation - cur) * 3.0;
+                                            }
+                                            GizmoTargetKind::Decanter => {
+                                                let cur = decanter_center + decanter_translation;
+                                                translation = cur + (translation - cur) * 3.0;
+                                            }
+                                            GizmoTargetKind::WineGlass => {
+                                                let cur = wine_center + wine_translation;
+                                                translation = cur + (translation - cur) * 3.0;
+                                            }
+                                            GizmoTargetKind::CornellBox => {
+                                                let cur = active_center + cornell_translation;
+                                                translation = cur + (translation - cur) * 3.0;
+                                            }
+                                            GizmoTargetKind::SunLamp => {
+                                                let cur = sun_empty_position;
+                                                translation = cur + (translation - cur) * 3.0;
+                                            }
+                                            GizmoTargetKind::WineSpotlight => {
+                                                let cur = spot_empty_position;
+                                                translation = cur + (translation - cur) * 3.0;
+                                            }
+                                        }
+                                    }
                                     match gizmo_target {
                                     GizmoTargetKind::Sphere => {
                                         uniforms.sphere_pos[0] = translation.x;
@@ -1812,14 +1861,29 @@ pub async fn run() {
                                         let sx = new_t.scale.x.abs() as f32;
                                         let sy = new_t.scale.y.abs() as f32;
                                         let sz = new_t.scale.z.abs() as f32;
-                                        sphere_radius_scale = sx.max(sy).max(sz).clamp(0.15, 8.0);
-                                        uniforms.sphere_pos[3] = sphere_radius * sphere_radius_scale;
+                                        sphere_scale = glam::Vec3::new(
+                                            sx.clamp(0.15, 8.0),
+                                            sy.clamp(0.15, 8.0),
+                                            sz.clamp(0.15, 8.0),
+                                        );
+                                        uniforms.sphere_extent = [
+                                            sphere_radius * sphere_scale.x,
+                                            sphere_radius * sphere_scale.y,
+                                            sphere_radius * sphere_scale.z,
+                                            0.0,
+                                        ];
                                         sphere_rotation = glam::Quat::from_array([
                                             new_t.rotation.v.x as f32,
                                             new_t.rotation.v.y as f32,
                                             new_t.rotation.v.z as f32,
                                             new_t.rotation.s as f32,
                                         ]);
+                                        uniforms.sphere_rot = [
+                                            sphere_rotation.x,
+                                            sphere_rotation.y,
+                                            sphere_rotation.z,
+                                            sphere_rotation.w,
+                                        ];
                                     }
                                     GizmoTargetKind::Decanter => {
                                         let new_center = glam::Vec3::new(translation.x, translation.y, translation.z);
@@ -1933,7 +1997,16 @@ pub async fn run() {
                                 let decanter_center_now = decanter_center + decanter_translation;
                                 let wine_center_now = wine_center + wine_translation;
                                 let sphere_hit = if scene_kind == SceneKind::Decanter && sphere_allowed {
-                                    intersect_cube(ro, rd, sphere_center, uniforms.sphere_pos[3])
+                                    intersect_cube(
+                                        ro,
+                                        rd,
+                                        sphere_center,
+                                        glam::Vec3::new(
+                                            uniforms.sphere_extent[0],
+                                            uniforms.sphere_extent[1],
+                                            uniforms.sphere_extent[2],
+                                        ),
+                                    )
                                 } else {
                                     None
                                 };
@@ -2156,7 +2229,7 @@ pub async fn run() {
                                     uniforms.sphere_pos[2],
                                 );
                                 obj.transform.rotation = sphere_rotation;
-                                obj.transform.scale = glam::Vec3::splat(sphere_radius_scale);
+                                obj.transform.scale = sphere_scale;
                             }
                             if let Some(obj) = main_db.objects.get_mut(&decanter_obj_id) {
                                 obj.transform.location = decanter_center + decanter_translation;

@@ -6,6 +6,8 @@ struct Uniforms {
   light_pos: vec4<f32>,
   sphere_pos: vec4<f32>,
   sphere_color: vec4<f32>,
+  sphere_rot: vec4<f32>,
+  sphere_extent: vec4<f32>,
   mesh_center: vec4<f32>,
   decanter_center: vec4<f32>,
   cornell_center: vec4<f32>,
@@ -283,9 +285,9 @@ fn sphere_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f
   return 1e38;
 }
 
-fn cube_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>, half_extent: f32) -> f32 {
-  let bmin = center - vec3<f32>(half_extent);
-  let bmax = center + vec3<f32>(half_extent);
+fn cube_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32>) -> f32 {
+  let bmin = center - half_extent;
+  let bmax = center + half_extent;
   let inv_dir = 1.0 / max(abs(direction), vec3<f32>(1e-6)) * sign(direction);
   let t0 = (bmin - origin) * inv_dir;
   let t1 = (bmax - origin) * inv_dir;
@@ -305,8 +307,8 @@ fn cube_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32
   return 1e38;
 }
 
-fn cube_normal(hit_pos: vec3<f32>, center: vec3<f32>, half_extent: f32) -> vec3<f32> {
-  let p = (hit_pos - center) / max(half_extent, 1e-6);
+fn cube_normal(hit_pos: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32>) -> vec3<f32> {
+  let p = (hit_pos - center) / max(half_extent, vec3<f32>(1e-6));
   let ax = abs(p.x);
   let ay = abs(p.y);
   let az = abs(p.z);
@@ -317,6 +319,13 @@ fn cube_normal(hit_pos: vec3<f32>, center: vec3<f32>, half_extent: f32) -> vec3<
     return vec3<f32>(0.0, sign(p.y), 0.0);
   }
   return vec3<f32>(0.0, 0.0, sign(p.z));
+}
+
+// Rotate vector `v` by quaternion `q` (q = [xyz, w])
+fn quat_mul_vec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+  let qv = q.xyz;
+  let t = 2.0 * cross(qv, v);
+  return v + q.w * t + cross(qv, t);
 }
 
 fn trace_cornell(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32> {
@@ -465,13 +474,19 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     bounce = bounce + 1u;
 
     // Scene intersections: cube, triangles (ray query), ground
-    // Cube intersection
+    // Cube intersection (support rotation via quaternion)
     let sph = uniforms.sphere_pos;
     let cube_center = sph.xyz;
     let cube_half_extent = sph.w;
+    let q = uniforms.sphere_rot;
+    let q_inv = vec4<f32>(-q.xyz, q.w);
     var t_cube = 1e38;
     if (!is_wine_scene) {
-      t_cube = cube_intersection_t(ro, rd, cube_center, cube_half_extent);
+      let local_ro = quat_mul_vec(q_inv, ro - cube_center);
+      let local_rd = quat_mul_vec(q_inv, rd);
+      let cube_half_vec = uniforms.sphere_extent.xyz;
+      let t_local = cube_intersection_t(local_ro, local_rd, vec3<f32>(0.0), cube_half_vec);
+      if (t_local < 1e37) { t_cube = t_local; }
     }
 
     // Triangle / mesh intersection via ray query
@@ -500,7 +515,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
 
     var t_cornell = 1e38;
     if (!is_wine_scene && uniforms.cornell_enabled != 0u) {
-      t_cornell = cube_intersection_t(ro, rd, uniforms.cornell_center.xyz, uniforms.cornell_center.w);
+      t_cornell = cube_intersection_t(ro, rd, uniforms.cornell_center.xyz, vec3<f32>(uniforms.cornell_center.w));
     }
 
     // Ground plane
@@ -535,7 +550,11 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
 
     if (hit_type == 1u) {
       // Cube: allow glass behavior via sphere_color.w toggle
-      normal = cube_normal(hit_pos, cube_center, cube_half_extent);
+      let qh = uniforms.sphere_rot;
+      let qh_inv = vec4<f32>(-qh.xyz, qh.w);
+      let local_hit = quat_mul_vec(qh_inv, hit_pos - cube_center);
+      let local_n = cube_normal(local_hit, vec3<f32>(0.0), uniforms.sphere_extent.xyz);
+      normal = quat_mul_vec(qh, local_n);
       albedo = max(uniforms.sphere_color.xyz, vec3<f32>(0.001));
       metallic = 0.0;
       roughness = 0.0025;
@@ -561,8 +580,8 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       transmission = clamp(m.params.z, 0.0, 1.0);
       ior = max(m.params.w, 1.0);
       if (is_wine_scene) {
-        let wine_tint = vec3<f32>(0.42, 0.012, 0.022);
-        let is_wine_tinted = albedo.r > albedo.g * 4.0 && albedo.r > albedo.b * 3.0;
+        let wine_tint = vec3<f32>(0.62, 0.11, 0.16);
+        let is_wine_tinted = transmission > 0.02;
         albedo = select(albedo, wine_tint, is_wine_tinted);
         transmission = max(transmission, 0.72);
         roughness = min(roughness, 0.012);
@@ -574,7 +593,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
         albedo = mix(albedo, vec3<f32>(1.0), 0.85);
       }
     } else if (hit_type == 4u) {
-      normal = cube_normal(hit_pos, uniforms.cornell_center.xyz, uniforms.cornell_center.w);
+      normal = cube_normal(hit_pos, uniforms.cornell_center.xyz, vec3<f32>(uniforms.cornell_center.w));
       albedo = vec3<f32>(0.82, 0.82, 0.82);
       metallic = 0.0;
       roughness = 0.7;
@@ -618,12 +637,13 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
     var cube_shadow_t = 1e38;
     if (!is_wine_scene) {
-      cube_shadow_t = cube_intersection_t(
-        shadow_origin,
-        to_light,
-        uniforms.sphere_pos.xyz,
-        uniforms.sphere_pos.w,
-      );
+      let qsh = uniforms.sphere_rot;
+      let qsh_inv = vec4<f32>(-qsh.xyz, qsh.w);
+      let local_shadow_origin = quat_mul_vec(qsh_inv, shadow_origin - cube_center);
+      let local_to_light = quat_mul_vec(qsh_inv, to_light);
+      let cube_half_vec_sh = uniforms.sphere_extent.xyz;
+      let t_local_sh = cube_intersection_t(local_shadow_origin, local_to_light, vec3<f32>(0.0), cube_half_vec_sh);
+      if (t_local_sh < 1e37) { cube_shadow_t = t_local_sh; }
     }
     let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (cube_shadow_t >= 1e37);
     let receives_spot_pool = is_wine_scene && hit_type == 3u;
@@ -720,9 +740,15 @@ fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   let sph = uniforms.sphere_pos;
   let cube_center = sph.xyz;
   let cube_half_extent = sph.w;
+  let q = uniforms.sphere_rot;
+  let q_inv = vec4<f32>(-q.xyz, q.w);
+  let cube_half_vec_main = uniforms.sphere_extent.xyz;
   var t_cube = 1e38;
   if (!is_wine_scene) {
-    t_cube = cube_intersection_t(ro, rd, cube_center, cube_half_extent);
+    let local_ro = quat_mul_vec(q_inv, ro - cube_center);
+    let local_rd = quat_mul_vec(q_inv, rd);
+    let t_local = cube_intersection_t(local_ro, local_rd, vec3<f32>(0.0), cube_half_vec_main);
+    if (t_local < 1e37) { t_cube = t_local; }
   }
 
   var t_tri = 1e38;
@@ -743,7 +769,7 @@ fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   }
   var t_cornell = 1e38;
   if (!is_wine_scene && uniforms.cornell_enabled != 0u) {
-    t_cornell = cube_intersection_t(ro, rd, uniforms.cornell_center.xyz, uniforms.cornell_center.w);
+    t_cornell = cube_intersection_t(ro, rd, uniforms.cornell_center.xyz, vec3<f32>(uniforms.cornell_center.w));
   }
 
   let t_ground = ground_plane_intersection(ro, rd);
