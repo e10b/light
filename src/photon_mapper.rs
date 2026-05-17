@@ -112,7 +112,11 @@ impl PhotonMapper {
 
         let hash_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("photon_hash_layout"),
-            entries: &[uniform_entry(0), storage_entry(1, false), storage_entry(2, false)],
+            entries: &[
+                uniform_entry(0),
+                storage_entry(1, false),
+                storage_entry(2, false),
+            ],
         });
 
         let emission_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -260,7 +264,6 @@ impl PhotonMapper {
         pass.set_bind_group(0, &self.emission_bind_group, &[]);
         pass.dispatch_workgroups(photons_per_frame.div_ceil(256), 1, 1);
         drop(pass);
-
     }
 
     pub fn build_spatial_structure(&self, encoder: &mut wgpu::CommandEncoder) {

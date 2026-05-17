@@ -73,16 +73,22 @@ fn ground_plane_intersection(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
 fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= uniforms.photon_count) { return; }
 
-  let sun_to_scene = -normalize(uniforms.light_pos.xyz);
   let center = uniforms.emitter_center.xyz;
   let radius = max(uniforms.emitter_center.w, 1.0);
-  let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(sun_to_scene.y) < 0.95);
-  let tangent = normalize(cross(up, sun_to_scene));
-  let bitangent = cross(sun_to_scene, tangent);
   let disk = disk_sample(gid.x * 9781u + uniforms.frame * 6271u, radius);
 
-  var ro = center - sun_to_scene * 70.0 + tangent * disk.x + bitangent * disk.y;
-  var rd = sun_to_scene;
+  let is_spotlight = uniforms.light_pos.w < 0.0;
+  let sun_to_scene = -normalize(uniforms.light_pos.xyz);
+  let spot_position = uniforms.light_pos.xyz;
+  let spot_axis = normalize(center - spot_position);
+  let light_axis = select(sun_to_scene, spot_axis, is_spotlight);
+  let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light_axis.y) < 0.95);
+  let tangent = normalize(cross(up, light_axis));
+  let bitangent = cross(light_axis, tangent);
+  let aperture = disk * select(1.0, 0.08, is_spotlight);
+
+  var ro = select(center - light_axis * 70.0 + tangent * disk.x + bitangent * disk.y, spot_position, is_spotlight);
+  var rd = normalize(select(light_axis, center + tangent * aperture.x + bitangent * aperture.y - spot_position, is_spotlight));
   var power = vec3<f32>(1.0, 0.9, 0.72) * 0.035;
   var passed_glass = false;
   write_photon(gid.x, center, vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0));

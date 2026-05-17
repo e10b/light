@@ -399,6 +399,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
   if (uniforms.scene_kind == 1u) {
     return trace_cornell(origin, direction, seed_in);
   }
+  let is_wine_scene = uniforms.scene_kind == 2u;
 
   var L = vec3<f32>(0.0);
   var throughput = vec3<f32>(1.0);
@@ -425,7 +426,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     let c = dot(oc, oc) - sphere_r * sphere_r;
     var t_sphere = 1e38;
     let disc = b * b - a * c;
-    if (disc > 0.0) {
+    if (!is_wine_scene && disc > 0.0) {
       let sq = sqrt(disc);
       let t1 = (-b - sq) / a;
       let t2 = (-b + sq) / a;
@@ -451,8 +452,10 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
 
     if (hit_type == 0u) {
-      // Miss -> environment/sun in spectral space
-      L = L + throughput * sky(rd) * spectral_weight;
+      // Wine is a black studio scene; decanter keeps the procedural sky.
+      if (!is_wine_scene) {
+        L = L + throughput * sky(rd) * spectral_weight;
+      }
       break;
     }
 
@@ -501,42 +504,69 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     } else {
       // Ground
       normal = vec3<f32>(0.0, 1.0, 0.0);
-      let grid_scale = 2.0;
-      let grid_x = i32(floor(hit_pos.x / grid_scale)) & 1;
-      let grid_z = i32(floor(hit_pos.z / grid_scale)) & 1;
-      let is_white = (grid_x ^ grid_z) == 0;
-      albedo = select(vec3<f32>(0.3), vec3<f32>(0.7), is_white);
+      if (is_wine_scene) {
+        albedo = vec3<f32>(0.035, 0.03, 0.024);
+      } else {
+        let grid_scale = 2.0;
+        let grid_x = i32(floor(hit_pos.x / grid_scale)) & 1;
+        let grid_z = i32(floor(hit_pos.z / grid_scale)) & 1;
+        let is_white = (grid_x ^ grid_z) == 0;
+        albedo = select(vec3<f32>(0.3), vec3<f32>(0.7), is_white);
+      }
       metallic = 0.0;
       roughness = 0.9;
       transmission = 0.0;
       ior = 1.0;
     }
 
-    // Direct sun term / shadow
+    // Decanter uses directional sun; Wine uses a local spotlight aimed at the glass.
+    let spot_position = uniforms.light_pos.xyz;
+    let spot_target = uniforms.mesh_center.xyz;
+    let spot_to_hit = hit_pos - spot_position;
+    let spot_distance = length(spot_to_hit);
+    let spot_axis = normalize(spot_target - spot_position);
+    let spot_cos = dot(normalize(spot_to_hit), spot_axis);
+    let spot_shape = smoothstep(cos(24.0 * 3.141592653589793 / 180.0), cos(8.0 * 3.141592653589793 / 180.0), spot_cos);
+    let wine_to_light = normalize(spot_position - hit_pos);
     let sun_dir = normalize(uniforms.light_pos.xyz);
-    let to_light = sun_dir;
+    let to_light = select(sun_dir, wine_to_light, is_wine_scene);
+    let light_tmax = select(10000.0, max(spot_distance - 0.05, 0.05), is_wine_scene);
     var shadow_rq: ray_query;
     let shadow_origin = hit_pos + normal * 0.02;
-    rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, 10000.0, shadow_origin, to_light));
+    rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, light_tmax, shadow_origin, to_light));
     rayQueryProceed(&shadow_rq);
     let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
-    let sphere_shadow_t = sphere_intersection_t(
-      shadow_origin,
-      to_light,
-      uniforms.sphere_pos.xyz,
-      uniforms.sphere_pos.w,
-    );
+    var sphere_shadow_t = 1e38;
+    if (!is_wine_scene) {
+      sphere_shadow_t = sphere_intersection_t(
+        shadow_origin,
+        to_light,
+        uniforms.sphere_pos.xyz,
+        uniforms.sphere_pos.w,
+      );
+    }
     let visible = (shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (sphere_shadow_t >= 1e37);
-    if (visible && transmission < 0.5) {
+    let receives_spot_pool = is_wine_scene && hit_type == 3u;
+    if ((visible || receives_spot_pool) && transmission < 0.5) {
       let nl = max(dot(normal, to_light), 0.0);
       let base = select(vec3<f32>(0.08), vec3<f32>(0.05), hit_type == 1u);
-      let sun_color = vec3<f32>(1.0, 0.94, 0.82);
+      let light_color = select(vec3<f32>(1.0, 0.94, 0.82), vec3<f32>(1.0, 0.82, 0.58) * spot_shape * 7.5, is_wine_scene);
       let photon_indirect = estimate_photon_density(hit_pos, normal, photon_uniforms.voxel_size * 1.5);
-      L = L + throughput * (base + photon_indirect * albedo + albedo * sun_color * nl * uniforms.sun_intensity) * spectral_weight;
+      if (is_wine_scene && hit_type == 3u) {
+        L = L + throughput * (photon_indirect * 8.0 + albedo * light_color * nl * uniforms.sun_intensity) * spectral_weight;
+      } else {
+        L = L + throughput * (base + photon_indirect * albedo + albedo * light_color * nl * uniforms.sun_intensity) * spectral_weight;
+      }
       break;
     }
 
     if (hit_type == 2u || transmission >= 0.5) {
+      if (is_wine_scene && visible) {
+        let half_vec = normalize(to_light - rd);
+        let spec = pow(max(dot(normal, half_vec), 0.0), 96.0);
+        let rim = pow(1.0 - max(dot(-rd, normal), 0.0), 3.0);
+        L = L + throughput * vec3<f32>(1.0, 0.55, 0.35) * spot_shape * (spec * 2.5 + rim * 0.08);
+      }
       // Spectral glass transport (faithful style to main branch)
       let entering = dot(rd, normal) < 0.0;
       let n = select(-normal, normal, entering);
@@ -573,7 +603,11 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     // If diffuse surface is shadowed, keep only small ambient and terminate.
     if (transmission < 0.5) {
       let photon_indirect = estimate_photon_density(hit_pos, normal, photon_uniforms.voxel_size * 1.5);
-      L = L + throughput * ((vec3<f32>(0.04) + photon_indirect) * albedo) * spectral_weight;
+      if (is_wine_scene && hit_type == 3u) {
+        L = L + throughput * photon_indirect * 8.0 * spectral_weight;
+      } else {
+        L = L + throughput * ((vec3<f32>(0.04) + photon_indirect) * albedo) * spectral_weight;
+      }
       break;
     }
 

@@ -8,7 +8,7 @@ use winit::{event::*, event_loop::EventLoop};
 
 use crate::{
     compute_pass,
-    mesh::{load_gltf_mesh, Vertex},
+    mesh::{load_gltf_mesh, MeshData, Vertex},
     photon_mapper::PhotonMapper,
     quad_pass,
     scene::SceneKind,
@@ -63,6 +63,98 @@ impl Camera {
     }
 }
 
+fn mesh_bounds(vertices: &[Vertex]) -> (glam::Vec3, glam::Vec3, glam::Vec3, glam::Vec3) {
+    let mut min_pos = glam::Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max_pos = glam::Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for vert in vertices {
+        let pos = glam::Vec3::from(vert.position);
+        min_pos = min_pos.min(pos);
+        max_pos = max_pos.max(pos);
+    }
+    let center = (min_pos + max_pos) * 0.5;
+    let size = max_pos - min_pos;
+    (center, size, min_pos, max_pos)
+}
+
+fn translate_mesh(mesh: &mut MeshData, offset: glam::Vec3) {
+    for vertex in &mut mesh.vertices {
+        let pos = glam::Vec3::from(vertex.position) + offset;
+        vertex.position = pos.to_array();
+    }
+    for pos in &mut mesh.positions4 {
+        pos[0] += offset.x;
+        pos[1] += offset.y;
+        pos[2] += offset.z;
+    }
+}
+
+fn orient_and_scale_mesh(mesh: &mut MeshData, pivot: glam::Vec3, rotation: glam::Quat, scale: f32) {
+    for vertex in &mut mesh.vertices {
+        let pos = glam::Vec3::from(vertex.position);
+        vertex.position = (pivot + rotation * ((pos - pivot) * scale)).to_array();
+    }
+    for pos in &mut mesh.positions4 {
+        let p = glam::Vec3::new(pos[0], pos[1], pos[2]);
+        let transformed = pivot + rotation * ((p - pivot) * scale);
+        pos[0] = transformed.x;
+        pos[1] = transformed.y;
+        pos[2] = transformed.z;
+    }
+    for normal in &mut mesh.normals4 {
+        let transformed = rotation * glam::Vec3::new(normal[0], normal[1], normal[2]);
+        normal[0] = transformed.x;
+        normal[1] = transformed.y;
+        normal[2] = transformed.z;
+    }
+}
+
+fn append_mesh(base: &mut MeshData, extra: MeshData) {
+    let vertex_offset = base.positions4.len() as u32;
+    let material_offset = base.materials.len() as u32;
+
+    base.vertices.extend(extra.vertices);
+    base.positions4.extend(extra.positions4);
+    base.normals4.extend(extra.normals4);
+    base.indices
+        .extend(extra.indices.into_iter().map(|index| index + vertex_offset));
+    base.triangle_material_ids.extend(
+        extra
+            .triangle_material_ids
+            .into_iter()
+            .map(|material_id| material_id + material_offset),
+    );
+    base.materials.extend(extra.materials);
+}
+
+fn sphere_position_for(center: glam::Vec3, size: glam::Vec3, radius: f32) -> glam::Vec3 {
+    glam::Vec3::new(center.x + size.x * 0.6 + 2.0, -1.5 + radius, center.z)
+}
+
+fn scene_camera(scene_kind: SceneKind, center: glam::Vec3, size: glam::Vec3) -> (glam::Vec3, glam::Vec3) {
+    if scene_kind == SceneKind::Wine {
+        let distance = size.max_element().max(12.0) * 1.35;
+        return (center + glam::Vec3::new(0.0, size.y * 0.2, distance), center);
+    }
+    scene_kind.default_camera(center)
+}
+
+fn wine_spotlight_position(
+    center: glam::Vec3,
+    azimuth_deg: f32,
+    elevation_deg: f32,
+    distance: f32,
+) -> glam::Vec3 {
+    let azimuth = azimuth_deg.to_radians();
+    let elevation = elevation_deg.to_radians();
+    let dir_from_target = glam::Vec3::new(
+        azimuth.cos() * elevation.cos(),
+        elevation.sin(),
+        azimuth.sin() * elevation.cos(),
+    )
+    .normalize_or_zero();
+    center + dir_from_target * distance.max(1.0)
+}
+
 pub async fn run() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let window = create_window(&event_loop, "wgpu v0.29 ray tracing");
@@ -108,30 +200,46 @@ pub async fn run() {
     surface.configure(&device, &config);
 
     let decanter_path = std::path::Path::new("res/wine_decanter_and_glass.glb");
-    let mesh = load_gltf_mesh(decanter_path).expect("Failed to load decanter model");
+    let wine_path = std::path::Path::new("res/red_wine_glass.glb");
+    let mut mesh = load_gltf_mesh(decanter_path).expect("Failed to load decanter model");
+    let mut wine_mesh = load_gltf_mesh(wine_path).expect("Failed to load red wine model");
+    let (decanter_center, decanter_size, _, decanter_max) = mesh_bounds(&mesh.vertices);
+    let (wine_original_center, _, _, _) = mesh_bounds(&wine_mesh.vertices);
+    orient_and_scale_mesh(
+        &mut wine_mesh,
+        wine_original_center,
+        glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+        25.0,
+    );
+    let (wine_oriented_center, wine_size, wine_min, _) = mesh_bounds(&wine_mesh.vertices);
+    let wine_target_center = glam::Vec3::new(
+        decanter_max.x + wine_size.x * 0.5 + 36.0,
+        wine_oriented_center.y + (-1.5 - wine_min.y),
+        decanter_center.z,
+    );
+    translate_mesh(&mut wine_mesh, wine_target_center - wine_oriented_center);
+    let (wine_center, wine_size, _, _) = mesh_bounds(&wine_mesh.vertices);
+    append_mesh(&mut mesh, wine_mesh);
+
     let model_verts = mesh.vertices;
     let model_idx = mesh.indices;
 
     println!(
-        "Loaded {} vertices and {} indices from decanter",
+        "Loaded {} vertices and {} indices from decanter + wine",
         model_verts.len(),
         model_idx.len()
     );
 
-    let mut min_pos = glam::Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-    let mut max_pos = glam::Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for vert in &model_verts {
-        let pos = glam::Vec3::from(vert.position);
-        min_pos = min_pos.min(pos);
-        max_pos = max_pos.max(pos);
-    }
-    let center = (min_pos + max_pos) * 0.5;
-    let size = max_pos - min_pos;
-    let max_extent = size.max_element();
+    let (center, size, _, _) = mesh_bounds(&model_verts);
+    let decanter_max_extent = decanter_size.max_element();
+    let wine_max_extent = wine_size.max_element();
     let render_width = 1280u32;
     let render_height = 720u32;
 
-    println!("Model bounds: center={:?}, size={:?}", center, size);
+    println!(
+        "Scene bounds: decanter center={:?}, wine center={:?}, combined center={:?}, size={:?}",
+        decanter_center, wine_center, center, size
+    );
 
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("model_vbuf"),
@@ -229,13 +337,10 @@ pub async fn run() {
 
     let mut scene_kind = SceneKind::Decanter;
     let sphere_radius = 6.0;
-    let ground_y = -1.5;
-    let sphere_pos = glam::Vec3::new(
-        center.x + size.x * 0.6 + 2.0,
-        ground_y + sphere_radius,
-        center.z,
-    );
-    let (camera_pos, camera_target) = scene_kind.default_camera(center);
+    let mut active_center = decanter_center;
+    let mut active_max_extent = decanter_max_extent;
+    let sphere_pos = sphere_position_for(active_center, decanter_size, sphere_radius);
+    let (camera_pos, camera_target) = scene_camera(scene_kind, active_center, decanter_size);
     let mut camera = Camera::look_at(camera_pos, camera_target);
     let mut uniforms = SceneUniforms {
         view_inv: camera.view_matrix().inverse().to_cols_array_2d(),
@@ -243,7 +348,7 @@ pub async fn run() {
         light_pos: [10.0, 8.0, 10.0, 1.0],
         sphere_pos: [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius],
         sphere_color: [0.98, 1.0, 1.0, 1.0],
-        mesh_center: [center.x, center.y, center.z, 0.0],
+        mesh_center: [active_center.x, active_center.y, active_center.z, 0.0],
         sun_intensity: 0.8,
         frame: 0,
         scene_kind: scene_kind.index(),
@@ -260,6 +365,9 @@ pub async fn run() {
         .sqrt();
     let mut sun_elevation_deg = uniforms.light_pos[1].atan2(sun_len_xz).to_degrees();
     let mut sun_intensity = uniforms.sun_intensity;
+    let mut wine_spotlight_azimuth_deg = -55.0;
+    let mut wine_spotlight_elevation_deg = 54.0;
+    let mut wine_spotlight_distance = wine_max_extent.max(10.0) * 1.4;
 
     let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("ubuf"),
@@ -714,6 +822,10 @@ pub async fn run() {
                                         requested_scene = SceneKind::Decanter;
                                     }
                                     ui.same_line();
+                                    if ui.button("Wine") {
+                                        requested_scene = SceneKind::Wine;
+                                    }
+                                    ui.same_line();
                                     if ui.button("Cornell Box") {
                                         requested_scene = SceneKind::CornellBox;
                                     }
@@ -731,10 +843,39 @@ pub async fn run() {
                                         .build(&mut sun_intensity);
                                 });
 
+                            ui.window("Wine Spotlight")
+                                .size([300.0, 150.0], Condition::FirstUseEver)
+                                .build(|| {
+                                    ui.slider_config("Azimuth (deg)", -180.0, 180.0)
+                                        .build(&mut wine_spotlight_azimuth_deg);
+                                    ui.slider_config("Elevation (deg)", 5.0, 85.0)
+                                        .build(&mut wine_spotlight_elevation_deg);
+                                    ui.slider_config("Distance", 2.0, wine_max_extent.max(10.0) * 4.0)
+                                        .build(&mut wine_spotlight_distance);
+                                });
+
                             if requested_scene != scene_kind {
                                 scene_kind = requested_scene;
                                 uniforms.scene_kind = scene_kind.index();
-                                let (camera_pos, camera_target) = scene_kind.default_camera(center);
+                                let (next_center, next_size, next_extent) = match scene_kind {
+                                    SceneKind::Decanter => {
+                                        (decanter_center, decanter_size, decanter_max_extent)
+                                    }
+                                    SceneKind::Wine => (wine_center, wine_size, wine_max_extent),
+                                    SceneKind::CornellBox => {
+                                        (glam::Vec3::ZERO, glam::Vec3::splat(2.0), 2.0)
+                                    }
+                                };
+                                active_center = next_center;
+                                active_max_extent = next_extent;
+                                let sphere_pos =
+                                    sphere_position_for(active_center, next_size, sphere_radius);
+                                uniforms.sphere_pos =
+                                    [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius];
+                                uniforms.mesh_center =
+                                    [active_center.x, active_center.y, active_center.z, 0.0];
+                                let (camera_pos, camera_target) =
+                                    scene_camera(scene_kind, active_center, next_size);
                                 camera = Camera::look_at(camera_pos, camera_target);
                                 uniforms.view_inv =
                                     camera.view_matrix().inverse().to_cols_array_2d();
@@ -751,7 +892,17 @@ pub async fn run() {
                             .normalize_or_zero();
                             let old_light = uniforms.light_pos;
                             let old_intensity = uniforms.sun_intensity;
-                            uniforms.light_pos = [sun_dir.x, sun_dir.y, sun_dir.z, 1.0];
+                            uniforms.light_pos = if scene_kind == SceneKind::Wine {
+                                let spot_position = wine_spotlight_position(
+                                    active_center,
+                                    wine_spotlight_azimuth_deg,
+                                    wine_spotlight_elevation_deg,
+                                    wine_spotlight_distance,
+                                );
+                                [spot_position.x, spot_position.y, spot_position.z, -1.0]
+                            } else {
+                                [sun_dir.x, sun_dir.y, sun_dir.z, 1.0]
+                            };
                             uniforms.sun_intensity = sun_intensity.max(0.0);
                             uniforms.scene_kind = scene_kind.index();
 
@@ -777,7 +928,12 @@ pub async fn run() {
                             photon_mapper.update(
                                 &queue,
                                 uniforms.light_pos,
-                                [center.x, center.y, center.z, max_extent * 0.85],
+                                [
+                                    active_center.x,
+                                    active_center.y,
+                                    active_center.z,
+                                    active_max_extent * 0.85,
+                                ],
                                 uniforms.frame,
                             );
                             photon_mapper.emit_photons(&mut encoder, 262_144);
