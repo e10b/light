@@ -14,7 +14,8 @@ struct Uniforms {
   render_width: u32,
   render_height: u32,
   selected_object: u32,
-  pad: vec3<u32>,
+  mesh_enabled: u32,
+  pad: vec2<u32>,
 };
 
 @group(0) @binding(0)
@@ -278,6 +279,42 @@ fn sphere_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f
   return 1e38;
 }
 
+fn cube_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>, half_extent: f32) -> f32 {
+  let bmin = center - vec3<f32>(half_extent);
+  let bmax = center + vec3<f32>(half_extent);
+  let inv_dir = 1.0 / max(abs(direction), vec3<f32>(1e-6)) * sign(direction);
+  let t0 = (bmin - origin) * inv_dir;
+  let t1 = (bmax - origin) * inv_dir;
+  let tmin3 = min(t0, t1);
+  let tmax3 = max(t0, t1);
+  let tmin = max(max(tmin3.x, tmin3.y), tmin3.z);
+  let tmax = min(min(tmax3.x, tmax3.y), tmax3.z);
+  if (tmax < 0.0 || tmin > tmax) {
+    return 1e38;
+  }
+  if (tmin > 0.001) {
+    return tmin;
+  }
+  if (tmax > 0.001) {
+    return tmax;
+  }
+  return 1e38;
+}
+
+fn cube_normal(hit_pos: vec3<f32>, center: vec3<f32>, half_extent: f32) -> vec3<f32> {
+  let p = (hit_pos - center) / max(half_extent, 1e-6);
+  let ax = abs(p.x);
+  let ay = abs(p.y);
+  let az = abs(p.z);
+  if (ax > ay && ax > az) {
+    return vec3<f32>(sign(p.x), 0.0, 0.0);
+  }
+  if (ay > az) {
+    return vec3<f32>(0.0, sign(p.y), 0.0);
+  }
+  return vec3<f32>(0.0, 0.0, sign(p.z));
+}
+
 fn trace_cornell(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32> {
   var L = vec3<f32>(0.0);
   var throughput = vec3<f32>(1.0);
@@ -401,6 +438,9 @@ fn trace_cornell(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<
 }
 
 fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32> {
+  if (uniforms.scene_kind == 99u) {
+    return vec3<f32>(0.0);
+  }
   if (uniforms.scene_kind == 1u) {
     return trace_cornell(origin, direction, seed_in);
   }
@@ -420,46 +460,46 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     if (bounce >= max_bounces) { break; }
     bounce = bounce + 1u;
 
-    // Scene intersections: sphere, triangles (ray query), ground
-    // Sphere intersection
+    // Scene intersections: cube, triangles (ray query), ground
+    // Cube intersection
     let sph = uniforms.sphere_pos;
-    let sphere_center = sph.xyz;
-    let sphere_r = sph.w;
-    let oc = ro - sphere_center;
-    let a = dot(rd, rd);
-    let b = dot(oc, rd);
-    let c = dot(oc, oc) - sphere_r * sphere_r;
-    var t_sphere = 1e38;
-    let disc = b * b - a * c;
-    if (!is_wine_scene && disc > 0.0) {
-      let sq = sqrt(disc);
-      let t1 = (-b - sq) / a;
-      let t2 = (-b + sq) / a;
-      if (t1 > 0.001) { t_sphere = t1; } else if (t2 > 0.001) { t_sphere = t2; }
+    let cube_center = sph.xyz;
+    let cube_half_extent = sph.w;
+    var t_cube = 1e38;
+    if (!is_wine_scene) {
+      t_cube = cube_intersection_t(ro, rd, cube_center, cube_half_extent);
     }
 
     // Triangle / mesh intersection via ray query
-    var rq: ray_query;
-    rayQueryInitialize(&rq, acc_struct, RayDesc(0u, 0xFFu, 0.001, 1000.0, ro, rd));
-    rayQueryProceed(&rq);
-    let tri_hit = rayQueryGetCommittedIntersection(&rq);
     var t_tri = 1e38;
-    if (tri_hit.kind != RAY_QUERY_INTERSECTION_NONE) { t_tri = tri_hit.t; }
+    var tri_prim = 0u;
+    var tri_bary = vec2<f32>(0.0);
+    if (uniforms.mesh_enabled != 0u) {
+      var rq: ray_query;
+      rayQueryInitialize(&rq, acc_struct, RayDesc(0u, 0xFFu, 0.001, 1000.0, ro, rd));
+      rayQueryProceed(&rq);
+      let tri_hit = rayQueryGetCommittedIntersection(&rq);
+      if (tri_hit.kind != RAY_QUERY_INTERSECTION_NONE) {
+        t_tri = tri_hit.t;
+        tri_prim = tri_hit.primitive_index;
+        tri_bary = tri_hit.barycentrics;
+      }
+    }
 
     // Ground plane
     let t_ground = ground_plane_intersection(ro, rd);
 
     // Choose nearest
     var hit_t = 1e38;
-    var hit_type = 0u; // 0=none,1=sphere,2=tri,3=ground
-    if (t_sphere < hit_t) { hit_t = t_sphere; hit_type = 1u; }
+    var hit_type = 0u; // 0=none,1=cube,2=tri,3=ground
+    if (t_cube < hit_t) { hit_t = t_cube; hit_type = 1u; }
     if (t_tri < hit_t) { hit_t = t_tri; hit_type = 2u; }
     if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
 
     if (hit_type == 0u) {
-      // Wine is a black studio scene; decanter keeps the procedural sky.
+      // Wine is a black studio scene; default scene uses neutral gray.
       if (!is_wine_scene) {
-        L = L + throughput * sky(rd) * spectral_weight;
+        L = L + throughput * vec3<f32>(0.62) * spectral_weight;
       }
       break;
     }
@@ -476,8 +516,8 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     var ior = 1.5;
 
     if (hit_type == 1u) {
-      // Sphere: allow glass behavior via sphere_color.w toggle
-      normal = normalize(hit_pos - sphere_center);
+      // Cube: allow glass behavior via sphere_color.w toggle
+      normal = cube_normal(hit_pos, cube_center, cube_half_extent);
       albedo = max(uniforms.sphere_color.xyz, vec3<f32>(0.001));
       metallic = 0.0;
       roughness = 0.0025;
@@ -485,11 +525,11 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       ior = 1.52;
     } else if (hit_type == 2u) {
       // True triangle normal/material from ray-query primitive + barycentrics.
-      let prim = tri_hit.primitive_index;
+      let prim = tri_prim;
       let i0 = mesh_indices[prim * 3u + 0u];
       let i1 = mesh_indices[prim * 3u + 1u];
       let i2 = mesh_indices[prim * 3u + 2u];
-      let bary = tri_hit.barycentrics;
+      let bary = tri_bary;
       let w = 1.0 - bary.x - bary.y;
       let n0 = mesh_normals[i0].xyz;
       let n1 = mesh_normals[i1].xyz;
@@ -551,16 +591,16 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, light_tmax, shadow_origin, to_light));
     rayQueryProceed(&shadow_rq);
     let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
-    var sphere_shadow_t = 1e38;
+    var cube_shadow_t = 1e38;
     if (!is_wine_scene) {
-      sphere_shadow_t = sphere_intersection_t(
+      cube_shadow_t = cube_intersection_t(
         shadow_origin,
         to_light,
         uniforms.sphere_pos.xyz,
         uniforms.sphere_pos.w,
       );
     }
-    let visible = (shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (sphere_shadow_t >= 1e37);
+    let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (cube_shadow_t >= 1e37);
     let receives_spot_pool = is_wine_scene && hit_type == 3u;
     if ((visible || receives_spot_pool) && transmission < 0.5) {
       let nl = max(dot(normal, to_light), 0.0);
@@ -642,6 +682,9 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
 }
 
 fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
+  if (uniforms.scene_kind == 99u) {
+    return 0.0;
+  }
   if (uniforms.selected_object == 0u) {
     return 0.0;
   }
@@ -650,32 +693,26 @@ fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   let rd = direction;
 
   let sph = uniforms.sphere_pos;
-  let sphere_center = sph.xyz;
-  let sphere_r = sph.w;
-  let oc = ro - sphere_center;
-  let a = dot(rd, rd);
-  let b = dot(oc, rd);
-  let c = dot(oc, oc) - sphere_r * sphere_r;
-  var t_sphere = 1e38;
-  let disc = b * b - a * c;
-  if (!is_wine_scene && disc > 0.0) {
-    let sq = sqrt(disc);
-    let t1 = (-b - sq) / a;
-    let t2 = (-b + sq) / a;
-    if (t1 > 0.001) { t_sphere = t1; } else if (t2 > 0.001) { t_sphere = t2; }
+  let cube_center = sph.xyz;
+  let cube_half_extent = sph.w;
+  var t_cube = 1e38;
+  if (!is_wine_scene) {
+    t_cube = cube_intersection_t(ro, rd, cube_center, cube_half_extent);
   }
 
-  var rq: ray_query;
-  rayQueryInitialize(&rq, acc_struct, RayDesc(0u, 0xFFu, 0.001, 1000.0, ro, rd));
-  rayQueryProceed(&rq);
-  let tri_hit = rayQueryGetCommittedIntersection(&rq);
   var t_tri = 1e38;
-  if (tri_hit.kind != RAY_QUERY_INTERSECTION_NONE) { t_tri = tri_hit.t; }
+  if (uniforms.mesh_enabled != 0u) {
+    var rq: ray_query;
+    rayQueryInitialize(&rq, acc_struct, RayDesc(0u, 0xFFu, 0.001, 1000.0, ro, rd));
+    rayQueryProceed(&rq);
+    let tri_hit = rayQueryGetCommittedIntersection(&rq);
+    if (tri_hit.kind != RAY_QUERY_INTERSECTION_NONE) { t_tri = tri_hit.t; }
+  }
 
   let t_ground = ground_plane_intersection(ro, rd);
   var hit_t = 1e38;
   var hit_type = 0u;
-  if (t_sphere < hit_t) { hit_t = t_sphere; hit_type = 1u; }
+  if (t_cube < hit_t) { hit_t = t_cube; hit_type = 1u; }
   if (t_tri < hit_t) { hit_t = t_tri; hit_type = 2u; }
   if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
   if (hit_type == 0u || hit_type == 3u) {
