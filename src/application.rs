@@ -1,8 +1,10 @@
 use std::iter;
 
-use imgui::{Condition, FontConfig, FontSource};
+use imgui::{Condition, FontConfig, FontSource, MouseButton};
 use imgui_wgpu::{Renderer as ImguiRenderer, RendererConfig};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
+use transform_gizmo::config::TransformPivotPoint;
+use transform_gizmo::{math::Transform as GizmoTransform, prelude::*};
 use wgpu::util::DeviceExt;
 use winit::{event::*, event_loop::EventLoop};
 
@@ -36,6 +38,19 @@ struct Camera {
     pos: glam::Vec3,
     yaw: f32,
     pitch: f32,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum GizmoModeKind {
+    Translate,
+    Rotate,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum GizmoTargetKind {
+    Sphere,
+    WineGlass,
+    WineSpotlight,
 }
 
 impl Camera {
@@ -155,6 +170,67 @@ fn wine_spotlight_position(
     center + dir_from_target * distance.max(1.0)
 }
 
+fn world_ray_from_cursor(
+    cursor: [f32; 2],
+    viewport: [f32; 2],
+    view_inv: glam::Mat4,
+    proj_inv: glam::Mat4,
+) -> (glam::Vec3, glam::Vec3) {
+    let ndc_x = (cursor[0] / viewport[0]) * 2.0 - 1.0;
+    let ndc_y = (1.0 - cursor[1] / viewport[1]) * 2.0 - 1.0;
+    let cam_far = proj_inv * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+    let far_pos = cam_far.truncate() / cam_far.w.max(1e-6);
+    let origin = (view_inv * glam::Vec4::new(0.0, 0.0, 0.0, 1.0)).truncate();
+    let far_world = (view_inv * glam::Vec4::new(far_pos.x, far_pos.y, far_pos.z, 1.0)).truncate();
+    (origin, (far_world - origin).normalize_or_zero())
+}
+
+fn intersect_sphere(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, radius: f32) -> Option<f32> {
+    let oc = origin - center;
+    let a = dir.dot(dir);
+    let b = oc.dot(dir);
+    let c = oc.dot(oc) - radius * radius;
+    let disc = b * b - a * c;
+    if disc <= 0.0 {
+        return None;
+    }
+    let sq = disc.sqrt();
+    let t1 = (-b - sq) / a;
+    let t2 = (-b + sq) / a;
+    if t1 > 0.001 {
+        Some(t1)
+    } else if t2 > 0.001 {
+        Some(t2)
+    } else {
+        None
+    }
+}
+
+fn update_wine_mesh_transform(
+    mesh: &mut MeshData,
+    model_verts: &mut [Vertex],
+    start: usize,
+    count: usize,
+    base_positions: &[glam::Vec3],
+    base_normals: &[glam::Vec3],
+    pivot: glam::Vec3,
+    rotation: glam::Quat,
+    translation: glam::Vec3,
+) {
+    for i in 0..count {
+        let idx = start + i;
+        let p = pivot + rotation * (base_positions[i] - pivot) + translation;
+        let n = (rotation * base_normals[i]).normalize_or_zero();
+        model_verts[idx].position = p.to_array();
+        mesh.positions4[idx][0] = p.x;
+        mesh.positions4[idx][1] = p.y;
+        mesh.positions4[idx][2] = p.z;
+        mesh.normals4[idx][0] = n.x;
+        mesh.normals4[idx][1] = n.y;
+        mesh.normals4[idx][2] = n.z;
+    }
+}
+
 pub async fn run() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let window = create_window(&event_loop, "wgpu v0.29 ray tracing");
@@ -219,10 +295,22 @@ pub async fn run() {
     );
     translate_mesh(&mut wine_mesh, wine_target_center - wine_oriented_center);
     let (wine_center, wine_size, _, _) = mesh_bounds(&wine_mesh.vertices);
+    let wine_vertex_start = mesh.positions4.len();
+    let wine_vertex_count = wine_mesh.positions4.len();
     append_mesh(&mut mesh, wine_mesh);
+    let wine_base_positions: Vec<glam::Vec3> =
+        mesh.positions4[wine_vertex_start..wine_vertex_start + wine_vertex_count]
+            .iter()
+            .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
+            .collect();
+    let wine_base_normals: Vec<glam::Vec3> =
+        mesh.normals4[wine_vertex_start..wine_vertex_start + wine_vertex_count]
+            .iter()
+            .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
+            .collect();
 
-    let model_verts = mesh.vertices;
-    let model_idx = mesh.indices;
+    let mut model_verts = mesh.vertices.clone();
+    let model_idx = mesh.indices.clone();
 
     println!(
         "Loaded {} vertices and {} indices from decanter + wine",
@@ -244,7 +332,9 @@ pub async fn run() {
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("model_vbuf"),
         contents: bytemuck::cast_slice(&model_verts),
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::BLAS_INPUT,
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::BLAS_INPUT
+            | wgpu::BufferUsages::COPY_DST,
     });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("model_ibuf"),
@@ -254,12 +344,12 @@ pub async fn run() {
     let pos_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_pos_buf"),
         contents: bytemuck::cast_slice(&mesh.positions4),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let nrm_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_nrm_buf"),
         contents: bytemuck::cast_slice(&mesh.normals4),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_idx_buf"),
@@ -607,6 +697,13 @@ pub async fn run() {
     let mut fps_display_time = std::time::Instant::now();
     let mut last_update = std::time::Instant::now();
     let mut accumulation_dirty = true;
+    let mut gizmo = Gizmo::default();
+    let mut gizmo_mode = GizmoModeKind::Translate;
+    let mut gizmo_target = GizmoTargetKind::Sphere;
+    let mut sphere_rotation = glam::Quat::IDENTITY;
+    let mut wine_rotation = glam::Quat::IDENTITY;
+    let mut wine_translation = glam::Vec3::ZERO;
+    let mut geometry_dirty = false;
 
     let _ = event_loop.run(move |event, active_loop| {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -854,6 +951,59 @@ pub async fn run() {
                                         .build(&mut wine_spotlight_distance);
                                 });
 
+                            ui.window("Transform Gizmo")
+                                .size([330.0, 120.0], Condition::FirstUseEver)
+                                .build(|| {
+                                    ui.text("Target");
+                                    if ui.radio_button_bool("Sphere", gizmo_target == GizmoTargetKind::Sphere) {
+                                        gizmo_target = GizmoTargetKind::Sphere;
+                                    }
+                                    ui.same_line();
+                                    if ui.radio_button_bool("Wine Glass", gizmo_target == GizmoTargetKind::WineGlass) {
+                                        gizmo_target = GizmoTargetKind::WineGlass;
+                                    }
+                                    ui.same_line();
+                                    if ui.radio_button_bool("Spotlight", gizmo_target == GizmoTargetKind::WineSpotlight) {
+                                        gizmo_target = GizmoTargetKind::WineSpotlight;
+                                    }
+
+                                    ui.text("Mode");
+                                    if ui.radio_button_bool(
+                                        "Translate",
+                                        gizmo_mode == GizmoModeKind::Translate,
+                                    ) {
+                                        gizmo_mode = GizmoModeKind::Translate;
+                                    }
+                                    ui.same_line();
+                                    if ui.radio_button_bool("Rotate", gizmo_mode == GizmoModeKind::Rotate)
+                                    {
+                                        gizmo_mode = GizmoModeKind::Rotate;
+                                    }
+                                });
+
+                            if ui.is_mouse_clicked(MouseButton::Left) && !ui.io().want_capture_mouse {
+                                let display_size = ui.io().display_size;
+                                let (ro, rd) = world_ray_from_cursor(
+                                    ui.io().mouse_pos,
+                                    [display_size[0].max(1.0), display_size[1].max(1.0)],
+                                    camera.view_matrix().inverse(),
+                                    projection.inverse(),
+                                );
+                                let sphere_center =
+                                    glam::Vec3::new(uniforms.sphere_pos[0], uniforms.sphere_pos[1], uniforms.sphere_pos[2]);
+                                let wine_center_now = wine_center + wine_translation;
+                                let sphere_hit = intersect_sphere(ro, rd, sphere_center, uniforms.sphere_pos[3]);
+                                let wine_hit = intersect_sphere(ro, rd, wine_center_now, (wine_max_extent * 0.55).max(0.25));
+                                gizmo_target = match (sphere_hit, wine_hit) {
+                                    (Some(ts), Some(tw)) => {
+                                        if ts <= tw { GizmoTargetKind::Sphere } else { GizmoTargetKind::WineGlass }
+                                    }
+                                    (Some(_), None) => GizmoTargetKind::Sphere,
+                                    (None, Some(_)) => GizmoTargetKind::WineGlass,
+                                    _ => gizmo_target,
+                                };
+                            }
+
                             if requested_scene != scene_kind {
                                 scene_kind = requested_scene;
                                 uniforms.scene_kind = scene_kind.index();
@@ -903,12 +1053,240 @@ pub async fn run() {
                             } else {
                                 [sun_dir.x, sun_dir.y, sun_dir.z, 1.0]
                             };
+
+                            let view = camera.view_matrix();
+                            let projection = glam::Mat4::perspective_rh(
+                                std::f32::consts::FRAC_PI_3 * 1.2,
+                                config.width as f32 / config.height as f32,
+                                0.1,
+                                1000.0,
+                            );
+                            let display_size = ui.io().display_size;
+                            let viewport = Rect::from_min_max(
+                                [0.0, 0.0].into(),
+                                [display_size[0].max(1.0), display_size[1].max(1.0)].into(),
+                            );
+                            let cursor = ui.io().mouse_pos;
+                            let interaction = GizmoInteraction {
+                                cursor_pos: (cursor[0], cursor[1]),
+                                hovered: !ui.io().want_capture_mouse,
+                                drag_started: ui.is_mouse_clicked(MouseButton::Left),
+                                dragging: ui.is_mouse_down(MouseButton::Left),
+                            };
+                            let gizmo_modes = match gizmo_mode {
+                                GizmoModeKind::Translate => GizmoMode::all_translate(),
+                                GizmoModeKind::Rotate => GizmoMode::all_rotate(),
+                            };
+                            let view_cols = view.to_cols_array();
+                            let proj_cols = projection.to_cols_array();
+                            let view_matrix = transform_gizmo::math::DMat4::from_cols_array(&[
+                                view_cols[0] as f64,
+                                view_cols[1] as f64,
+                                view_cols[2] as f64,
+                                view_cols[3] as f64,
+                                view_cols[4] as f64,
+                                view_cols[5] as f64,
+                                view_cols[6] as f64,
+                                view_cols[7] as f64,
+                                view_cols[8] as f64,
+                                view_cols[9] as f64,
+                                view_cols[10] as f64,
+                                view_cols[11] as f64,
+                                view_cols[12] as f64,
+                                view_cols[13] as f64,
+                                view_cols[14] as f64,
+                                view_cols[15] as f64,
+                            ]);
+                            let projection_matrix = transform_gizmo::math::DMat4::from_cols_array(
+                                &[
+                                    proj_cols[0] as f64,
+                                    proj_cols[1] as f64,
+                                    proj_cols[2] as f64,
+                                    proj_cols[3] as f64,
+                                    proj_cols[4] as f64,
+                                    proj_cols[5] as f64,
+                                    proj_cols[6] as f64,
+                                    proj_cols[7] as f64,
+                                    proj_cols[8] as f64,
+                                    proj_cols[9] as f64,
+                                    proj_cols[10] as f64,
+                                    proj_cols[11] as f64,
+                                    proj_cols[12] as f64,
+                                    proj_cols[13] as f64,
+                                    proj_cols[14] as f64,
+                                    proj_cols[15] as f64,
+                                ],
+                            );
+                            gizmo.update_config(GizmoConfig {
+                                view_matrix: view_matrix.into(),
+                                projection_matrix: projection_matrix.into(),
+                                viewport,
+                                modes: gizmo_modes,
+                                mode_override: None,
+                                orientation: GizmoOrientation::Global,
+                                pivot_point: TransformPivotPoint::MedianPoint,
+                                snapping: false,
+                                snap_angle: 15f32.to_radians(),
+                                snap_distance: 0.5,
+                                snap_scale: 0.1,
+                                visuals: GizmoVisuals::default(),
+                                pixels_per_point: ui.io().display_framebuffer_scale[0].max(1.0),
+                            });
+
+                            let target_transform = match gizmo_target {
+                                GizmoTargetKind::Sphere => GizmoTransform::from_scale_rotation_translation(
+                                    transform_gizmo::math::DVec3::ONE,
+                                    transform_gizmo::math::DQuat::from_xyzw(
+                                        sphere_rotation.x as f64,
+                                        sphere_rotation.y as f64,
+                                        sphere_rotation.z as f64,
+                                        sphere_rotation.w as f64,
+                                    ),
+                                    transform_gizmo::math::DVec3::new(
+                                        uniforms.sphere_pos[0] as f64,
+                                        uniforms.sphere_pos[1] as f64,
+                                        uniforms.sphere_pos[2] as f64,
+                                    ),
+                                ),
+                                GizmoTargetKind::WineGlass => {
+                                    GizmoTransform::from_scale_rotation_translation(
+                                        transform_gizmo::math::DVec3::ONE,
+                                        transform_gizmo::math::DQuat::from_xyzw(
+                                            wine_rotation.x as f64,
+                                            wine_rotation.y as f64,
+                                            wine_rotation.z as f64,
+                                            wine_rotation.w as f64,
+                                        ),
+                                        transform_gizmo::math::DVec3::new(
+                                            (wine_center.x + wine_translation.x) as f64,
+                                            (wine_center.y + wine_translation.y) as f64,
+                                            (wine_center.z + wine_translation.z) as f64,
+                                        ),
+                                    )
+                                }
+                                GizmoTargetKind::WineSpotlight => {
+                                    GizmoTransform::from_scale_rotation_translation(
+                                        transform_gizmo::math::DVec3::ONE,
+                                        transform_gizmo::math::DQuat::IDENTITY,
+                                        transform_gizmo::math::DVec3::new(
+                                            uniforms.light_pos[0] as f64,
+                                            uniforms.light_pos[1] as f64,
+                                            uniforms.light_pos[2] as f64,
+                                        ),
+                                    )
+                                }
+                            };
+
+                            if let Some((_result, transforms)) = gizmo.update(interaction, &[target_transform]) {
+                                let new_t = transforms[0];
+                                let translation = glam::Vec3::new(
+                                    new_t.translation.x as f32,
+                                    new_t.translation.y as f32,
+                                    new_t.translation.z as f32,
+                                );
+                                match gizmo_target {
+                                    GizmoTargetKind::Sphere => {
+                                        uniforms.sphere_pos[0] = translation.x;
+                                        uniforms.sphere_pos[1] = translation.y;
+                                        uniforms.sphere_pos[2] = translation.z;
+                                        sphere_rotation = glam::Quat::from_array([
+                                            new_t.rotation.v.x as f32,
+                                            new_t.rotation.v.y as f32,
+                                            new_t.rotation.v.z as f32,
+                                            new_t.rotation.s as f32,
+                                        ]);
+                                    }
+                                    GizmoTargetKind::WineGlass => {
+                                        let new_center = glam::Vec3::new(translation.x, translation.y, translation.z);
+                                        wine_translation = new_center - wine_center;
+                                        wine_rotation = glam::Quat::from_array([
+                                            new_t.rotation.v.x as f32,
+                                            new_t.rotation.v.y as f32,
+                                            new_t.rotation.v.z as f32,
+                                            new_t.rotation.s as f32,
+                                        ]);
+                                        geometry_dirty = true;
+                                    }
+                                    GizmoTargetKind::WineSpotlight => {
+                                        uniforms.light_pos[0] = translation.x;
+                                        uniforms.light_pos[1] = translation.y;
+                                        uniforms.light_pos[2] = translation.z;
+                                    }
+                                }
+                                accumulation_dirty = true;
+                            }
+
+                            {
+                                let draw_data = gizmo.draw();
+                                let fg = ui.get_foreground_draw_list();
+                                for idx in (0..draw_data.indices.len()).step_by(3) {
+                                    let i0 = draw_data.indices[idx] as usize;
+                                    let i1 = draw_data.indices[idx + 1] as usize;
+                                    let i2 = draw_data.indices[idx + 2] as usize;
+                                    let p0 = draw_data.vertices[i0];
+                                    let p1 = draw_data.vertices[i1];
+                                    let p2 = draw_data.vertices[i2];
+                                    let c = draw_data.colors[i0];
+                                    let color =
+                                        imgui::ImColor32::from_rgba_f32s(c[0], c[1], c[2], c[3]);
+                                    fg.add_triangle(
+                                        [p0[0], p0[1]],
+                                        [p1[0], p1[1]],
+                                        [p2[0], p2[1]],
+                                        color,
+                                    )
+                                    .filled(true)
+                                    .build();
+                                }
+                            }
                             uniforms.sun_intensity = sun_intensity.max(0.0);
                             uniforms.scene_kind = scene_kind.index();
 
                             let sun_changed = uniforms.light_pos != old_light
                                 || (uniforms.sun_intensity - old_intensity).abs() > f32::EPSILON;
                             if accumulation_dirty || sun_changed {
+                                if geometry_dirty {
+                                    update_wine_mesh_transform(
+                                        &mut mesh,
+                                        &mut model_verts,
+                                        wine_vertex_start,
+                                        wine_vertex_count,
+                                        &wine_base_positions,
+                                        &wine_base_normals,
+                                        wine_center,
+                                        wine_rotation,
+                                        wine_translation,
+                                    );
+                                    queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&model_verts));
+                                    queue.write_buffer(&pos_buf, 0, bytemuck::cast_slice(&mesh.positions4));
+                                    queue.write_buffer(&nrm_buf, 0, bytemuck::cast_slice(&mesh.normals4));
+
+                                    let model_build = wgpu::BlasBuildEntry {
+                                        blas: &model_blas,
+                                        geometry: wgpu::BlasGeometries::TriangleGeometries(vec![
+                                            wgpu::BlasTriangleGeometry {
+                                                size: &model_blas_desc,
+                                                vertex_buffer: &vbuf,
+                                                first_vertex: 0,
+                                                vertex_stride: std::mem::size_of::<Vertex>() as u64,
+                                                index_buffer: Some(&ibuf),
+                                                first_index: Some(0),
+                                                transform_buffer: None,
+                                                transform_buffer_offset: None,
+                                            },
+                                        ]),
+                                    };
+                                    let mut accel_encoder =
+                                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                            label: Some("accel_update"),
+                                        });
+                                    accel_encoder.build_acceleration_structures(
+                                        [model_build].iter(),
+                                        iter::once(&tlas),
+                                    );
+                                    queue.submit(Some(accel_encoder.finish()));
+                                    geometry_dirty = false;
+                                }
                                 uniforms.frame = 0;
                                 let zeros = vec![0u8; accum_byte_size as usize];
                                 queue.write_buffer(&accum_buf, 0, &zeros);
