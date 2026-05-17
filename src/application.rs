@@ -26,12 +26,14 @@ struct SceneUniforms {
     sphere_pos: [f32; 4],
     sphere_color: [f32; 4],
     mesh_center: [f32; 4],
+    decanter_center: [f32; 4],
     sun_intensity: f32,
     frame: u32,
     scene_kind: u32,
     render_width: u32,
     render_height: u32,
-    _pad: [u32; 7],
+    selected_object: u32,
+    _pad: [u32; 6],
 }
 
 struct Camera {
@@ -44,11 +46,13 @@ struct Camera {
 enum GizmoModeKind {
     Translate,
     Rotate,
+    Scale,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum GizmoTargetKind {
     Sphere,
+    Decanter,
     WineGlass,
     WineSpotlight,
 }
@@ -206,7 +210,7 @@ fn intersect_sphere(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, rad
     }
 }
 
-fn update_wine_mesh_transform(
+fn update_mesh_transform(
     mesh: &mut MeshData,
     model_verts: &mut [Vertex],
     start: usize,
@@ -214,12 +218,15 @@ fn update_wine_mesh_transform(
     base_positions: &[glam::Vec3],
     base_normals: &[glam::Vec3],
     pivot: glam::Vec3,
+    scale: glam::Vec3,
     rotation: glam::Quat,
     translation: glam::Vec3,
 ) {
     for i in 0..count {
         let idx = start + i;
-        let p = pivot + rotation * (base_positions[i] - pivot) + translation;
+        let local = base_positions[i] - pivot;
+        let scaled = glam::Vec3::new(local.x * scale.x, local.y * scale.y, local.z * scale.z);
+        let p = pivot + rotation * scaled + translation;
         let n = (rotation * base_normals[i]).normalize_or_zero();
         model_verts[idx].position = p.to_array();
         mesh.positions4[idx][0] = p.x;
@@ -278,6 +285,18 @@ pub async fn run() {
     let decanter_path = std::path::Path::new("res/wine_decanter_and_glass.glb");
     let wine_path = std::path::Path::new("res/red_wine_glass.glb");
     let mut mesh = load_gltf_mesh(decanter_path).expect("Failed to load decanter model");
+    let decanter_vertex_start = 0usize;
+    let decanter_vertex_count = mesh.positions4.len();
+    let decanter_base_positions: Vec<glam::Vec3> = mesh
+        .positions4
+        .iter()
+        .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
+        .collect();
+    let decanter_base_normals: Vec<glam::Vec3> = mesh
+        .normals4
+        .iter()
+        .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
+        .collect();
     let mut wine_mesh = load_gltf_mesh(wine_path).expect("Failed to load red wine model");
     let (decanter_center, decanter_size, _, decanter_max) = mesh_bounds(&mesh.vertices);
     let (wine_original_center, _, _, _) = mesh_bounds(&wine_mesh.vertices);
@@ -438,13 +457,15 @@ pub async fn run() {
         light_pos: [10.0, 8.0, 10.0, 1.0],
         sphere_pos: [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius],
         sphere_color: [0.98, 1.0, 1.0, 1.0],
-        mesh_center: [active_center.x, active_center.y, active_center.z, 0.0],
+        mesh_center: [wine_center.x, wine_center.y, wine_center.z, wine_max_extent * 0.8],
+        decanter_center: [decanter_center.x, decanter_center.y, decanter_center.z, decanter_max_extent * 0.7],
         sun_intensity: 0.8,
         frame: 0,
         scene_kind: scene_kind.index(),
         render_width,
         render_height,
-        _pad: [0; 7],
+        selected_object: 1,
+        _pad: [0; 6],
     };
 
     let mut sun_azimuth_deg = uniforms.light_pos[2]
@@ -701,8 +722,13 @@ pub async fn run() {
     let mut gizmo_mode = GizmoModeKind::Translate;
     let mut gizmo_target = GizmoTargetKind::Sphere;
     let mut sphere_rotation = glam::Quat::IDENTITY;
+    let mut sphere_radius_scale = 1.0f32;
+    let mut decanter_rotation = glam::Quat::IDENTITY;
+    let mut decanter_translation = glam::Vec3::ZERO;
+    let mut decanter_scale = glam::Vec3::ONE;
     let mut wine_rotation = glam::Quat::IDENTITY;
     let mut wine_translation = glam::Vec3::ZERO;
+    let mut wine_scale = glam::Vec3::ONE;
     let mut geometry_dirty = false;
 
     let _ = event_loop.run(move |event, active_loop| {
@@ -959,6 +985,10 @@ pub async fn run() {
                                         gizmo_target = GizmoTargetKind::Sphere;
                                     }
                                     ui.same_line();
+                                    if ui.radio_button_bool("Decanter", gizmo_target == GizmoTargetKind::Decanter) {
+                                        gizmo_target = GizmoTargetKind::Decanter;
+                                    }
+                                    ui.same_line();
                                     if ui.radio_button_bool("Wine Glass", gizmo_target == GizmoTargetKind::WineGlass) {
                                         gizmo_target = GizmoTargetKind::WineGlass;
                                     }
@@ -979,6 +1009,10 @@ pub async fn run() {
                                     {
                                         gizmo_mode = GizmoModeKind::Rotate;
                                     }
+                                    ui.same_line();
+                                    if ui.radio_button_bool("Scale", gizmo_mode == GizmoModeKind::Scale) {
+                                        gizmo_mode = GizmoModeKind::Scale;
+                                    }
                                 });
 
                             if ui.is_mouse_clicked(MouseButton::Left) && !ui.io().want_capture_mouse {
@@ -991,17 +1025,36 @@ pub async fn run() {
                                 );
                                 let sphere_center =
                                     glam::Vec3::new(uniforms.sphere_pos[0], uniforms.sphere_pos[1], uniforms.sphere_pos[2]);
+                                let decanter_center_now = decanter_center + decanter_translation;
                                 let wine_center_now = wine_center + wine_translation;
                                 let sphere_hit = intersect_sphere(ro, rd, sphere_center, uniforms.sphere_pos[3]);
+                                let decanter_hit = intersect_sphere(
+                                    ro,
+                                    rd,
+                                    decanter_center_now,
+                                    (decanter_max_extent * decanter_scale.max_element() * 0.55).max(0.25),
+                                );
                                 let wine_hit = intersect_sphere(ro, rd, wine_center_now, (wine_max_extent * 0.55).max(0.25));
-                                gizmo_target = match (sphere_hit, wine_hit) {
-                                    (Some(ts), Some(tw)) => {
-                                        if ts <= tw { GizmoTargetKind::Sphere } else { GizmoTargetKind::WineGlass }
+                                let mut best = gizmo_target;
+                                let mut best_t = f32::INFINITY;
+                                if let Some(t) = sphere_hit {
+                                    if t < best_t {
+                                        best_t = t;
+                                        best = GizmoTargetKind::Sphere;
                                     }
-                                    (Some(_), None) => GizmoTargetKind::Sphere,
-                                    (None, Some(_)) => GizmoTargetKind::WineGlass,
-                                    _ => gizmo_target,
-                                };
+                                }
+                                if let Some(t) = decanter_hit {
+                                    if t < best_t {
+                                        best_t = t;
+                                        best = GizmoTargetKind::Decanter;
+                                    }
+                                }
+                                if let Some(t) = wine_hit {
+                                    if t < best_t {
+                                        best = GizmoTargetKind::WineGlass;
+                                    }
+                                }
+                                gizmo_target = best;
                             }
 
                             if requested_scene != scene_kind {
@@ -1021,9 +1074,13 @@ pub async fn run() {
                                 let sphere_pos =
                                     sphere_position_for(active_center, next_size, sphere_radius);
                                 uniforms.sphere_pos =
-                                    [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius];
-                                uniforms.mesh_center =
-                                    [active_center.x, active_center.y, active_center.z, 0.0];
+                                    [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius * sphere_radius_scale];
+                                uniforms.mesh_center = [
+                                    wine_center.x + wine_translation.x,
+                                    wine_center.y + wine_translation.y,
+                                    wine_center.z + wine_translation.z,
+                                    wine_max_extent * wine_scale.max_element() * 0.8,
+                                ];
                                 let (camera_pos, camera_target) =
                                     scene_camera(scene_kind, active_center, next_size);
                                 camera = Camera::look_at(camera_pos, camera_target);
@@ -1076,6 +1133,7 @@ pub async fn run() {
                             let gizmo_modes = match gizmo_mode {
                                 GizmoModeKind::Translate => GizmoMode::all_translate(),
                                 GizmoModeKind::Rotate => GizmoMode::all_rotate(),
+                                GizmoModeKind::Scale => GizmoMode::all_scale(),
                             };
                             let view_cols = view.to_cols_array();
                             let proj_cols = projection.to_cols_array();
@@ -1135,7 +1193,11 @@ pub async fn run() {
 
                             let target_transform = match gizmo_target {
                                 GizmoTargetKind::Sphere => GizmoTransform::from_scale_rotation_translation(
-                                    transform_gizmo::math::DVec3::ONE,
+                                    transform_gizmo::math::DVec3::new(
+                                        sphere_radius_scale as f64,
+                                        sphere_radius_scale as f64,
+                                        sphere_radius_scale as f64,
+                                    ),
                                     transform_gizmo::math::DQuat::from_xyzw(
                                         sphere_rotation.x as f64,
                                         sphere_rotation.y as f64,
@@ -1148,9 +1210,33 @@ pub async fn run() {
                                         uniforms.sphere_pos[2] as f64,
                                     ),
                                 ),
+                                GizmoTargetKind::Decanter => {
+                                    GizmoTransform::from_scale_rotation_translation(
+                                        transform_gizmo::math::DVec3::new(
+                                            decanter_scale.x as f64,
+                                            decanter_scale.y as f64,
+                                            decanter_scale.z as f64,
+                                        ),
+                                        transform_gizmo::math::DQuat::from_xyzw(
+                                            decanter_rotation.x as f64,
+                                            decanter_rotation.y as f64,
+                                            decanter_rotation.z as f64,
+                                            decanter_rotation.w as f64,
+                                        ),
+                                        transform_gizmo::math::DVec3::new(
+                                            (decanter_center.x + decanter_translation.x) as f64,
+                                            (decanter_center.y + decanter_translation.y) as f64,
+                                            (decanter_center.z + decanter_translation.z) as f64,
+                                        ),
+                                    )
+                                }
                                 GizmoTargetKind::WineGlass => {
                                     GizmoTransform::from_scale_rotation_translation(
-                                        transform_gizmo::math::DVec3::ONE,
+                                        transform_gizmo::math::DVec3::new(
+                                            wine_scale.x as f64,
+                                            wine_scale.y as f64,
+                                            wine_scale.z as f64,
+                                        ),
                                         transform_gizmo::math::DQuat::from_xyzw(
                                             wine_rotation.x as f64,
                                             wine_rotation.y as f64,
@@ -1189,12 +1275,30 @@ pub async fn run() {
                                         uniforms.sphere_pos[0] = translation.x;
                                         uniforms.sphere_pos[1] = translation.y;
                                         uniforms.sphere_pos[2] = translation.z;
+                                        sphere_radius_scale = (new_t.scale.x as f32).clamp(0.15, 8.0);
+                                        uniforms.sphere_pos[3] = sphere_radius * sphere_radius_scale;
                                         sphere_rotation = glam::Quat::from_array([
                                             new_t.rotation.v.x as f32,
                                             new_t.rotation.v.y as f32,
                                             new_t.rotation.v.z as f32,
                                             new_t.rotation.s as f32,
                                         ]);
+                                    }
+                                    GizmoTargetKind::Decanter => {
+                                        let new_center = glam::Vec3::new(translation.x, translation.y, translation.z);
+                                        decanter_translation = new_center - decanter_center;
+                                        decanter_rotation = glam::Quat::from_array([
+                                            new_t.rotation.v.x as f32,
+                                            new_t.rotation.v.y as f32,
+                                            new_t.rotation.v.z as f32,
+                                            new_t.rotation.s as f32,
+                                        ]);
+                                        decanter_scale = glam::Vec3::new(
+                                            (new_t.scale.x as f32).clamp(0.1, 8.0),
+                                            (new_t.scale.y as f32).clamp(0.1, 8.0),
+                                            (new_t.scale.z as f32).clamp(0.1, 8.0),
+                                        );
+                                        geometry_dirty = true;
                                     }
                                     GizmoTargetKind::WineGlass => {
                                         let new_center = glam::Vec3::new(translation.x, translation.y, translation.z);
@@ -1205,6 +1309,11 @@ pub async fn run() {
                                             new_t.rotation.v.z as f32,
                                             new_t.rotation.s as f32,
                                         ]);
+                                        wine_scale = glam::Vec3::new(
+                                            (new_t.scale.x as f32).clamp(0.1, 8.0),
+                                            (new_t.scale.y as f32).clamp(0.1, 8.0),
+                                            (new_t.scale.z as f32).clamp(0.1, 8.0),
+                                        );
                                         geometry_dirty = true;
                                     }
                                     GizmoTargetKind::WineSpotlight => {
@@ -1241,12 +1350,42 @@ pub async fn run() {
                             }
                             uniforms.sun_intensity = sun_intensity.max(0.0);
                             uniforms.scene_kind = scene_kind.index();
+                            uniforms.mesh_center = [
+                                wine_center.x + wine_translation.x,
+                                wine_center.y + wine_translation.y,
+                                wine_center.z + wine_translation.z,
+                                wine_max_extent * wine_scale.max_element() * 0.8,
+                            ];
+                            uniforms.decanter_center = [
+                                decanter_center.x + decanter_translation.x,
+                                decanter_center.y + decanter_translation.y,
+                                decanter_center.z + decanter_translation.z,
+                                decanter_max_extent * decanter_scale.max_element() * 0.7,
+                            ];
+                            uniforms.selected_object = match gizmo_target {
+                                GizmoTargetKind::Sphere => 1,
+                                GizmoTargetKind::Decanter => 3,
+                                GizmoTargetKind::WineGlass => 2,
+                                GizmoTargetKind::WineSpotlight => 0,
+                            };
 
                             let sun_changed = uniforms.light_pos != old_light
                                 || (uniforms.sun_intensity - old_intensity).abs() > f32::EPSILON;
                             if accumulation_dirty || sun_changed {
                                 if geometry_dirty {
-                                    update_wine_mesh_transform(
+                                    update_mesh_transform(
+                                        &mut mesh,
+                                        &mut model_verts,
+                                        decanter_vertex_start,
+                                        decanter_vertex_count,
+                                        &decanter_base_positions,
+                                        &decanter_base_normals,
+                                        decanter_center,
+                                        decanter_scale,
+                                        decanter_rotation,
+                                        decanter_translation,
+                                    );
+                                    update_mesh_transform(
                                         &mut mesh,
                                         &mut model_verts,
                                         wine_vertex_start,
@@ -1254,6 +1393,7 @@ pub async fn run() {
                                         &wine_base_positions,
                                         &wine_base_normals,
                                         wine_center,
+                                        wine_scale,
                                         wine_rotation,
                                         wine_translation,
                                     );

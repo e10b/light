@@ -7,11 +7,13 @@ struct Uniforms {
   sphere_pos: vec4<f32>,
   sphere_color: vec4<f32>,
   mesh_center: vec4<f32>,
+  decanter_center: vec4<f32>,
   sun_intensity: f32,
   frame: u32,
   scene_kind: u32,
   render_width: u32,
   render_height: u32,
+  selected_object: u32,
   pad: vec3<u32>,
 };
 
@@ -469,6 +471,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     var roughness = 0.2;
     var transmission = 0.0;
     var ior = 1.5;
+    var selected_hit = false;
 
     if (hit_type == 1u) {
       // Sphere: allow glass behavior via sphere_color.w toggle
@@ -478,6 +481,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       roughness = 0.0025;
       transmission = clamp(uniforms.sphere_color.w, 0.0, 1.0);
       ior = 1.52;
+      selected_hit = uniforms.selected_object == 1u;
     } else if (hit_type == 2u) {
       // True triangle normal/material from ray-query primitive + barycentrics.
       let prim = tri_hit.primitive_index;
@@ -510,6 +514,10 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
         roughness = min(roughness, 0.003);
         albedo = mix(albedo, vec3<f32>(1.0), 0.85);
       }
+      let within_wine = distance(hit_pos, uniforms.mesh_center.xyz) <= uniforms.mesh_center.w;
+      let within_decanter = distance(hit_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
+      selected_hit = (uniforms.selected_object == 2u && within_wine)
+        || (uniforms.selected_object == 3u && within_decanter);
     } else {
       // Ground
       normal = vec3<f32>(0.0, 1.0, 0.0);
@@ -526,6 +534,12 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       roughness = 0.9;
       transmission = 0.0;
       ior = 1.0;
+    }
+
+    if (bounce == 1u && selected_hit) {
+      let outline = pow(1.0 - abs(dot(normalize(normal), normalize(-rd))), 5.0);
+      let orange = vec3<f32>(1.0, 0.42, 0.08);
+      L = L + throughput * orange * (0.08 + outline * 1.2);
     }
 
     // Decanter uses directional sun; Wine uses a local spotlight aimed at the glass.
