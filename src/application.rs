@@ -1126,6 +1126,7 @@ pub async fn run() {
     let mut accumulation_dirty = true;
     let mut render_mode = RenderModeKind::Pathtraced;
     let mut gizmo = Gizmo::default();
+    let mut show_editor_ui = true;
     let mut gizmo_mode = GizmoModeKind::Translate;
     let mut gizmo_target = default_target_for_scene(scene_kind);
     let mut has_selection = true;
@@ -1185,7 +1186,13 @@ pub async fn run() {
                 ..
             } => match event.state {
                 ElementState::Pressed => {
-                    if let winit::keyboard::Key::Character(c) = &event.logical_key {
+                    if event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F1)
+                    {
+                        if !event.repeat {
+                            show_editor_ui = !show_editor_ui;
+                        }
+                    } else if let winit::keyboard::Key::Character(c) = &event.logical_key {
                         keys_pressed.insert(c.to_lowercase().to_string());
                     } else if event.physical_key
                         == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
@@ -1387,6 +1394,7 @@ pub async fn run() {
                                 let has_wine = wine_scene_id.0 != 0 && main_db.scenes.contains_key(&wine_scene_id);
                                 let has_cornell = cornell_scene_id.0 != 0 && main_db.scenes.contains_key(&cornell_scene_id);
 
+                                if show_editor_ui {
                                 egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.strong("Prism");
@@ -1749,6 +1757,7 @@ pub async fn run() {
                                             });
                                         });
                                     });
+                                }
 
                             let requested_scene_exists = match requested_scene {
                                 SceneKind::Decanter => decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id),
@@ -1855,6 +1864,7 @@ pub async fn run() {
                                 0.1,
                                 1000.0,
                             );
+                            if show_editor_ui {
                             let pixels_per_point = ctx.pixels_per_point().max(1.0);
                             let screen_rect = ctx.input(|i| i.screen_rect());
                             let display_size = [screen_rect.width().max(1.0), screen_rect.height().max(1.0)];
@@ -2410,6 +2420,7 @@ pub async fn run() {
                                         painter.circle_filled(Pos2::new(s[0], s[1]), 3.0, line_color);
                                     }
                                 }
+                            }
                             }
                             uniforms.sun_intensity = sun_intensity.max(0.0);
                             uniforms.scene_kind = if current_scene_exists {
