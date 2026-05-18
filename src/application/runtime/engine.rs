@@ -17,31 +17,37 @@ use crate::{
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     mesh::{load_gltf_mesh, Vertex},
     photon_mapper::PhotonMapper,
-    prism_file::{
-        load_prism_database, save_prism_file, MaterialData as PrismMaterialData,
-    },
+    prism_file::MaterialData as PrismMaterialData,
     quad_pass, raster_pass,
     scene::SceneKind,
     tooling::lua::scripts_dir,
-    tooling::materials::{
-        make_empty_material, make_glass_material, make_white_material, preview_from_material_data,
-    },
-    tooling::persistence::build_prism_database_from_main,
+    tooling::materials::{make_empty_material, make_glass_material, make_white_material, preview_from_material_data},
     window::create_window,
 };
 
+use super::input::{handle_keyboard_input, handle_pointer_window_event};
 use super::{
+    camera_motion::apply_fly_camera_motion,
+    camera_state::write_runtime_back_to_database,
+    fps::update_fps_title,
+    mouse_look::handle_mouse_motion,
+    resize::handle_surface_resize,
+    stress::maybe_build_stress_scene,
+    sun::update_sun_lights,
+    world_tick::tick_world_and_scripts,
+};
+use super::super::{
     add_menu::{draw_add_menu, AddMenuContext},
     editor_surface::draw_editor_surface,
-    ecs_sync::{
-        register_object_entity, sync_ecs_to_runtime, sync_ecs_visibility_to_main,
-        sync_runtime_to_ecs,
-    },
+    ecs_sync::register_object_entity,
+    frame_render::render_frame_and_present,
     geometry::{
         append_object_mesh, build_photon_targets, make_cube_mesh, make_prism_mesh, mesh_bounds,
         orient_and_scale_mesh, place_instance_center, sphere_position_for, translate_mesh,
         update_mesh_transform, visible_render_geometry,
     },
+    gpu_scene::sync_accumulation_and_geometry,
+    project_io::{draw_project_io_buttons, ProjectIoContext},
     types::{
         default_target_for_scene, target_allowed_in_scene, Camera, GizmoTargetKind,
         LightObjectInstance, MeshAsset, MeshObjectInstance, SceneUniforms, MAX_SUN_LIGHTS,
@@ -632,7 +638,7 @@ pub async fn run() {
         compute_pass.output_view(),
         compute_pass.selection_mask_view(),
     );
-    let raster_pass = raster_pass::RasterPass::new(&device, surface_format);
+    let mut raster_pass = raster_pass::RasterPass::new(&device, surface_format);
     let mut raster_instance_count: u32 = 0;
     let mut raster_instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("raster_instance_buf"),
@@ -777,26 +783,13 @@ pub async fn run() {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
         if let Event::WindowEvent { event, .. } = &event {
             let _ = egui_state.on_window_event(window.as_ref(), event);
-            match event {
-                WindowEvent::CursorMoved { position, .. } => {
-                    mouse_pos = [position.x as f32, position.y as f32];
-                    if mouse_left_down {
-                        mouse_left_dragging = true;
-                    }
-                }
-                WindowEvent::MouseInput {
-                    state,
-                    button: winit::event::MouseButton::Left,
-                    ..
-                } => {
-                    mouse_left_down = *state == ElementState::Pressed;
-                    if *state == ElementState::Pressed {
-                        mouse_left_clicked = true;
-                        mouse_left_dragging = false;
-                    }
-                }
-                _ => {}
-            }
+            handle_pointer_window_event(
+                event,
+                &mut mouse_pos,
+                &mut mouse_left_down,
+                &mut mouse_left_clicked,
+                &mut mouse_left_dragging,
+            );
         }
         match event {
             Event::WindowEvent {
@@ -806,140 +799,42 @@ pub async fn run() {
             Event::WindowEvent {
                 event: WindowEvent::KeyboardInput { event, .. },
                 ..
-            } => match event.state {
-                ElementState::Pressed => {
-                    if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F1)
-                    {
-                        if !event.repeat {
-                            show_editor_ui = !show_editor_ui;
-                        }
-                    } else if let winit::keyboard::Key::Character(c) = &event.logical_key {
-                        keys_pressed.insert(c.to_lowercase().to_string());
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
-                    {
-                        keys_pressed.insert("Space".to_string());
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft)
-                        || event.physical_key
-                            == winit::keyboard::PhysicalKey::Code(
-                                winit::keyboard::KeyCode::ShiftRight,
-                            )
-                    {
-                        keys_pressed.insert("Shift".to_string());
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft)
-                        || event.physical_key
-                            == winit::keyboard::PhysicalKey::Code(
-                                winit::keyboard::KeyCode::ControlRight,
-                            )
-                    {
-                        keys_pressed.insert("Control".to_string());
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowUp)
-                    {
-                        keys_pressed.insert("ArrowUp".to_string());
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowDown)
-                    {
-                        keys_pressed.insert("ArrowDown".to_string());
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowLeft)
-                    {
-                        keys_pressed.insert("ArrowLeft".to_string());
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowRight)
-                    {
-                        keys_pressed.insert("ArrowRight".to_string());
-                    }
-                }
-                ElementState::Released => {
-                    if let winit::keyboard::Key::Character(c) = &event.logical_key {
-                        keys_pressed.remove(&c.to_lowercase().to_string());
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space)
-                    {
-                        keys_pressed.remove("Space");
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft)
-                        || event.physical_key
-                            == winit::keyboard::PhysicalKey::Code(
-                                winit::keyboard::KeyCode::ShiftRight,
-                            )
-                    {
-                        keys_pressed.remove("Shift");
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft)
-                        || event.physical_key
-                            == winit::keyboard::PhysicalKey::Code(
-                                winit::keyboard::KeyCode::ControlRight,
-                            )
-                    {
-                        keys_pressed.remove("Control");
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowUp)
-                    {
-                        keys_pressed.remove("ArrowUp");
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowDown)
-                    {
-                        keys_pressed.remove("ArrowDown");
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowLeft)
-                    {
-                        keys_pressed.remove("ArrowLeft");
-                    } else if event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ArrowRight)
-                    {
-                        keys_pressed.remove("ArrowRight");
-                    }
-                }
-            },
+            } => handle_keyboard_input(&event, &mut show_editor_ui, &mut keys_pressed),
             Event::WindowEvent {
                 event: WindowEvent::Resized(size),
                 ..
             } => {
-                config.width = size.width;
-                config.height = size.height;
-                let projection = camera_projection_matrix(
+                handle_surface_resize(
+                    size,
+                    &mut config,
                     camera_projection_mode,
                     camera_fov_radians,
                     camera_ortho_height,
                     camera_near,
                     camera_far,
-                    config.width,
-                    config.height,
+                    &mut uniforms,
+                    &queue,
+                    &ubuf,
+                    &surface,
+                    &device,
                 );
-                uniforms.proj_inv = projection.inverse().to_cols_array_2d();
-                uniforms.frame = 0;
-                queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
-                surface.configure(&device, &config);
             }
             Event::DeviceEvent {
                 event: winit::event::DeviceEvent::MouseMotion { delta },
                 ..
             } => {
-                if egui_ctx.is_pointer_over_area() || !keys_pressed.contains("v") {
-                    return;
-                }
-                let (dx, dy) = delta;
-                camera.yaw -= dx as f32 * mouse_speed;
-                camera.pitch -= dy as f32 * mouse_speed;
-                camera.pitch = camera.pitch.clamp(-1.45, 1.45);
-                accumulation_dirty = true;
+                handle_mouse_motion(
+                    delta,
+                    &egui_ctx,
+                    &keys_pressed,
+                    mouse_speed,
+                    &mut camera,
+                    &mut accumulation_dirty,
+                );
             }
             Event::NewEvents(start_cause) => match start_cause {
                 winit::event::StartCause::Init | winit::event::StartCause::Poll => {
-                    frame_count += 1;
-                    let now = std::time::Instant::now();
-                    let elapsed = now.duration_since(fps_display_time).as_secs_f32();
-                    if elapsed >= 1.0 {
-                        let fps = frame_count as f32 / elapsed;
-                        window.set_title(&format!("wgpu v0.29 ray tracing - {:.1} FPS", fps));
-                        frame_count = 0;
-                        fps_display_time = now;
-                    }
+                    update_fps_title(window.as_ref(), &mut frame_count, &mut fps_display_time);
 
                     let now = std::time::Instant::now();
                     let dt = now.duration_since(last_update).as_secs_f32();
@@ -947,69 +842,23 @@ pub async fn run() {
                     let prev_cam_pos = camera.pos;
                     let prev_cam_yaw = camera.yaw;
                     let prev_cam_pitch = camera.pitch;
-                    let sprint = if keys_pressed.contains("Shift") {
-                        12.0
-                    } else {
-                        1.0
-                    };
-                    let wants_keyboard = egui_ctx.wants_keyboard_input();
+                    apply_fly_camera_motion(
+                        &mut camera,
+                        dt,
+                        &keys_pressed,
+                        move_speed,
+                        look_speed,
+                        &egui_ctx,
+                    );
 
-                    if !wants_keyboard && keys_pressed.contains("w") {
-                        camera.pos += camera.forward() * move_speed * sprint * dt;
-                    }
-                    if !wants_keyboard && keys_pressed.contains("s") {
-                        camera.pos -= camera.forward() * move_speed * sprint * dt;
-                    }
-                    if !wants_keyboard && keys_pressed.contains("a") {
-                        camera.pos -= camera.right() * move_speed * sprint * dt;
-                    }
-                    if !wants_keyboard && keys_pressed.contains("d") {
-                        camera.pos += camera.right() * move_speed * sprint * dt;
-                    }
-                    if !wants_keyboard && keys_pressed.contains("Space") {
-                        camera.pos.y += move_speed * sprint * dt;
-                    }
-                    if !wants_keyboard && keys_pressed.contains("Control") {
-                        camera.pos.y -= move_speed * sprint * dt;
-                    }
-                    if !wants_keyboard && keys_pressed.contains("ArrowUp") {
-                        camera.pitch += look_speed * dt;
-                        camera.pitch = camera.pitch.min(1.45);
-                    }
-                    if !wants_keyboard && keys_pressed.contains("ArrowDown") {
-                        camera.pitch -= look_speed * dt;
-                        camera.pitch = camera.pitch.max(-1.45);
-                    }
-                    if !wants_keyboard && keys_pressed.contains("ArrowLeft") {
-                        camera.yaw += look_speed * dt;
-                    }
-                    if !wants_keyboard && keys_pressed.contains("ArrowRight") {
-                        camera.yaw -= look_speed * dt;
-                    }
-
-                    {
-                        let mut world = ecs_world.borrow_mut();
-                        sync_runtime_to_ecs(
-                            &mut world,
-                            &main_db,
-                            &mesh_instances,
-                            &light_instances,
-                            &camera,
-                        );
-                        world.integrate_physics(dt);
-                        world.update_global_transforms_and_visibility();
-                    }
-                    script_engine.update(dt);
-                    ecs_world
-                        .borrow_mut()
-                        .update_global_transforms_and_visibility();
-                    sync_ecs_visibility_to_main(&ecs_world.borrow(), &mut main_db);
-                    if sync_ecs_to_runtime(
-                        &ecs_world.borrow(),
+                    if tick_world_and_scripts(
+                        dt,
+                        &ecs_world,
                         &mut main_db,
                         &mut mesh_instances,
                         &mut light_instances,
                         &mut camera,
+                        &mut script_engine,
                     ) {
                         geometry_dirty = true;
                         accumulation_dirty = true;
@@ -1099,147 +948,47 @@ pub async fn run() {
                                                 suppress_scene_click: &mut suppress_scene_click,
                                             },
                                         );
-                                        if ui.button("Open").clicked() {
-                                            match load_prism_database(std::path::Path::new("res/scenes.prism"), false) {
-                                                Ok(loaded) => {
-                                                    main_db.collections.clear();
-                                                    main_db.scenes.clear();
-                                                    main_db.view_layers.clear();
-                                                    decanter_master = Id(0);
-                                                    wine_master = Id(0);
-                                                    cornell_master = Id(0);
-                                                    decanter_scene_id = Id(0);
-                                                    wine_scene_id = Id(0);
-                                                    cornell_scene_id = Id(0);
-                                                    object_material_names.clear();
-                                                    material_library.clear();
-                                                    material_library.insert("White".to_string(), make_white_material());
-                                                    material_library.insert("Glass".to_string(), make_glass_material());
-                                                    object_material_names.insert(sphere_obj_id, "Glass".to_string());
-                                                    object_material_names.insert(decanter_obj_id, "Glass".to_string());
-                                                    object_material_names.insert(wine_obj_id, "Glass".to_string());
-                                                    object_material_names.insert(cornell_obj_id, "Empty".to_string());
-                                                    for (_mh, mat) in loaded.materials.iter() {
-                                                        material_library.insert(mat.name.clone(), mat.clone());
-                                                    }
-                                                    for (_sh, scene) in loaded.scenes.iter() {
-                                                        let scene_name = scene.name.to_ascii_lowercase();
-                                                        let local_master = main_db.create_collection(format!("{}Master", scene.name));
-                                                        let local_scene = main_db.create_scene(&scene.name, local_master);
-                                                        if scene_name.contains("decanter") || scene_name == "scene" {
-                                                            decanter_master = local_master;
-                                                            decanter_scene_id = local_scene;
-                                                        } else if scene_name.contains("wine") {
-                                                            wine_master = local_master;
-                                                            wine_scene_id = local_scene;
-                                                        } else if scene_name.contains("cornell") {
-                                                            cornell_master = local_master;
-                                                            cornell_scene_id = local_scene;
-                                                        }
-                                                        if let Some(master_col) = loaded.collections.get(scene.master_collection) {
-                                                            for obj_handle in &master_col.objects {
-                                                                if let Some(obj) = loaded.objects.get(*obj_handle) {
-                                                                    let name = obj.name.to_ascii_lowercase();
-                                                                    let oid = if name.contains("decanter") {
-                                                                        Some(decanter_obj_id)
-                                                                    } else if name.contains("wine") {
-                                                                        Some(wine_obj_id)
-                                                                    } else if name.contains("spot") {
-                                                                        Some(spot_obj_id)
-                                                                    } else if name.contains("sun") {
-                                                                        Some(sun_obj_id)
-                                                                    } else if name.contains("cornell") {
-                                                                        Some(cornell_obj_id)
-                                                                    } else if name.contains("sphere") || name.contains("cube") {
-                                                                        Some(sphere_obj_id)
-                                                                    } else {
-                                                                        None
-                                                                    };
-                                                                    if let Some(local_obj_id) = oid {
-                                                                        main_db.collection_link_object(local_master, local_obj_id);
-                                                                        main_db.ensure_scene_base(local_scene, local_obj_id, true, true);
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    for (_oh, obj) in loaded.objects.iter() {
-                                                        let m = glam::Mat4::from_cols_array(&obj.transform_matrix);
-                                                        let (s, r, t) = m.to_scale_rotation_translation();
-                                                        let lname = obj.name.to_ascii_lowercase();
-                                                        if lname.contains("sphere") || lname.contains("cube") {
-                                                            uniforms.sphere_pos[0] = t.x;
-                                                            uniforms.sphere_pos[1] = t.y;
-                                                            uniforms.sphere_pos[2] = t.z;
-                                                            sphere_rotation = r;
-                                                            uniforms.sphere_rot = [sphere_rotation.x, sphere_rotation.y, sphere_rotation.z, sphere_rotation.w];
-                                                            sphere_scale = s.max(glam::Vec3::splat(0.01));
-                                                            uniforms.sphere_extent = [
-                                                                sphere_radius * sphere_scale.x,
-                                                                sphere_radius * sphere_scale.y,
-                                                                sphere_radius * sphere_scale.z,
-                                                                0.0,
-                                                            ];
-                                                        } else if lname.contains("decanter") {
-                                                            decanter_translation = t - decanter_center;
-                                                            decanter_rotation = r;
-                                                            decanter_scale = s;
-                                                            geometry_dirty = true;
-                                                        } else if lname.contains("wine") {
-                                                            wine_translation = t - wine_center;
-                                                            wine_rotation = r;
-                                                            wine_scale = s;
-                                                            geometry_dirty = true;
-                                                        } else if lname.contains("sun") {
-                                                            sun_empty_position = t;
-                                                            sun_empty_rotation = r;
-                                                            sun_empty_scale = s;
-                                                        } else if lname.contains("spot") {
-                                                            spot_empty_position = t;
-                                                            spot_empty_rotation = r;
-                                                            spot_empty_scale = s;
-                                                        }
-                                                        if let Some(mh) = obj.material_link {
-                                                            if let Some(mat) = loaded.materials.get(mh) {
-                                                                material_library.insert(mat.name.clone(), mat.clone());
-                                                                let target_id = if lname.contains("decanter") {
-                                                                    Some(decanter_obj_id)
-                                                                } else if lname.contains("wine") {
-                                                                    Some(wine_obj_id)
-                                                                } else if lname.contains("sphere") || lname.contains("cube") {
-                                                                    Some(sphere_obj_id)
-                                                                } else if lname.contains("cornell") {
-                                                                    Some(cornell_obj_id)
-                                                                } else {
-                                                                    None
-                                                                };
-                                                                if let Some(tid) = target_id {
-                                                                    object_material_names
-                                                                        .insert(tid, mat.name.clone());
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    accumulation_dirty = true;
-                                                    project_status = "Opened: res/scenes.prism".to_string();
-                                                }
-                                                Err(e) => project_status = format!("Open failed (res/scenes.prism): {e}"),
-                                            }
-                                        }
-                                        if ui.button("Save").clicked() {
-                                            let prism_db = build_prism_database_from_main(
-                                                &main_db,
-                                                decanter_scene_id,
-                                                wine_scene_id,
-                                                cornell_scene_id,
-                                                &object_material_names,
-                                                &material_library,
-                                            );
-                                            match save_prism_file(std::path::Path::new("res/scenes.prism"), &prism_db, false) {
-                                                Ok(_) => project_status = "Saved: res/scenes.prism".to_string(),
-                                                Err(e) => project_status = format!("Save failed: {e}"),
-                                            }
-                                        }
+                                        draw_project_io_buttons(
+                                            ui,
+                                            ProjectIoContext {
+                                                main_db: &mut main_db,
+                                                decanter_master: &mut decanter_master,
+                                                wine_master: &mut wine_master,
+                                                cornell_master: &mut cornell_master,
+                                                decanter_scene_id: &mut decanter_scene_id,
+                                                wine_scene_id: &mut wine_scene_id,
+                                                cornell_scene_id: &mut cornell_scene_id,
+                                                object_material_names: &mut object_material_names,
+                                                material_library: &mut material_library,
+                                                sphere_obj_id,
+                                                decanter_obj_id,
+                                                wine_obj_id,
+                                                cornell_obj_id,
+                                                sun_obj_id,
+                                                spot_obj_id,
+                                                uniforms: &mut uniforms,
+                                                sphere_rotation: &mut sphere_rotation,
+                                                sphere_scale: &mut sphere_scale,
+                                                sphere_radius,
+                                                decanter_center,
+                                                decanter_translation: &mut decanter_translation,
+                                                decanter_rotation: &mut decanter_rotation,
+                                                decanter_scale: &mut decanter_scale,
+                                                wine_center,
+                                                wine_translation: &mut wine_translation,
+                                                wine_rotation: &mut wine_rotation,
+                                                wine_scale: &mut wine_scale,
+                                                sun_empty_position: &mut sun_empty_position,
+                                                sun_empty_rotation: &mut sun_empty_rotation,
+                                                sun_empty_scale: &mut sun_empty_scale,
+                                                spot_empty_position: &mut spot_empty_position,
+                                                spot_empty_rotation: &mut spot_empty_rotation,
+                                                spot_empty_scale: &mut spot_empty_scale,
+                                                geometry_dirty: &mut geometry_dirty,
+                                                accumulation_dirty: &mut accumulation_dirty,
+                                                project_status: &mut project_status,
+                                            },
+                                        );
                                     });
                                 });
 
@@ -1285,56 +1034,18 @@ pub async fn run() {
                                 );
                                 }
 
-                            if stress_test_requested {
-                                stress_test_requested = false;
-                                let cube_mesh = make_cube_mesh(glam::Vec3::ZERO, 1.5);
-                                mesh = cube_mesh;
-                                model_idx = mesh.indices.clone();
-                                mesh_instances.clear();
-                                let side = 1000usize;
-                                let total = side * side;
-                                let spacing = 3.2f32;
-                                let half = side as f32 * 0.5;
-                                for i in 0..total {
-                                    let x = (i % side) as f32;
-                                    let z = (i / side) as f32;
-                                    let center = glam::Vec3::new((x - half) * spacing, 0.0, (z - half) * spacing);
-                                    mesh_instances.push(MeshObjectInstance {
-                                        object_id: Id(10_000_000 + i as u64),
-                                        mesh_asset_id: 0,
-                                        vertex_start: 0,
-                                        vertex_count: mesh.positions4.len(),
-                                        index_start: 0,
-                                        index_count: mesh.indices.len(),
-                                        material_start: 0,
-                                        material_count: mesh.materials.len(),
-                                        base_positions: mesh
-                                            .positions4
-                                            .iter()
-                                            .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
-                                            .collect(),
-                                        base_normals: mesh
-                                            .normals4
-                                            .iter()
-                                            .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
-                                            .collect(),
-                                        pivot: glam::Vec3::ZERO,
-                                        max_extent: 3.0,
-                                        rotation: glam::Quat::IDENTITY,
-                                        translation: center,
-                                        scale: glam::Vec3::ONE,
-                                    });
-                                }
-                                stress_instance_count = mesh_instances.len();
-                                gpu_mesh_dirty = true;
-                                geometry_dirty = true;
-                                accumulation_dirty = true;
-                                project_status = format!(
-                                    "Stress scene armed: {} cubes (TLAS instances), {} mesh assets",
-                                    stress_instance_count,
-                                    mesh_assets.len()
-                                );
-                            }
+                            maybe_build_stress_scene(
+                                &mut stress_test_requested,
+                                &mut mesh,
+                                &mut model_idx,
+                                &mut mesh_instances,
+                                &mut stress_instance_count,
+                                &mut gpu_mesh_dirty,
+                                &mut geometry_dirty,
+                                &mut accumulation_dirty,
+                                &mut project_status,
+                                mesh_assets.len(),
+                            );
 
                             let sun_lamp_pos = sun_empty_position;
                             let primary_sun_intensity = light_instances
@@ -1345,34 +1056,18 @@ pub async fn run() {
                                 .max(0.0);
                             let old_light = uniforms.light_pos;
                             let old_intensity = uniforms.sun_intensity;
-                            uniforms.light_pos = {
-                                let d = (sun_lamp_pos - active_center).normalize_or_zero();
-                                sun_azimuth_deg = d.z.atan2(d.x).to_degrees();
-                                let len_xz = (d.x * d.x + d.z * d.z).sqrt().max(1e-5);
-                                sun_elevation_deg = d.y.atan2(len_xz).to_degrees();
-                                [d.x, d.y, d.z, primary_sun_intensity]
-                            };
-                            uniforms.sun_lights = [[0.0, 0.0, 0.0, 0.0]; MAX_SUN_LIGHTS];
-                            uniforms.sun_light_count = 0;
-                            if current_scene_exists {
-                                let scene_id = decanter_scene_id;
-                                let visible = main_db.scene_visible_selectable_objects(scene_id);
-                                for light in light_instances
-                                    .iter()
-                                    .filter(|light| visible.contains(&light.object_id))
-                                    .take(MAX_SUN_LIGHTS)
-                                {
-                                    let d = (light.position - active_center).normalize_or_zero();
-                                    let idx = uniforms.sun_light_count as usize;
-                                    uniforms.sun_lights[idx] = [d.x, d.y, d.z, light.intensity.max(0.0)];
-                                    uniforms.sun_light_count += 1;
-                                }
-                                if uniforms.sun_light_count == 0 {
-                                    let d = (sun_lamp_pos - active_center).normalize_or_zero();
-                                    uniforms.sun_lights[0] = [d.x, d.y, d.z, primary_sun_intensity];
-                                    uniforms.sun_light_count = 1;
-                                }
-                            }
+                            update_sun_lights(
+                                &mut uniforms,
+                                &main_db,
+                                decanter_scene_id,
+                                current_scene_exists,
+                                active_center,
+                                sun_lamp_pos,
+                                primary_sun_intensity,
+                                &light_instances,
+                                &mut sun_azimuth_deg,
+                                &mut sun_elevation_deg,
+                            );
 
                             let view = camera.view_matrix();
                             let projection = camera_projection_matrix(
@@ -2273,56 +1968,39 @@ pub async fn run() {
                                 }
                             }
 
-                            if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
-                                obj.transform.location = glam::Vec3::new(
-                                    uniforms.sphere_pos[0],
-                                    uniforms.sphere_pos[1],
-                                    uniforms.sphere_pos[2],
-                                );
-                                obj.transform.rotation = sphere_rotation;
-                                obj.transform.scale = sphere_scale;
-                            }
-                            if let Some(obj) = main_db.objects.get_mut(&decanter_obj_id) {
-                                obj.transform.location = decanter_center + decanter_translation;
-                                obj.transform.rotation = decanter_rotation;
-                                obj.transform.scale = decanter_scale;
-                            }
-                            if let Some(obj) = main_db.objects.get_mut(&wine_obj_id) {
-                                obj.transform.location = wine_center + wine_translation;
-                                obj.transform.rotation = wine_rotation;
-                                obj.transform.scale = wine_scale;
-                            }
-                            if stress_instance_count == 0 {
-                                for inst in &mesh_instances {
-                                    if let Some(obj) = main_db.objects.get_mut(&inst.object_id) {
-                                        obj.transform.location = inst.center();
-                                        obj.transform.rotation = inst.rotation;
-                                        obj.transform.scale = inst.scale;
-                                    }
-                                }
-                            }
-                            if let Some(obj) = main_db.objects.get_mut(&sun_obj_id) {
-                                obj.transform.location = sun_empty_position;
-                                obj.transform.rotation = sun_empty_rotation;
-                                obj.transform.scale = sun_empty_scale;
-                            }
-                            for light in &light_instances {
-                                if let Some(obj) = main_db.objects.get_mut(&light.object_id) {
-                                    obj.transform.location = light.position;
-                                    obj.transform.rotation = light.rotation;
-                                    obj.transform.scale = light.scale;
-                                }
-                            }
-                            if let Some(obj) = main_db.objects.get_mut(&spot_obj_id) {
-                                obj.transform.location = spot_empty_position;
-                                obj.transform.rotation = spot_empty_rotation;
-                                obj.transform.scale = spot_empty_scale;
-                            }
-                            if let Some(obj) = main_db.objects.get_mut(&cornell_obj_id) {
-                                obj.transform.location = active_center + cornell_translation;
-                                obj.transform.rotation = cornell_rotation;
-                                obj.transform.scale = cornell_scale;
-                            }
+                            write_runtime_back_to_database(
+                                &mut main_db,
+                                sphere_obj_id,
+                                decanter_obj_id,
+                                wine_obj_id,
+                                sun_obj_id,
+                                spot_obj_id,
+                                cornell_obj_id,
+                                &uniforms,
+                                sphere_rotation,
+                                sphere_scale,
+                                decanter_center,
+                                decanter_translation,
+                                decanter_rotation,
+                                decanter_scale,
+                                wine_center,
+                                wine_translation,
+                                wine_rotation,
+                                wine_scale,
+                                stress_instance_count,
+                                &mesh_instances,
+                                sun_empty_position,
+                                sun_empty_rotation,
+                                sun_empty_scale,
+                                &light_instances,
+                                spot_empty_position,
+                                spot_empty_rotation,
+                                spot_empty_scale,
+                                active_center,
+                                cornell_translation,
+                                cornell_rotation,
+                                cornell_scale,
+                            );
 
                             sun_changed = uniforms.light_pos != old_light
                                 || (uniforms.sun_intensity - old_intensity).abs() > f32::EPSILON;
@@ -2337,390 +2015,76 @@ pub async fn run() {
                             egui_state.handle_platform_output(window.as_ref(), platform_output);
                             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
-                            if accumulation_dirty || sun_changed {
-                                if geometry_dirty {
-                                    model_verts = mesh.vertices.clone();
-                                    if stress_instance_count == 0 {
-                                        for inst in &mesh_instances {
-                                            update_mesh_transform(
-                                                &mut mesh,
-                                                &mut model_verts,
-                                                inst.vertex_start,
-                                                inst.vertex_count,
-                                                &inst.base_positions,
-                                                &inst.base_normals,
-                                                inst.pivot,
-                                                inst.scale,
-                                                inst.rotation,
-                                                inst.translation,
-                                            );
-                                        }
-                                    }
-                                    let (render_verts, render_indices, render_positions, render_normals, render_triangle_material_ids) =
-                                        if stress_instance_count > 0 {
-                                            let asset_mesh = &mesh_assets[0].mesh;
-                                            (
-                                                asset_mesh.vertices.clone(),
-                                                asset_mesh.indices.clone(),
-                                                asset_mesh.positions4.clone(),
-                                                asset_mesh.normals4.clone(),
-                                                asset_mesh.triangle_material_ids.clone(),
-                                            )
-                                        } else {
-                                            let render_scene_id = decanter_scene_id;
-                                            let visible_render_ids = main_db.scene_visible_selectable_objects(render_scene_id);
-                                            visible_render_geometry(&mesh, &mesh_instances, &visible_render_ids)
-                                        };
-                                    model_idx = render_indices;
-                                    if gpu_mesh_dirty {
-                                        vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                            label: Some("model_vbuf"),
-                                            contents: bytemuck::cast_slice(&render_verts),
-                                            usage: wgpu::BufferUsages::VERTEX
-                                                | wgpu::BufferUsages::BLAS_INPUT
-                                                | wgpu::BufferUsages::COPY_DST,
-                                        });
-                                        ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                            label: Some("model_ibuf"),
-                                            contents: bytemuck::cast_slice(&model_idx),
-                                            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::BLAS_INPUT,
-                                        });
-                                        pos_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                            label: Some("mesh_pos_buf"),
-                                            contents: bytemuck::cast_slice(&render_positions),
-                                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                                        });
-                                        nrm_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                            label: Some("mesh_nrm_buf"),
-                                            contents: bytemuck::cast_slice(&render_normals),
-                                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                                        });
-                                        idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                            label: Some("mesh_idx_buf"),
-                                            contents: bytemuck::cast_slice(&model_idx),
-                                            usage: wgpu::BufferUsages::STORAGE,
-                                        });
-                                        tri_mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                            label: Some("mesh_tri_mat_buf"),
-                                            contents: bytemuck::cast_slice(&render_triangle_material_ids),
-                                            usage: wgpu::BufferUsages::STORAGE,
-                                        });
-                                        mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                            label: Some("mesh_materials_buf"),
-                                            contents: bytemuck::cast_slice(&mesh.materials),
-                                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                                        });
-                                        model_blas_desc = wgpu::BlasTriangleGeometrySizeDescriptor {
-                                            vertex_format: wgpu::VertexFormat::Float32x3,
-                                            vertex_count: render_verts.len() as u32,
-                                            index_format: Some(wgpu::IndexFormat::Uint32),
-                                            index_count: Some(model_idx.len() as u32),
-                                            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
-                                        };
-                                        model_blas = device.create_blas(
-                                            &wgpu::CreateBlasDescriptor {
-                                                label: Some("model_blas"),
-                                                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
-                                                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-                                            },
-                                            wgpu::BlasGeometrySizeDescriptors::Triangles {
-                                                descriptors: vec![model_blas_desc.clone()],
-                                            },
-                                        );
-                                        let tlas_instances: u32 = if stress_instance_count > 0 {
-                                            stress_instance_count.max(1)
-                                        } else {
-                                            1
-                                        } as u32;
-                                        tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
-                                            label: Some("scene_tlas"),
-                                            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
-                                            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-                                            max_instances: tlas_instances,
-                                        });
-                                        if stress_instance_count > 0 {
-                                            for (i, inst) in mesh_instances.iter().enumerate() {
-                                                let c = inst.center();
-                                                tlas[i] = Some(wgpu::TlasInstance::new(
-                                                    &model_blas,
-                                                    [1.0, 0.0, 0.0, c.x, 0.0, 1.0, 0.0, c.y, 0.0, 0.0, 1.0, c.z],
-                                                    0,
-                                                    0xff,
-                                                ));
-                                            }
-                                        } else {
-                                            tlas[0] = Some(wgpu::TlasInstance::new(
-                                                &model_blas,
-                                                [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                                                0,
-                                                0xff,
-                                            ));
-                                        }
-                                        photon_mapper = PhotonMapper::new(
-                                            &device,
-                                            &queue,
-                                            &tlas,
-                                            &pos_buf,
-                                            &nrm_buf,
-                                            &idx_buf,
-                                            &tri_mat_buf,
-                                            &mat_buf,
-                                        );
-                                        ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                            label: Some("ugroup"),
-                                            layout: &ubind,
-                                            entries: &[
-                                                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::AccelerationStructure(&tlas) },
-                                                wgpu::BindGroupEntry { binding: 2, resource: accum_buf.as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 3, resource: pos_buf.as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 4, resource: nrm_buf.as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 5, resource: idx_buf.as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 6, resource: tri_mat_buf.as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 7, resource: mat_buf.as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(compute_pass.output_view()) },
-                                                wgpu::BindGroupEntry { binding: 9, resource: photon_mapper.photon_buffer().as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 10, resource: photon_mapper.hash_heads().as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 11, resource: photon_mapper.uniforms_buffer().as_entire_binding() },
-                                                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(compute_pass.selection_mask_view()) },
-                                            ],
-                                        });
-                                        gpu_mesh_dirty = false;
-                                    } else {
-                                        queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&render_verts));
-                                        queue.write_buffer(&pos_buf, 0, bytemuck::cast_slice(&render_positions));
-                                        queue.write_buffer(&nrm_buf, 0, bytemuck::cast_slice(&render_normals));
-                                    }
-
-                                    let model_build = wgpu::BlasBuildEntry {
-                                        blas: &model_blas,
-                                        geometry: wgpu::BlasGeometries::TriangleGeometries(vec![
-                                            wgpu::BlasTriangleGeometry {
-                                                size: &model_blas_desc,
-                                                vertex_buffer: &vbuf,
-                                                first_vertex: 0,
-                                                vertex_stride: std::mem::size_of::<Vertex>() as u64,
-                                                index_buffer: Some(&ibuf),
-                                                first_index: Some(0),
-                                                transform_buffer: None,
-                                                transform_buffer_offset: None,
-                                            },
-                                        ]),
-                                    };
-                                    let mut accel_encoder =
-                                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                            label: Some("accel_update"),
-                                        });
-                                    accel_encoder.build_acceleration_structures(
-                                        [model_build].iter(),
-                                        iter::once(&tlas),
-                                    );
-                                    queue.submit(Some(accel_encoder.finish()));
-                                    geometry_dirty = false;
-                                }
-                                uniforms.frame = 0;
-                                let zeros = vec![0u8; accum_byte_size as usize];
-                                queue.write_buffer(&accum_buf, 0, &zeros);
-                                accumulation_dirty = false;
-                            } else {
-                                uniforms.frame = uniforms.frame.saturating_add(1);
-                            }
+                            sync_accumulation_and_geometry(
+                                &mut accumulation_dirty,
+                                sun_changed,
+                                &mut geometry_dirty,
+                                &mut uniforms,
+                                accum_byte_size,
+                                &queue,
+                                &ubuf,
+                                &accum_buf,
+                                &mut mesh,
+                                &mut model_verts,
+                                stress_instance_count,
+                                &mesh_instances,
+                                &mesh_assets,
+                                &main_db,
+                                decanter_scene_id,
+                                &mut model_idx,
+                                &mut gpu_mesh_dirty,
+                                &mut vbuf,
+                                &mut ibuf,
+                                &mut pos_buf,
+                                &mut nrm_buf,
+                                &mut idx_buf,
+                                &mut tri_mat_buf,
+                                &mut mat_buf,
+                                &mut model_blas_desc,
+                                &mut model_blas,
+                                &mut tlas,
+                                &mut photon_mapper,
+                                &mut ugroup,
+                                &device,
+                                &ubind,
+                                &compute_pass,
+                            );
                             queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
 
-                            let view = tex
-                                .texture
-                                .create_view(&wgpu::TextureViewDescriptor::default());
-                            let mut encoder =
-                                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                    label: Some("enc"),
-                                });
-                            let screen_descriptor = ScreenDescriptor {
-                                size_in_pixels: [config.width, config.height],
-                                pixels_per_point,
-                            };
-                            for (id, image_delta) in &textures_delta.set {
-                                egui_renderer.update_texture(&device, &queue, *id, image_delta);
-                            }
-                            egui_renderer.update_buffers(
+                            render_frame_and_present(
                                 &device,
                                 &queue,
-                                &mut encoder,
+                                &config,
+                                tex,
+                                &mut egui_renderer,
+                                &textures_delta,
                                 &clipped_primitives,
-                                &screen_descriptor,
+                                pixels_per_point,
+                                render_mode,
+                                &mut uniforms,
+                                photons_per_frame,
+                                &main_db,
+                                decanter_scene_id,
+                                &mesh_instances,
+                                stress_instance_count,
+                                &mut photon_mapper,
+                                photon_emitter_center,
+                                sphere_visible_for_photons,
+                                &mut raster_pass,
+                                &mut raster_instance_count,
+                                &mut raster_instance_buf,
+                                projection,
+                                &camera,
+                                &vbuf,
+                                &ibuf,
+                                model_idx.len(),
+                                &compute_pass,
+                                &ugroup,
+                                &quad_pass,
+                                &mut mouse_left_clicked,
+                                mouse_left_down,
+                                &mut mouse_left_dragging,
                             );
-                            if matches!(render_mode, RenderModeKind::Pathtraced) {
-                                let photon_light_pos = if uniforms.sun_light_count > 0 {
-                                    let count = uniforms.sun_light_count.min(MAX_SUN_LIGHTS as u32);
-                                    let idx = (uniforms.frame % count) as usize;
-                                    uniforms.sun_lights[idx]
-                                } else {
-                                    uniforms.light_pos
-                                };
-                                let photon_frame_count = photons_per_frame
-                                    .saturating_mul(uniforms.sun_light_count.max(1))
-                                    .min(1_000_000);
-                                let photon_visible_ids =
-                                    main_db.scene_visible_selectable_objects(decanter_scene_id);
-                                let photon_targets = build_photon_targets(
-                                    &mesh_instances,
-                                    &photon_visible_ids,
-                                    stress_instance_count > 0,
-                                );
-                                photon_mapper.update(
-                                    &queue,
-                                    photon_light_pos,
-                                    photon_emitter_center,
-                                    uniforms.sphere_pos,
-                                    uniforms.sphere_rot,
-                                    uniforms.sphere_extent,
-                                    [
-                                        uniforms.sphere_color[3],
-                                        uniforms.sphere_params[1],
-                                        uniforms.sphere_params[2],
-                                        0.0,
-                                    ],
-                                    sphere_visible_for_photons,
-                                    photon_frame_count,
-                                    &photon_targets,
-                                    uniforms.frame,
-                                );
-                                photon_mapper.emit_photons(&mut encoder, photon_frame_count);
-                                photon_mapper.build_spatial_structure(&mut encoder);
-                            }
-                            if matches!(render_mode, RenderModeKind::Rasterized) {
-                                if stress_instance_count > 0 {
-                                    let instances: Vec<raster_pass::RasterInstance> = mesh_instances
-                                        .iter()
-                                        .map(|inst| {
-                                            let c = inst.center();
-                                            raster_pass::RasterInstance {
-                                                offset: [c.x, c.y, c.z, 0.0],
-                                            }
-                                        })
-                                        .collect();
-                                    if raster_instance_count != instances.len() as u32 {
-                                        raster_instance_count = instances.len() as u32;
-                                        raster_instance_buf = device.create_buffer_init(
-                                            &wgpu::util::BufferInitDescriptor {
-                                                label: Some("raster_instance_buf"),
-                                                contents: bytemuck::cast_slice(&instances),
-                                                usage: wgpu::BufferUsages::VERTEX
-                                                    | wgpu::BufferUsages::COPY_DST,
-                                            },
-                                        );
-                                    }
-                                } else {
-                                    if raster_instance_count != 1 {
-                                        raster_instance_count = 1;
-                                        raster_instance_buf = device.create_buffer_init(
-                                            &wgpu::util::BufferInitDescriptor {
-                                                label: Some("raster_instance_buf"),
-                                                contents: bytemuck::cast_slice(&[
-                                                    raster_pass::RasterInstance {
-                                                        offset: [0.0, 0.0, 0.0, 0.0],
-                                                    },
-                                                ]),
-                                                usage: wgpu::BufferUsages::VERTEX
-                                                    | wgpu::BufferUsages::COPY_DST,
-                                            },
-                                        );
-                                    }
-                                }
-                                let view_proj = projection * camera.view_matrix();
-                                raster_pass.update_view_proj(&queue, view_proj);
-                                let mut raster_rpass =
-                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                        label: Some("raster_pass"),
-                                        color_attachments: &[Some(
-                                            wgpu::RenderPassColorAttachment {
-                                                view: &view,
-                                                resolve_target: None,
-                                                depth_slice: None,
-                                                ops: wgpu::Operations {
-                                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                                    store: wgpu::StoreOp::Store,
-                                                },
-                                            },
-                                        )],
-                                        depth_stencil_attachment: None,
-                                        multiview_mask: None,
-                                        occlusion_query_set: None,
-                                        timestamp_writes: None,
-                                    });
-                                raster_pass.render(
-                                    &mut raster_rpass,
-                                    &vbuf,
-                                    &raster_instance_buf,
-                                    raster_instance_count,
-                                    &ibuf,
-                                    model_idx.len() as u32,
-                                );
-                            } else {
-                                compute_pass.record(
-                                    &mut encoder,
-                                    &ugroup,
-                                    match render_mode {
-                                        RenderModeKind::Pathtraced => compute_pass::RenderPath::Pathtraced,
-                                        RenderModeKind::Raytraced => compute_pass::RenderPath::Raytraced,
-                                        RenderModeKind::Rasterized => unreachable!(),
-                                    },
-                                );
-                                let mut present_rpass =
-                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                        label: Some("present_pass"),
-                                        color_attachments: &[Some(
-                                            wgpu::RenderPassColorAttachment {
-                                                view: &view,
-                                                resolve_target: None,
-                                                depth_slice: None,
-                                                ops: wgpu::Operations {
-                                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                                    store: wgpu::StoreOp::Store,
-                                                },
-                                            },
-                                        )],
-                                        depth_stencil_attachment: None,
-                                        multiview_mask: None,
-                                        occlusion_query_set: None,
-                                        timestamp_writes: None,
-                                    });
-                                quad_pass.render(&mut present_rpass);
-                            }
-                            {
-                                let ui_rpass =
-                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                        label: Some("egui-pass"),
-                                        color_attachments: &[Some(
-                                            wgpu::RenderPassColorAttachment {
-                                                view: &view,
-                                                resolve_target: None,
-                                                depth_slice: None,
-                                                ops: wgpu::Operations {
-                                                    load: wgpu::LoadOp::Load,
-                                                    store: wgpu::StoreOp::Store,
-                                                },
-                                            },
-                                        )],
-                                        depth_stencil_attachment: None,
-                                        multiview_mask: None,
-                                        occlusion_query_set: None,
-                                        timestamp_writes: None,
-                                    });
-                                egui_renderer.render(
-                                    &mut ui_rpass.forget_lifetime(),
-                                    &clipped_primitives,
-                                    &screen_descriptor,
-                                );
-                            }
-                            queue.submit(Some(encoder.finish()));
-                            for id in &textures_delta.free {
-                                egui_renderer.free_texture(id);
-                            }
-                            mouse_left_clicked = false;
-                            if !mouse_left_down {
-                                mouse_left_dragging = false;
-                            }
-                            tex.present();
                         }
                         _ => {}
                     }

@@ -1,7 +1,10 @@
 mod add_menu;
 mod ecs_sync;
 mod editor_surface;
+mod frame_render;
 mod geometry;
+mod gpu_scene;
+mod project_io;
 mod runtime;
 mod types;
 mod view_math;
