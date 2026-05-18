@@ -1,7 +1,7 @@
 use std::iter;
 
 use egui::{Color32, Pos2, Stroke, ViewportId};
-use egui_code_editor::{CodeEditor, ColorTheme, Syntax};
+use egui_code_editor::Syntax;
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
 use egui_winit::State as EguiWinitState;
 use transform_gizmo::config::TransformPivotPoint;
@@ -12,21 +12,23 @@ use winit::{event::*, event_loop::EventLoop};
 use crate::{
     blender_data::{Id, MainDatabase, Transform as DbTransform},
     compute_pass,
-    ecs::{
-        script_path_for_entity_name, CameraComponent, PhysicsComponent, ScriptEngine,
-        TransformComponent, World,
+    ecs::{CameraComponent, PhysicsComponent, ScriptEngine, TransformComponent, World},
+    editor_ui::{
+        draw_properties_panel, CameraProjectionKind, GizmoModeKind, RenderModeKind,
     },
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     mesh::{load_gltf_mesh, MeshData, Vertex},
     photon_mapper::{PhotonMapper, PhotonTarget},
     prism_file::{
-        load_prism_database, save_prism_file, CollectionData as PrismCollectionData,
-        MaterialData as PrismMaterialData, MeshData as PrismMeshData, NodeProperties, NodeType,
-        ObjectData as PrismObjectData, ObjectDataLink as PrismObjectDataLink, PrismDatabase,
-        SceneData as PrismSceneData, ShaderNode,
+        load_prism_database, save_prism_file, MaterialData as PrismMaterialData,
     },
     quad_pass, raster_pass,
     scene::SceneKind,
+    tooling_lua::scripts_dir,
+    tooling_materials::{
+        make_empty_material, make_glass_material, make_white_material, preview_from_material_data,
+    },
+    tooling_persistence::build_prism_database_from_main,
     window::create_window,
 };
 
@@ -153,70 +155,6 @@ fn sync_runtime_to_ecs(
     }
 }
 
-fn default_lua_script(entity_name: &str) -> String {
-    let escaped_name = entity_name.replace('\\', "\\\\").replace('"', "\\\"");
-    format!(
-        r#"local state = {{
-    t = 0.0,
-}}
-
-return {{
-    on_start = function(entity)
-        entity:log("{escaped_name} script attached")
-    end,
-
-    on_update = function(entity, dt)
-        state.t = state.t + dt
-        entity:set_rotation_euler(0.0, state.t * 1.5, 0.0)
-    end,
-}}
-"#
-    )
-}
-
-fn project_path(path: impl AsRef<std::path::Path>) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
-}
-
-fn scripts_dir() -> std::path::PathBuf {
-    project_path("scripts")
-}
-
-fn write_lua_script(path: &str, source: &str) -> std::io::Result<std::path::PathBuf> {
-    let clean_path = path.trim().trim_start_matches('/').to_string();
-    let full_path = scripts_dir().join(clean_path);
-    let parent = full_path
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(scripts_dir);
-    std::fs::create_dir_all(parent)?;
-    std::fs::write(&full_path, source)?;
-    Ok(full_path)
-}
-
-fn ensure_lua_editor_document(
-    entity_id: Id,
-    entity_name: &str,
-    script_path: Option<String>,
-    editor_entity: &mut Option<Id>,
-    editor_path: &mut String,
-    editor_text: &mut String,
-    editor_status: &mut String,
-) {
-    if *editor_entity == Some(entity_id) && !editor_path.is_empty() {
-        return;
-    }
-
-    let path = script_path.unwrap_or_else(|| script_path_for_entity_name(entity_name));
-    let full_path = scripts_dir().join(&path);
-    let source =
-        std::fs::read_to_string(&full_path).unwrap_or_else(|_| default_lua_script(entity_name));
-    *editor_entity = Some(entity_id);
-    *editor_path = path;
-    *editor_text = source;
-    *editor_status = String::new();
-}
-
 const MAX_SUN_LIGHTS: usize = 8;
 const MAX_PHOTON_TARGETS: usize = 4096;
 
@@ -255,26 +193,6 @@ struct Camera {
     pos: glam::Vec3,
     yaw: f32,
     pitch: f32,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum CameraProjectionKind {
-    Perspective,
-    Orthographic,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum GizmoModeKind {
-    Translate,
-    Rotate,
-    Scale,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum RenderModeKind {
-    Pathtraced,
-    Raytraced,
-    Rasterized,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -344,231 +262,6 @@ fn target_label(target: GizmoTargetKind) -> &'static str {
         GizmoTargetKind::SunLamp => "Sun Lamp",
         GizmoTargetKind::WineSpotlight => "Spotlight",
     }
-}
-
-fn transform_to_matrix(t: &DbTransform) -> [f32; 16] {
-    glam::Mat4::from_scale_rotation_translation(t.scale, t.rotation, t.location).to_cols_array()
-}
-
-fn make_white_material() -> PrismMaterialData {
-    PrismMaterialData {
-        name: "White".to_string(),
-        graph: {
-            let mut g = petgraph::graph::DiGraph::new();
-            let n_out = g.add_node(ShaderNode {
-                node_type: NodeType::MaterialOutput,
-                properties: NodeProperties::default(),
-            });
-            let n_in = g.add_node(ShaderNode {
-                node_type: NodeType::FloatInput,
-                properties: NodeProperties {
-                    float_value: Some(1.0),
-                    vec3_value: Some([1.0, 1.0, 1.0]),
-                    roughness: None,
-                    transmission: None,
-                    ior: None,
-                    bsdf_connected: None,
-                },
-            });
-            g.add_edge(
-                n_in,
-                n_out,
-                crate::prism_file::NodeLink {
-                    output_socket: "Value".to_string(),
-                    input_socket: "Surface".to_string(),
-                },
-            );
-            g
-        },
-    }
-}
-
-fn make_empty_material() -> PrismMaterialData {
-    PrismMaterialData {
-        name: "Empty".to_string(),
-        graph: {
-            let mut g = petgraph::graph::DiGraph::new();
-            g.add_node(ShaderNode {
-                node_type: NodeType::MaterialOutput,
-                properties: NodeProperties::default(),
-            });
-            g
-        },
-    }
-}
-
-fn make_glass_material() -> PrismMaterialData {
-    PrismMaterialData {
-        name: "Glass".to_string(),
-        graph: {
-            let mut g = petgraph::graph::DiGraph::new();
-            let n_bsdf = g.add_node(ShaderNode {
-                node_type: NodeType::PrincipledBSDF,
-                properties: NodeProperties {
-                    float_value: None,
-                    vec3_value: Some([0.98, 1.0, 1.0]),
-                    roughness: Some(0.02),
-                    transmission: Some(1.0),
-                    ior: Some(1.52),
-                    bsdf_connected: Some(true),
-                },
-            });
-            let n_out = g.add_node(ShaderNode {
-                node_type: NodeType::MaterialOutput,
-                properties: NodeProperties::default(),
-            });
-            g.add_edge(
-                n_bsdf,
-                n_out,
-                crate::prism_file::NodeLink {
-                    output_socket: "BSDF".to_string(),
-                    input_socket: "Surface".to_string(),
-                },
-            );
-            g
-        },
-    }
-}
-
-fn preview_from_material_data(material: Option<&PrismMaterialData>) -> RuntimeMaterialPreview {
-    let mut out = RuntimeMaterialPreview::default();
-    let Some(material) = material else {
-        return out;
-    };
-    let mut bsdf_idx = None;
-    let mut out_idx = None;
-    for idx in material.graph.node_indices() {
-        match material.graph[idx].node_type {
-            NodeType::PrincipledBSDF => bsdf_idx = Some(idx),
-            NodeType::MaterialOutput => out_idx = Some(idx),
-            _ => {}
-        }
-    }
-    if let Some(bi) = bsdf_idx {
-        let props = &material.graph[bi].properties;
-        if let Some(v) = props.vec3_value {
-            out.base_color = v;
-        }
-        if let Some(v) = props.roughness {
-            out.roughness = v;
-        }
-        if let Some(v) = props.transmission {
-            out.transmission = v;
-        }
-        if let Some(v) = props.ior {
-            out.ior = v;
-        }
-    }
-    if let (Some(bi), Some(oi)) = (bsdf_idx, out_idx) {
-        out.bsdf_connected = material.graph.edges_connecting(bi, oi).any(|edge| {
-            edge.weight().output_socket == "BSDF" && edge.weight().input_socket == "Surface"
-        });
-        if let Some(v) = material.graph[bi].properties.bsdf_connected {
-            out.bsdf_connected = v;
-        }
-    }
-    out.roughness = out.roughness.clamp(0.001, 1.0);
-    out.transmission = out.transmission.clamp(0.0, 1.0);
-    out.ior = out.ior.max(1.0);
-    out
-}
-
-fn build_prism_database_from_main(
-    main_db: &MainDatabase,
-    decanter_scene_id: Id,
-    wine_scene_id: Id,
-    cornell_scene_id: Id,
-    object_material_names: &std::collections::HashMap<Id, String>,
-    material_library: &std::collections::HashMap<String, PrismMaterialData>,
-) -> PrismDatabase {
-    let mut out = PrismDatabase::new();
-
-    let mut mesh_map: std::collections::HashMap<Id, crate::prism_file::MeshHandle> =
-        std::collections::HashMap::new();
-    for (mid, mesh) in &main_db.meshes {
-        let h = out.meshes.insert(PrismMeshData {
-            vertices: vec![[0.0, 0.0, 0.0]; mesh.vertex_count],
-            indices: Vec::new(),
-            material_slots: Vec::new(),
-        });
-        mesh_map.insert(*mid, h);
-    }
-
-    let mut material_map: std::collections::HashMap<String, crate::prism_file::MaterialHandle> =
-        std::collections::HashMap::new();
-    for (name, material) in material_library {
-        let h = out.materials.insert(material.clone());
-        material_map.insert(name.clone(), h);
-    }
-
-    let mut object_map: std::collections::HashMap<Id, crate::prism_file::ObjectHandle> =
-        std::collections::HashMap::new();
-    for (oid, obj) in &main_db.objects {
-        let mesh_link = obj.mesh_id.and_then(|m| mesh_map.get(&m).copied());
-        let object_material = object_material_names
-            .get(oid)
-            .and_then(|name| material_map.get(name).copied());
-        let h = out.objects.insert(PrismObjectData {
-            name: obj.name.clone(),
-            transform_matrix: transform_to_matrix(&obj.transform),
-            data_link: mesh_link
-                .map(PrismObjectDataLink::Mesh)
-                .unwrap_or(PrismObjectDataLink::None),
-            material_link: object_material,
-        });
-        object_map.insert(*oid, h);
-        if let (Some(mesh_id), Some(mat_handle)) = (obj.mesh_id, object_material) {
-            if let Some(mesh_h) = mesh_map.get(&mesh_id).copied() {
-                if let Some(mesh) = out.meshes.get_mut(mesh_h) {
-                    if mesh.material_slots.is_empty() {
-                        mesh.material_slots.push(Some(mat_handle));
-                    } else {
-                        mesh.material_slots[0] = Some(mat_handle);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut collection_map: std::collections::HashMap<Id, crate::prism_file::CollectionHandle> =
-        std::collections::HashMap::new();
-    for (cid, col) in &main_db.collections {
-        let h = out.collections.insert(PrismCollectionData {
-            name: col.name.clone(),
-            objects: Vec::new(),
-            children: Vec::new(),
-        });
-        collection_map.insert(*cid, h);
-    }
-    for (cid, col) in &main_db.collections {
-        if let Some(ch) = collection_map.get(cid).copied() {
-            if let Some(out_col) = out.collections.get_mut(ch) {
-                out_col.objects = col
-                    .object_ids
-                    .iter()
-                    .filter_map(|id| object_map.get(id).copied())
-                    .collect();
-                out_col.children = col
-                    .child_collection_ids
-                    .iter()
-                    .filter_map(|id| collection_map.get(id).copied())
-                    .collect();
-            }
-        }
-    }
-
-    for scene_id in [decanter_scene_id, wine_scene_id, cornell_scene_id] {
-        if let Some(scene) = main_db.scenes.get(&scene_id) {
-            if let Some(master) = collection_map.get(&scene.master_collection_id).copied() {
-                out.scenes.insert(PrismSceneData {
-                    name: scene.name.clone(),
-                    master_collection: master,
-                });
-            }
-        }
-    }
-
-    out
 }
 
 impl Camera {
@@ -2660,385 +2353,64 @@ pub async fn run() {
                                         }
                                     });
 
-                                egui::SidePanel::right("properties")
-                                    .resizable(true)
-                                    .default_width(300.0)
-                                    .show(ctx, |ui| {
-                                        ui.heading("Properties");
-                                        ui.horizontal(|ui| {
-                                            ui.label("Render");
-                                            let path_clicked = ui
-                                                .selectable_value(
-                                                    &mut render_mode,
-                                                    RenderModeKind::Pathtraced,
-                                                    "Pathtraced",
-                                                )
-                                                .changed();
-                                            let ray_clicked = ui
-                                                .selectable_value(
-                                                    &mut render_mode,
-                                                    RenderModeKind::Raytraced,
-                                                    "Raytraced",
-                                                )
-                                                .changed();
-                                            let ras_clicked = ui
-                                                .selectable_value(
-                                                    &mut render_mode,
-                                                    RenderModeKind::Rasterized,
-                                                    "Rasterized",
-                                                )
-                                                .changed();
-                                            if path_clicked || ray_clicked || ras_clicked {
-                                                accumulation_dirty = true;
-                                            }
-                                        });
-                                        ui.separator();
-                                        if !target_allowed_in_scene(scene_kind, gizmo_target) {
-                                            gizmo_target = default_target_for_scene(scene_kind);
-                                            selected_object_id = match gizmo_target {
-                                                GizmoTargetKind::Sphere => Some(sphere_obj_id),
-                                                GizmoTargetKind::Decanter => Some(decanter_obj_id),
-                                                GizmoTargetKind::WineGlass => Some(wine_obj_id),
-                                                GizmoTargetKind::CornellBox => Some(cornell_obj_id),
-                                                GizmoTargetKind::SunLamp => Some(sun_obj_id),
-                                                GizmoTargetKind::WineSpotlight => Some(spot_obj_id),
-                                            };
-                                        }
-                                        let selected_label = selected_object_id
-                                            .and_then(|id| main_db.objects.get(&id).map(|o| o.name.clone()))
-                                            .unwrap_or_else(|| "None".to_string());
-                                        ui.label(format!(
-                                            "Selected: {}",
-                                            if has_selection { selected_label.as_str() } else { "None" }
-                                        ));
-                                        if let Some(obj_id) = selected_object_id.filter(|_| has_selection) {
-                                            ui.collapsing("Entity", |ui| {
-                                                let (
-                                                    has_mesh,
-                                                    has_camera,
-                                                    has_physics,
-                                                    visible,
-                                                    inherited_visible,
-                                                    view_visible,
-                                                    script_path,
-                                                    script_error,
-                                                ) = {
-                                                    let world = ecs_world.borrow();
-                                                    (
-                                                        world.meshes.contains_key(&obj_id),
-                                                        world.cameras.contains_key(&obj_id),
-                                                        world.physics.contains_key(&obj_id),
-                                                        world
-                                                            .visibility
-                                                            .get(&obj_id)
-                                                            .copied()
-                                                            .unwrap_or_default()
-                                                            == crate::ecs::Visibility::Visible,
-                                                        world
-                                                            .inherited_visibility
-                                                            .get(&obj_id)
-                                                            .map(|v| v.visible)
-                                                            .unwrap_or(true),
-                                                        world
-                                                            .view_visibility
-                                                            .get(&obj_id)
-                                                            .map(|v| v.visible)
-                                                            .unwrap_or(true),
-                                                        world.scripts.get(&obj_id).map(|s| s.path.clone()),
-                                                        world
-                                                            .scripts
-                                                            .get(&obj_id)
-                                                            .and_then(|s| s.last_error.clone()),
-                                                    )
-                                                };
-                                                ui.label(format!(
-                                                    "Components: transform, global transform, visibility{}{}{}{}",
-                                                    if has_mesh { ", mesh" } else { "" },
-                                                    if has_camera { ", camera" } else { "" },
-                                                    if has_physics { ", physics" } else { "" },
-                                                    if script_path.is_some() { ", script" } else { "" },
-                                                ));
-                                                let mut visible_edit = visible;
-                                                if ui.checkbox(&mut visible_edit, "Visible").changed() {
-                                                    ecs_world
-                                                        .borrow_mut()
-                                                        .set_visible(obj_id, visible_edit);
-                                                    sync_ecs_visibility_to_main(
-                                                        &ecs_world.borrow(),
-                                                        &mut main_db,
-                                                    );
-                                                    accumulation_dirty = true;
-                                                }
-                                                ui.label(format!(
-                                                    "Inherited: {}  View: {}",
-                                                    if inherited_visible { "visible" } else { "hidden" },
-                                                    if view_visible { "visible" } else { "hidden" },
-                                                ));
-                                                ui.horizontal(|ui| {
-                                                    if ui.button("Attach Physics").clicked() {
-                                                        ecs_world
-                                                            .borrow_mut()
-                                                            .attach_physics(obj_id, PhysicsComponent::default());
-                                                    }
-                                                    if ui.button("Attach Camera").clicked() {
-                                                        ecs_world
-                                                            .borrow_mut()
-                                                            .attach_camera(obj_id, CameraComponent::default());
-                                                    }
-                                                });
-                                                ui.horizontal(|ui| {
-                                                    if ui.button("Attach Lua").clicked() {
-                                                        let entity_name = main_db
-                                                            .objects
-                                                            .get(&obj_id)
-                                                            .map(|o| o.name.as_str())
-                                                            .unwrap_or("Entity");
-                                                        ensure_lua_editor_document(
-                                                            obj_id,
-                                                            entity_name,
-                                                            script_path.clone(),
-                                                            &mut lua_editor_entity,
-                                                            &mut lua_editor_path,
-                                                            &mut lua_editor_text,
-                                                            &mut lua_editor_status,
-                                                        );
-                                                        match write_lua_script(
-                                                            &lua_editor_path,
-                                                            &lua_editor_text,
-                                                        ) {
-                                                            Ok(full_path) => {
-                                                                ecs_world.borrow_mut().attach_script(
-                                                                    obj_id,
-                                                                    lua_editor_path.clone(),
-                                                                );
-                                                                script_engine.forget(obj_id);
-                                                                lua_editor_status = format!(
-                                                                    "Attached: {}",
-                                                                    full_path.display()
-                                                                );
-                                                            }
-                                                            Err(e) => {
-                                                                lua_editor_status =
-                                                                    format!("Attach failed: {e}");
-                                                            }
-                                                        }
-                                                    }
-                                                    if ui.button("Use As Camera").clicked() {
-                                                        let mut world = ecs_world.borrow_mut();
-                                                        for camera in world.cameras.values_mut() {
-                                                            camera.active = false;
-                                                        }
-                                                        world
-                                                            .cameras
-                                                            .entry(obj_id)
-                                                            .or_insert_with(CameraComponent::default)
-                                                            .active = true;
-                                                    }
-                                                });
-                                                if let Some(path) = script_path {
-                                                    ui.label(format!(
-                                                        "Script: {path} ({})",
-                                                        ecs_world.borrow().script_status(obj_id)
-                                                    ));
-                                                }
-                                                if let Some(error) = script_error {
-                                                    ui.colored_label(Color32::from_rgb(255, 120, 96), error);
-                                                }
-                                            });
-                                            ui.collapsing("Lua Editor", |ui| {
-                                                let entity_name = main_db
-                                                    .objects
-                                                    .get(&obj_id)
-                                                    .map(|o| o.name.clone())
-                                                    .unwrap_or_else(|| "Entity".to_string());
-                                                ensure_lua_editor_document(
-                                                    obj_id,
-                                                    &entity_name,
-                                                    ecs_world
-                                                        .borrow()
-                                                        .scripts
-                                                        .get(&obj_id)
-                                                        .map(|s| s.path.clone()),
-                                                    &mut lua_editor_entity,
-                                                    &mut lua_editor_path,
-                                                    &mut lua_editor_text,
-                                                    &mut lua_editor_status,
-                                                );
-                                                ui.horizontal(|ui| {
-                                                    ui.label("scripts/");
-                                                    ui.text_edit_singleline(&mut lua_editor_path);
-                                                });
-                                                let mut editor = CodeEditor::default()
-                                                    .id_source(format!("lua_editor_{}", obj_id.0))
-                                                    .with_rows(18)
-                                                    .with_fontsize(13.0)
-                                                    .with_theme(ColorTheme::GRUVBOX)
-                                                    .with_numlines(true)
-                                                    .desired_width(f32::INFINITY);
-                                                editor.show(ui, &mut lua_editor_text, &lua_syntax);
-                                                ui.horizontal(|ui| {
-                                                    if ui.button("Save + Reload").clicked() {
-                                                        let clean_path = lua_editor_path
-                                                            .trim()
-                                                            .trim_start_matches('/')
-                                                            .to_string();
-                                                        match write_lua_script(&clean_path, &lua_editor_text) {
-                                                            Ok(_) => {
-                                                                lua_editor_path = clean_path.clone();
-                                                                {
-                                                                    let mut world = ecs_world.borrow_mut();
-                                                                    world.attach_script(obj_id, clean_path.clone());
-                                                                    if let Some(script) = world.scripts.get_mut(&obj_id) {
-                                                                        script.started = false;
-                                                                        script.last_error = None;
-                                                                    }
-                                                                }
-                                                                script_engine.forget(obj_id);
-                                                                lua_editor_status =
-                                                                    format!("Saved: {}", scripts_dir().join(&clean_path).display());
-                                                            }
-                                                            Err(e) => {
-                                                                lua_editor_status = format!("Save failed: {e}");
-                                                            }
-                                                        }
-                                                    }
-                                                    if ui.button("Reload From Disk").clicked() {
-                                                        let full_path =
-                                                            scripts_dir().join(lua_editor_path.trim());
-                                                        match std::fs::read_to_string(&full_path) {
-                                                            Ok(source) => {
-                                                                lua_editor_text = source;
-                                                                lua_editor_status =
-                                                                    format!("Reloaded: {}", full_path.display());
-                                                            }
-                                                            Err(e) => {
-                                                                lua_editor_status = format!("Reload failed: {e}");
-                                                            }
-                                                        }
-                                                    }
-                                                });
-                                                if !lua_editor_status.is_empty() {
-                                                    ui.label(&lua_editor_status);
-                                                }
-                                            });
-                                        }
-                                        ui.horizontal(|ui| {
-                                            ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Translate, "Move");
-                                            ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Rotate, "Rotate");
-                                            ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Scale, "Scale");
-                                        });
-                                        ui.separator();
-                                        ui.collapsing("Camera", |ui| {
-                                            let mut projection_changed = false;
-                                            ui.horizontal(|ui| {
-                                                projection_changed |= ui
-                                                    .selectable_value(
-                                                        &mut camera_projection_mode,
-                                                        CameraProjectionKind::Perspective,
-                                                        "Perspective",
-                                                    )
-                                                    .changed();
-                                                projection_changed |= ui
-                                                    .selectable_value(
-                                                        &mut camera_projection_mode,
-                                                        CameraProjectionKind::Orthographic,
-                                                        "Orthographic",
-                                                    )
-                                                    .changed();
-                                            });
-                                            projection_changed |= ui
-                                                .add(
-                                                    egui::Slider::new(&mut camera_near, 0.01..=10.0)
-                                                        .text("Near"),
-                                                )
-                                                .changed();
-                                            projection_changed |= ui
-                                                .add(
-                                                    egui::Slider::new(&mut camera_far, 10.0..=5000.0)
-                                                        .text("Far"),
-                                                )
-                                                .changed();
-                                            match camera_projection_mode {
-                                                CameraProjectionKind::Perspective => {
-                                                    let mut fov_deg = camera_fov_radians.to_degrees();
-                                                    if ui
-                                                        .add(egui::Slider::new(&mut fov_deg, 10.0..=140.0).text("FOV"))
-                                                        .changed()
-                                                    {
-                                                        camera_fov_radians = fov_deg.to_radians();
-                                                        projection_changed = true;
-                                                    }
-                                                }
-                                                CameraProjectionKind::Orthographic => {
-                                                    projection_changed |= ui
-                                                        .add(
-                                                            egui::Slider::new(
-                                                                &mut camera_ortho_height,
-                                                                0.1..=200.0,
-                                                            )
-                                                            .text("Height"),
-                                                        )
-                                                        .changed();
-                                                }
-                                            }
-                                            if camera_far <= camera_near + 0.001 {
-                                                camera_far = camera_near + 0.001;
-                                            }
-                                            if projection_changed {
-                                                accumulation_dirty = true;
-                                            }
-                                        });
-                                        ui.separator();
-                                        ui.collapsing("Sun", |ui| {
-                                            ui.add(egui::Slider::new(&mut sun_azimuth_deg, -180.0..=180.0).text("Azimuth"));
-                                            ui.add(egui::Slider::new(&mut sun_elevation_deg, -10.0..=89.0).text("Elevation"));
-                                            if let Some(light) = selected_object_id
-                                                .and_then(|id| light_instances.iter_mut().find(|l| l.object_id == id))
-                                            {
-                                                ui.add(egui::Slider::new(&mut light.intensity, 0.0..=5.0).text("Intensity"));
-                                            } else {
-                                                ui.add(egui::Slider::new(&mut sun_intensity, 0.0..=5.0).text("Intensity"));
-                                            }
-                                        });
-                                        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                                            ui.separator();
-                                            ui.collapsing("Shader Graph", |ui| {
-                                                let material_object_id = if has_selection { selected_object_id } else { None };
-                                                if let Some(obj_id) = material_object_id {
-                                                    let mut mat_name = object_material_names
-                                                        .get(&obj_id)
-                                                        .cloned()
-                                                        .unwrap_or_else(|| "White".to_string());
-                                                    egui::ComboBox::from_label("Material")
-                                                        .selected_text(&mat_name)
-                                                        .show_ui(ui, |ui| {
-                                                            for key in material_library.keys() {
-                                                                ui.selectable_value(&mut mat_name, key.clone(), key);
-                                                            }
-                                                        });
-                                                    object_material_names.insert(obj_id, mat_name.clone());
-                                                    if let Some(mat) = material_library.get(&mat_name) {
-                                                        let graph_key = mat_name.clone();
-                                                        ui.label(format!("Graph: {}", mat.name));
-                                                        material_editor.load_material(&graph_key, mat);
-                                                        egui::Frame::default().show(ui, |ui| {
-                                                            ui.set_min_height(280.0);
-                                                            material_editor.show(ui);
-                                                        });
-                                                        if let Some(mat_mut) = material_library.get_mut(&mat_name) {
-                                                            material_editor.commit_to_material(mat_mut);
-                                                        }
-                                                        material_runtime_overrides
-                                                            .insert(mat_name.clone(), material_editor.runtime_preview());
-                                                    } else {
-                                                        ui.label("White fallback (no material graph).");
-                                                    }
-                                                } else {
-                                                    ui.label("No object selected.");
-                                                }
-                                            });
-                                        });
-                                    });
+                                if !target_allowed_in_scene(scene_kind, gizmo_target) {
+                                    gizmo_target = default_target_for_scene(scene_kind);
+                                    selected_object_id = match gizmo_target {
+                                        GizmoTargetKind::Sphere => Some(sphere_obj_id),
+                                        GizmoTargetKind::Decanter => Some(decanter_obj_id),
+                                        GizmoTargetKind::WineGlass => Some(wine_obj_id),
+                                        GizmoTargetKind::CornellBox => Some(cornell_obj_id),
+                                        GizmoTargetKind::SunLamp => Some(sun_obj_id),
+                                        GizmoTargetKind::WineSpotlight => Some(spot_obj_id),
+                                    };
+                                }
+
+                                let selected_light_intensity = selected_object_id
+                                    .and_then(|id| light_instances.iter().find(|l| l.object_id == id))
+                                    .map(|l| l.intensity);
+                                let panel_output = draw_properties_panel(
+                                    ctx,
+                                    &main_db,
+                                    &ecs_world,
+                                    &mut script_engine,
+                                    &lua_syntax,
+                                    has_selection,
+                                    selected_object_id,
+                                    &mut render_mode,
+                                    &mut gizmo_mode,
+                                    &mut camera_projection_mode,
+                                    &mut camera_near,
+                                    &mut camera_far,
+                                    &mut camera_fov_radians,
+                                    &mut camera_ortho_height,
+                                    &mut sun_azimuth_deg,
+                                    &mut sun_elevation_deg,
+                                    &mut sun_intensity,
+                                    selected_light_intensity,
+                                    &mut lua_editor_entity,
+                                    &mut lua_editor_path,
+                                    &mut lua_editor_text,
+                                    &mut lua_editor_status,
+                                    &mut object_material_names,
+                                    &mut material_library,
+                                    &mut material_editor,
+                                    &mut material_runtime_overrides,
+                                );
+                                if let (Some(obj_id), Some(intensity)) =
+                                    (selected_object_id, panel_output.selected_light_intensity)
+                                {
+                                    if let Some(light) =
+                                        light_instances.iter_mut().find(|l| l.object_id == obj_id)
+                                    {
+                                        light.intensity = intensity;
+                                    }
+                                }
+                                if panel_output.visibility_changed {
+                                    sync_ecs_visibility_to_main(&ecs_world.borrow(), &mut main_db);
+                                }
+                                if panel_output.accumulation_dirty {
+                                    accumulation_dirty = true;
+                                }
                                 }
 
                             if stress_test_requested {
