@@ -1,6 +1,7 @@
 use std::iter;
 
 use egui::{Color32, Pos2, Stroke, ViewportId};
+use egui_code_editor::{CodeEditor, ColorTheme, Syntax};
 use egui_wgpu::{Renderer as EguiRenderer, RendererOptions, ScreenDescriptor};
 use egui_winit::State as EguiWinitState;
 use transform_gizmo::config::TransformPivotPoint;
@@ -11,6 +12,10 @@ use winit::{event::*, event_loop::EventLoop};
 use crate::{
     blender_data::{Id, MainDatabase, Transform as DbTransform},
     compute_pass,
+    ecs::{
+        script_path_for_entity_name, CameraComponent, PhysicsComponent, ScriptEngine,
+        TransformComponent, World,
+    },
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     mesh::{load_gltf_mesh, MeshData, Vertex},
     photon_mapper::{PhotonMapper, PhotonTarget},
@@ -20,11 +25,188 @@ use crate::{
         ObjectData as PrismObjectData, ObjectDataLink as PrismObjectDataLink, PrismDatabase,
         SceneData as PrismSceneData, ShaderNode,
     },
-    quad_pass,
-    raster_pass,
+    quad_pass, raster_pass,
     scene::SceneKind,
     window::create_window,
 };
+
+fn db_transform_to_ecs(transform: &DbTransform) -> TransformComponent {
+    TransformComponent {
+        translation: transform.location,
+        rotation: transform.rotation,
+        scale: transform.scale,
+    }
+}
+
+fn register_object_entity(world: &mut World, main_db: &MainDatabase, object_id: Id) {
+    if let Some(obj) = main_db.objects.get(&object_id) {
+        world.register_existing(
+            object_id,
+            obj.name.clone(),
+            db_transform_to_ecs(&obj.transform),
+        );
+        if obj.mesh_id.is_some() {
+            world.attach_mesh(object_id, 0);
+        }
+    }
+}
+
+fn sync_ecs_to_runtime(
+    world: &World,
+    main_db: &mut MainDatabase,
+    mesh_instances: &mut [MeshObjectInstance],
+    light_instances: &mut [LightObjectInstance],
+    camera: &mut Camera,
+) -> bool {
+    let mut geometry_changed = false;
+
+    for (object_id, transform) in &world.transforms {
+        if let Some(obj) = main_db.objects.get_mut(object_id) {
+            obj.transform.location = transform.translation;
+            obj.transform.rotation = transform.rotation;
+            obj.transform.scale = transform.scale;
+        }
+        if let Some(inst) = mesh_instances
+            .iter_mut()
+            .find(|inst| inst.object_id == *object_id)
+        {
+            let next_translation = transform.translation - inst.pivot;
+            if inst.translation != next_translation
+                || inst.rotation != transform.rotation
+                || inst.scale != transform.scale
+            {
+                inst.translation = next_translation;
+                inst.rotation = transform.rotation;
+                inst.scale = transform.scale;
+                geometry_changed = true;
+            }
+        }
+        if let Some(light) = light_instances
+            .iter_mut()
+            .find(|light| light.object_id == *object_id)
+        {
+            light.position = transform.translation;
+            light.rotation = transform.rotation;
+            light.scale = transform.scale;
+        }
+    }
+
+    if let Some((object_id, _)) = world.cameras.iter().find(|(_, camera)| camera.active) {
+        if let Some(transform) = world.transforms.get(object_id) {
+            camera.pos = transform.translation;
+        }
+    }
+
+    geometry_changed
+}
+
+fn sync_runtime_to_ecs(
+    world: &mut World,
+    main_db: &MainDatabase,
+    mesh_instances: &[MeshObjectInstance],
+    light_instances: &[LightObjectInstance],
+    camera: &Camera,
+) {
+    for entity in world.entities.clone() {
+        if let Some(obj) = main_db.objects.get(&entity.id) {
+            world.transforms.entry(entity.id).or_default().translation = obj.transform.location;
+            if let Some(transform) = world.transforms.get_mut(&entity.id) {
+                transform.rotation = obj.transform.rotation;
+                transform.scale = obj.transform.scale;
+            }
+        }
+    }
+
+    for inst in mesh_instances {
+        if let Some(transform) = world.transforms.get_mut(&inst.object_id) {
+            transform.translation = inst.center();
+            transform.rotation = inst.rotation;
+            transform.scale = inst.scale;
+        }
+    }
+
+    for light in light_instances {
+        if let Some(transform) = world.transforms.get_mut(&light.object_id) {
+            transform.translation = light.position;
+            transform.rotation = light.rotation;
+            transform.scale = light.scale;
+        }
+    }
+
+    let active_camera_id = world
+        .cameras
+        .iter()
+        .find_map(|(id, camera)| camera.active.then_some(*id));
+    if let Some(id) = active_camera_id {
+        if let Some(transform) = world.transforms.get_mut(&id) {
+            transform.translation = camera.pos;
+        }
+    }
+}
+
+fn default_lua_script(entity_name: &str) -> String {
+    let escaped_name = entity_name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        r#"local state = {{
+    t = 0.0,
+}}
+
+return {{
+    on_start = function(entity)
+        entity:log("{escaped_name} script attached")
+    end,
+
+    on_update = function(entity, dt)
+        state.t = state.t + dt
+        entity:set_rotation_euler(0.0, state.t * 1.5, 0.0)
+    end,
+}}
+"#
+    )
+}
+
+fn project_path(path: impl AsRef<std::path::Path>) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
+}
+
+fn scripts_dir() -> std::path::PathBuf {
+    project_path("scripts")
+}
+
+fn write_lua_script(path: &str, source: &str) -> std::io::Result<std::path::PathBuf> {
+    let clean_path = path.trim().trim_start_matches('/').to_string();
+    let full_path = scripts_dir().join(clean_path);
+    let parent = full_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(scripts_dir);
+    std::fs::create_dir_all(parent)?;
+    std::fs::write(&full_path, source)?;
+    Ok(full_path)
+}
+
+fn ensure_lua_editor_document(
+    entity_id: Id,
+    entity_name: &str,
+    script_path: Option<String>,
+    editor_entity: &mut Option<Id>,
+    editor_path: &mut String,
+    editor_text: &mut String,
+    editor_status: &mut String,
+) {
+    if *editor_entity == Some(entity_id) && !editor_path.is_empty() {
+        return;
+    }
+
+    let path = script_path.unwrap_or_else(|| script_path_for_entity_name(entity_name));
+    let full_path = scripts_dir().join(&path);
+    let source =
+        std::fs::read_to_string(&full_path).unwrap_or_else(|_| default_lua_script(entity_name));
+    *editor_entity = Some(entity_id);
+    *editor_path = path;
+    *editor_text = source;
+    *editor_status = String::new();
+}
 
 const MAX_SUN_LIGHTS: usize = 8;
 const MAX_PHOTON_TARGETS: usize = 4096;
@@ -572,7 +754,13 @@ fn visible_render_geometry(
     mesh: &MeshData,
     instances: &[MeshObjectInstance],
     visible_ids: &[Id],
-) -> (Vec<Vertex>, Vec<u32>, Vec<[f32; 4]>, Vec<[f32; 4]>, Vec<u32>) {
+) -> (
+    Vec<Vertex>,
+    Vec<u32>,
+    Vec<[f32; 4]>,
+    Vec<[f32; 4]>,
+    Vec<u32>,
+) {
     let mut verts = Vec::new();
     let mut indices = Vec::new();
     let mut positions = Vec::new();
@@ -687,7 +875,9 @@ fn camera_projection_matrix(
 ) -> glam::Mat4 {
     let aspect = width.max(1) as f32 / height.max(1) as f32;
     match mode {
-        CameraProjectionKind::Perspective => glam::Mat4::perspective_rh(fov_radians, aspect, near, far),
+        CameraProjectionKind::Perspective => {
+            glam::Mat4::perspective_rh(fov_radians, aspect, near, far)
+        }
         CameraProjectionKind::Orthographic => {
             let half_h = (ortho_height * 0.5).max(0.001);
             let half_w = (half_h * aspect).max(0.001);
@@ -965,7 +1155,10 @@ pub async fn run() {
     let mut main_db = MainDatabase::new();
     let decanter_mesh_id = main_db.create_mesh("DecanterMesh", decanter_vertex_count);
     let wine_mesh_id = main_db.create_mesh("WineGlassMesh", wine_vertex_count);
-    let cornell_mesh_id = main_db.create_mesh("CornellBoxMesh", make_cube_mesh(glam::Vec3::ZERO, 2.0).vertices.len());
+    let cornell_mesh_id = main_db.create_mesh(
+        "CornellBoxMesh",
+        make_cube_mesh(glam::Vec3::ZERO, 2.0).vertices.len(),
+    );
     let sphere_obj_id = main_db.create_object("Cube", None, DbTransform::default());
     let sun_obj_id = main_db.create_object("SunLamp", None, DbTransform::default());
     let spot_obj_id = main_db.create_object("Spotlight", None, DbTransform::default());
@@ -975,6 +1168,44 @@ pub async fn run() {
         main_db.create_object("WineGlass", Some(wine_mesh_id), DbTransform::default());
     let cornell_obj_id =
         main_db.create_object("CornellBox", Some(cornell_mesh_id), DbTransform::default());
+    let player_obj_id = main_db.create_object("Player", None, DbTransform::default());
+    let player_camera_obj_id = main_db.create_object(
+        "Player Camera",
+        None,
+        DbTransform {
+            location: glam::Vec3::new(0.0, 4.0, 12.0),
+            rotation: glam::Quat::IDENTITY,
+            scale: glam::Vec3::ONE,
+        },
+    );
+    let ecs_world = std::rc::Rc::new(std::cell::RefCell::new(World::new()));
+    {
+        let mut world = ecs_world.borrow_mut();
+        for object_id in [
+            sphere_obj_id,
+            sun_obj_id,
+            spot_obj_id,
+            decanter_obj_id,
+            wine_obj_id,
+            cornell_obj_id,
+            player_obj_id,
+            player_camera_obj_id,
+        ] {
+            register_object_entity(&mut world, &main_db, object_id);
+        }
+        world.attach_light(sun_obj_id, 0.8);
+        world.attach_light(spot_obj_id, 1.0);
+        world.attach_camera(
+            player_camera_obj_id,
+            CameraComponent {
+                active: false,
+                ..CameraComponent::default()
+            },
+        );
+        world.attach_physics(player_obj_id, PhysicsComponent::default());
+    }
+    let mut script_engine =
+        ScriptEngine::new(std::rc::Rc::clone(&ecs_world), scripts_dir()).expect("create Lua engine");
     let mut material_library: std::collections::HashMap<String, PrismMaterialData> =
         std::collections::HashMap::new();
     material_library.insert("White".to_string(), make_white_material());
@@ -1038,6 +1269,8 @@ pub async fn run() {
     object_target_by_id.insert(decanter_obj_id, GizmoTargetKind::Decanter);
     object_target_by_id.insert(wine_obj_id, GizmoTargetKind::WineGlass);
     object_target_by_id.insert(cornell_obj_id, GizmoTargetKind::CornellBox);
+    object_target_by_id.insert(player_obj_id, GizmoTargetKind::Decanter);
+    object_target_by_id.insert(player_camera_obj_id, GizmoTargetKind::Decanter);
 
     let mut decanter_master = main_db.create_collection("SceneMaster");
     let mut wine_master = Id(0);
@@ -1049,6 +1282,10 @@ pub async fn run() {
     main_db.ensure_scene_base(decanter_scene_id, sphere_obj_id, true, true);
     main_db.collection_link_object(decanter_master, sun_obj_id);
     main_db.ensure_scene_base(decanter_scene_id, sun_obj_id, true, true);
+    main_db.collection_link_object(decanter_master, player_obj_id);
+    main_db.ensure_scene_base(decanter_scene_id, player_obj_id, true, true);
+    main_db.collection_link_object(decanter_master, player_camera_obj_id);
+    main_db.ensure_scene_base(decanter_scene_id, player_camera_obj_id, true, true);
     println!(
         "Scene bounds: decanter center={:?}, wine center={:?}, combined center={:?}, size={:?}",
         decanter_center, wine_center, center, size
@@ -1534,6 +1771,11 @@ pub async fn run() {
     let mut material_editor = MaterialGraphEditor::new();
     let mut material_runtime_overrides: std::collections::HashMap<String, RuntimeMaterialPreview> =
         std::collections::HashMap::new();
+    let lua_syntax = Syntax::lua();
+    let mut lua_editor_entity: Option<Id> = None;
+    let mut lua_editor_path = String::new();
+    let mut lua_editor_text = String::new();
+    let mut lua_editor_status = String::new();
 
     let _ = event_loop.run(move |event, active_loop| {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -1749,6 +1991,29 @@ pub async fn run() {
                         camera.yaw -= look_speed * dt;
                     }
 
+                    {
+                        let mut world = ecs_world.borrow_mut();
+                        sync_runtime_to_ecs(
+                            &mut world,
+                            &main_db,
+                            &mesh_instances,
+                            &light_instances,
+                            &camera,
+                        );
+                        world.integrate_physics(dt);
+                    }
+                    script_engine.update(dt);
+                    if sync_ecs_to_runtime(
+                        &ecs_world.borrow(),
+                        &mut main_db,
+                        &mut mesh_instances,
+                        &mut light_instances,
+                        &mut camera,
+                    ) {
+                        geometry_dirty = true;
+                        accumulation_dirty = true;
+                    }
+
                     uniforms.view_inv = camera.view_matrix().inverse().to_cols_array_2d();
                     let projection = camera_projection_matrix(
                         camera_projection_mode,
@@ -1798,6 +2063,62 @@ pub async fn run() {
                                             let scene_id = decanter_scene_id;
                                             match scene_kind {
                                                 SceneKind::Decanter => {
+                                                    if ui.button("Empty Entity").clicked() {
+                                                        let count = main_db
+                                                            .objects
+                                                            .values()
+                                                            .filter(|o| o.name.starts_with("Entity"))
+                                                            .count()
+                                                            + 1;
+                                                        let obj_id = main_db.create_object(
+                                                            format!("Entity {count}"),
+                                                            None,
+                                                            DbTransform::default(),
+                                                        );
+                                                        main_db.collection_link_object(decanter_master, obj_id);
+                                                        main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                        register_object_entity(
+                                                            &mut ecs_world.borrow_mut(),
+                                                            &main_db,
+                                                            obj_id,
+                                                        );
+                                                        object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
+                                                        selected_object_id = Some(obj_id);
+                                                        gizmo_target = GizmoTargetKind::Decanter;
+                                                        has_selection = true;
+                                                        suppress_scene_click = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Camera").clicked() {
+                                                        let count = main_db
+                                                            .objects
+                                                            .values()
+                                                            .filter(|o| o.name.starts_with("Camera"))
+                                                            .count()
+                                                            + 1;
+                                                        let obj_id = main_db.create_object(
+                                                            format!("Camera {count}"),
+                                                            None,
+                                                            DbTransform {
+                                                                location: camera.pos,
+                                                                rotation: glam::Quat::IDENTITY,
+                                                                scale: glam::Vec3::ONE,
+                                                            },
+                                                        );
+                                                        main_db.collection_link_object(decanter_master, obj_id);
+                                                        main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                        {
+                                                            let mut world = ecs_world.borrow_mut();
+                                                            register_object_entity(&mut world, &main_db, obj_id);
+                                                            world.attach_camera(obj_id, CameraComponent::default());
+                                                        }
+                                                        object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
+                                                        selected_object_id = Some(obj_id);
+                                                        gizmo_target = GizmoTargetKind::Decanter;
+                                                        has_selection = true;
+                                                        suppress_scene_click = true;
+                                                        ui.close();
+                                                    }
                                                     if ui.button("Cube").clicked() {
                                                         let count = main_db
                                                             .objects
@@ -1821,6 +2142,11 @@ pub async fn run() {
                                                         place_instance_center(&mut inst, cube_center);
                                                         main_db.collection_link_object(decanter_master, obj_id);
                                                         main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                        register_object_entity(
+                                                            &mut ecs_world.borrow_mut(),
+                                                            &main_db,
+                                                            obj_id,
+                                                        );
                                                         object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
                                                         object_material_names.insert(obj_id, "Glass".to_string());
                                                         mesh_instances.push(inst);
@@ -1850,6 +2176,11 @@ pub async fn run() {
                                                             + glam::Vec3::new(count as f32 * 3.0, 8.0, 10.0);
                                                         main_db.collection_link_object(decanter_master, obj_id);
                                                         main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                        register_object_entity(
+                                                            &mut ecs_world.borrow_mut(),
+                                                            &main_db,
+                                                            obj_id,
+                                                        );
                                                         object_target_by_id.insert(obj_id, GizmoTargetKind::SunLamp);
                                                         light_instances.push(LightObjectInstance {
                                                             object_id: obj_id,
@@ -1858,6 +2189,9 @@ pub async fn run() {
                                                             scale: glam::Vec3::ONE,
                                                             intensity: sun_intensity,
                                                         });
+                                                        ecs_world
+                                                            .borrow_mut()
+                                                            .attach_light(obj_id, sun_intensity);
                                                         selected_object_id = Some(obj_id);
                                                         gizmo_target = GizmoTargetKind::SunLamp;
                                                         has_selection = true;
@@ -1891,6 +2225,20 @@ pub async fn run() {
                                                                 let inst = append_object_mesh(&mut mesh, new_mesh, obj_id, 1);
                                                                 main_db.collection_link_object(decanter_master, obj_id);
                                                                 main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                                register_object_entity(
+                                                                    &mut ecs_world.borrow_mut(),
+                                                                    &main_db,
+                                                                    obj_id,
+                                                                );
+                                                                if let Some(transform) = ecs_world
+                                                                    .borrow_mut()
+                                                                    .transforms
+                                                                    .get_mut(&obj_id)
+                                                                {
+                                                                    transform.translation = inst.center();
+                                                                    transform.rotation = inst.rotation;
+                                                                    transform.scale = inst.scale;
+                                                                }
                                                                 object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
                                                                 object_material_names.insert(obj_id, "Glass".to_string());
                                                                 mesh_instances.push(inst);
@@ -1939,6 +2287,20 @@ pub async fn run() {
                                                                 let inst = append_object_mesh(&mut mesh, new_mesh, obj_id, 2);
                                                                 main_db.collection_link_object(decanter_master, obj_id);
                                                                 main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                                register_object_entity(
+                                                                    &mut ecs_world.borrow_mut(),
+                                                                    &main_db,
+                                                                    obj_id,
+                                                                );
+                                                                if let Some(transform) = ecs_world
+                                                                    .borrow_mut()
+                                                                    .transforms
+                                                                    .get_mut(&obj_id)
+                                                                {
+                                                                    transform.translation = inst.center();
+                                                                    transform.rotation = inst.rotation;
+                                                                    transform.scale = inst.scale;
+                                                                }
                                                                 object_target_by_id.insert(obj_id, GizmoTargetKind::WineGlass);
                                                                 object_material_names.insert(obj_id, "Glass".to_string());
                                                                 mesh_instances.push(inst);
@@ -1994,6 +2356,20 @@ pub async fn run() {
                                                                     let inst = append_object_mesh(&mut mesh, imported, obj_id, 3);
                                                                     main_db.collection_link_object(decanter_master, obj_id);
                                                                     main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                                    register_object_entity(
+                                                                        &mut ecs_world.borrow_mut(),
+                                                                        &main_db,
+                                                                        obj_id,
+                                                                    );
+                                                                    if let Some(transform) = ecs_world
+                                                                        .borrow_mut()
+                                                                        .transforms
+                                                                        .get_mut(&obj_id)
+                                                                    {
+                                                                        transform.translation = inst.center();
+                                                                        transform.rotation = inst.rotation;
+                                                                        transform.scale = inst.scale;
+                                                                    }
                                                                     object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
                                                                     object_material_names.insert(obj_id, "Glass".to_string());
                                                                     mesh_instances.push(inst);
@@ -2041,6 +2417,20 @@ pub async fn run() {
                                                         place_instance_center(&mut inst, box_center);
                                                         main_db.collection_link_object(decanter_master, obj_id);
                                                         main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                        register_object_entity(
+                                                            &mut ecs_world.borrow_mut(),
+                                                            &main_db,
+                                                            obj_id,
+                                                        );
+                                                        if let Some(transform) = ecs_world
+                                                            .borrow_mut()
+                                                            .transforms
+                                                            .get_mut(&obj_id)
+                                                        {
+                                                            transform.translation = inst.center();
+                                                            transform.rotation = inst.rotation;
+                                                            transform.scale = inst.scale;
+                                                        }
                                                         object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
                                                         object_material_names.insert(obj_id, "Empty".to_string());
                                                         mesh_instances.push(inst);
@@ -2307,6 +2697,176 @@ pub async fn run() {
                                             "Selected: {}",
                                             if has_selection { selected_label.as_str() } else { "None" }
                                         ));
+                                        if let Some(obj_id) = selected_object_id.filter(|_| has_selection) {
+                                            ui.collapsing("Entity", |ui| {
+                                                let (has_mesh, has_camera, has_physics, script_path, script_error) = {
+                                                    let world = ecs_world.borrow();
+                                                    (
+                                                        world.meshes.contains_key(&obj_id),
+                                                        world.cameras.contains_key(&obj_id),
+                                                        world.physics.contains_key(&obj_id),
+                                                        world.scripts.get(&obj_id).map(|s| s.path.clone()),
+                                                        world
+                                                            .scripts
+                                                            .get(&obj_id)
+                                                            .and_then(|s| s.last_error.clone()),
+                                                    )
+                                                };
+                                                ui.label(format!(
+                                                    "Components: transform{}{}{}{}",
+                                                    if has_mesh { ", mesh" } else { "" },
+                                                    if has_camera { ", camera" } else { "" },
+                                                    if has_physics { ", physics" } else { "" },
+                                                    if script_path.is_some() { ", script" } else { "" },
+                                                ));
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Attach Physics").clicked() {
+                                                        ecs_world
+                                                            .borrow_mut()
+                                                            .attach_physics(obj_id, PhysicsComponent::default());
+                                                    }
+                                                    if ui.button("Attach Camera").clicked() {
+                                                        ecs_world
+                                                            .borrow_mut()
+                                                            .attach_camera(obj_id, CameraComponent::default());
+                                                    }
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Attach Lua").clicked() {
+                                                        let entity_name = main_db
+                                                            .objects
+                                                            .get(&obj_id)
+                                                            .map(|o| o.name.as_str())
+                                                            .unwrap_or("Entity");
+                                                        ensure_lua_editor_document(
+                                                            obj_id,
+                                                            entity_name,
+                                                            script_path.clone(),
+                                                            &mut lua_editor_entity,
+                                                            &mut lua_editor_path,
+                                                            &mut lua_editor_text,
+                                                            &mut lua_editor_status,
+                                                        );
+                                                        match write_lua_script(
+                                                            &lua_editor_path,
+                                                            &lua_editor_text,
+                                                        ) {
+                                                            Ok(full_path) => {
+                                                                ecs_world.borrow_mut().attach_script(
+                                                                    obj_id,
+                                                                    lua_editor_path.clone(),
+                                                                );
+                                                                script_engine.forget(obj_id);
+                                                                lua_editor_status = format!(
+                                                                    "Attached: {}",
+                                                                    full_path.display()
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                lua_editor_status =
+                                                                    format!("Attach failed: {e}");
+                                                            }
+                                                        }
+                                                    }
+                                                    if ui.button("Use As Camera").clicked() {
+                                                        let mut world = ecs_world.borrow_mut();
+                                                        for camera in world.cameras.values_mut() {
+                                                            camera.active = false;
+                                                        }
+                                                        world
+                                                            .cameras
+                                                            .entry(obj_id)
+                                                            .or_insert_with(CameraComponent::default)
+                                                            .active = true;
+                                                    }
+                                                });
+                                                if let Some(path) = script_path {
+                                                    ui.label(format!(
+                                                        "Script: {path} ({})",
+                                                        ecs_world.borrow().script_status(obj_id)
+                                                    ));
+                                                }
+                                                if let Some(error) = script_error {
+                                                    ui.colored_label(Color32::from_rgb(255, 120, 96), error);
+                                                }
+                                            });
+                                            ui.collapsing("Lua Editor", |ui| {
+                                                let entity_name = main_db
+                                                    .objects
+                                                    .get(&obj_id)
+                                                    .map(|o| o.name.clone())
+                                                    .unwrap_or_else(|| "Entity".to_string());
+                                                ensure_lua_editor_document(
+                                                    obj_id,
+                                                    &entity_name,
+                                                    ecs_world
+                                                        .borrow()
+                                                        .scripts
+                                                        .get(&obj_id)
+                                                        .map(|s| s.path.clone()),
+                                                    &mut lua_editor_entity,
+                                                    &mut lua_editor_path,
+                                                    &mut lua_editor_text,
+                                                    &mut lua_editor_status,
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.label("scripts/");
+                                                    ui.text_edit_singleline(&mut lua_editor_path);
+                                                });
+                                                let mut editor = CodeEditor::default()
+                                                    .id_source(format!("lua_editor_{}", obj_id.0))
+                                                    .with_rows(18)
+                                                    .with_fontsize(13.0)
+                                                    .with_theme(ColorTheme::GRUVBOX)
+                                                    .with_numlines(true)
+                                                    .desired_width(f32::INFINITY);
+                                                editor.show(ui, &mut lua_editor_text, &lua_syntax);
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Save + Reload").clicked() {
+                                                        let clean_path = lua_editor_path
+                                                            .trim()
+                                                            .trim_start_matches('/')
+                                                            .to_string();
+                                                        match write_lua_script(&clean_path, &lua_editor_text) {
+                                                            Ok(_) => {
+                                                                lua_editor_path = clean_path.clone();
+                                                                {
+                                                                    let mut world = ecs_world.borrow_mut();
+                                                                    world.attach_script(obj_id, clean_path.clone());
+                                                                    if let Some(script) = world.scripts.get_mut(&obj_id) {
+                                                                        script.started = false;
+                                                                        script.last_error = None;
+                                                                    }
+                                                                }
+                                                                script_engine.forget(obj_id);
+                                                                lua_editor_status =
+                                                                    format!("Saved: {}", scripts_dir().join(&clean_path).display());
+                                                            }
+                                                            Err(e) => {
+                                                                lua_editor_status = format!("Save failed: {e}");
+                                                            }
+                                                        }
+                                                    }
+                                                    if ui.button("Reload From Disk").clicked() {
+                                                        let full_path =
+                                                            scripts_dir().join(lua_editor_path.trim());
+                                                        match std::fs::read_to_string(&full_path) {
+                                                            Ok(source) => {
+                                                                lua_editor_text = source;
+                                                                lua_editor_status =
+                                                                    format!("Reloaded: {}", full_path.display());
+                                                            }
+                                                            Err(e) => {
+                                                                lua_editor_status = format!("Reload failed: {e}");
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                                if !lua_editor_status.is_empty() {
+                                                    ui.label(&lua_editor_status);
+                                                }
+                                            });
+                                        }
                                         ui.horizontal(|ui| {
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Translate, "Move");
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Rotate, "Rotate");
