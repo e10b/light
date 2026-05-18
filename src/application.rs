@@ -60,7 +60,7 @@ fn sync_ecs_to_runtime(
 ) -> bool {
     let mut geometry_changed = false;
 
-    for (object_id, transform) in &world.transforms {
+    for (object_id, transform) in &world.global_transforms {
         if let Some(obj) = main_db.objects.get_mut(object_id) {
             obj.transform.location = transform.translation;
             obj.transform.rotation = transform.rotation;
@@ -92,12 +92,21 @@ fn sync_ecs_to_runtime(
     }
 
     if let Some((object_id, _)) = world.cameras.iter().find(|(_, camera)| camera.active) {
-        if let Some(transform) = world.transforms.get(object_id) {
+        if let Some(transform) = world.global_transforms.get(object_id) {
             camera.pos = transform.translation;
         }
     }
 
     geometry_changed
+}
+
+fn sync_ecs_visibility_to_main(world: &World, main_db: &mut MainDatabase) {
+    let scene_ids: Vec<Id> = main_db.scenes.keys().copied().collect();
+    for scene_id in scene_ids {
+        for entity in &world.entities {
+            main_db.set_scene_base_visibility(scene_id, entity.id, world.is_visible(entity.id));
+        }
+    }
 }
 
 fn sync_runtime_to_ecs(
@@ -2001,8 +2010,13 @@ pub async fn run() {
                             &camera,
                         );
                         world.integrate_physics(dt);
+                        world.update_global_transforms_and_visibility();
                     }
                     script_engine.update(dt);
+                    ecs_world
+                        .borrow_mut()
+                        .update_global_transforms_and_visibility();
+                    sync_ecs_visibility_to_main(&ecs_world.borrow(), &mut main_db);
                     if sync_ecs_to_runtime(
                         &ecs_world.borrow(),
                         &mut main_db,
@@ -2699,12 +2713,37 @@ pub async fn run() {
                                         ));
                                         if let Some(obj_id) = selected_object_id.filter(|_| has_selection) {
                                             ui.collapsing("Entity", |ui| {
-                                                let (has_mesh, has_camera, has_physics, script_path, script_error) = {
+                                                let (
+                                                    has_mesh,
+                                                    has_camera,
+                                                    has_physics,
+                                                    visible,
+                                                    inherited_visible,
+                                                    view_visible,
+                                                    script_path,
+                                                    script_error,
+                                                ) = {
                                                     let world = ecs_world.borrow();
                                                     (
                                                         world.meshes.contains_key(&obj_id),
                                                         world.cameras.contains_key(&obj_id),
                                                         world.physics.contains_key(&obj_id),
+                                                        world
+                                                            .visibility
+                                                            .get(&obj_id)
+                                                            .copied()
+                                                            .unwrap_or_default()
+                                                            == crate::ecs::Visibility::Visible,
+                                                        world
+                                                            .inherited_visibility
+                                                            .get(&obj_id)
+                                                            .map(|v| v.visible)
+                                                            .unwrap_or(true),
+                                                        world
+                                                            .view_visibility
+                                                            .get(&obj_id)
+                                                            .map(|v| v.visible)
+                                                            .unwrap_or(true),
                                                         world.scripts.get(&obj_id).map(|s| s.path.clone()),
                                                         world
                                                             .scripts
@@ -2713,11 +2752,27 @@ pub async fn run() {
                                                     )
                                                 };
                                                 ui.label(format!(
-                                                    "Components: transform{}{}{}{}",
+                                                    "Components: transform, global transform, visibility{}{}{}{}",
                                                     if has_mesh { ", mesh" } else { "" },
                                                     if has_camera { ", camera" } else { "" },
                                                     if has_physics { ", physics" } else { "" },
                                                     if script_path.is_some() { ", script" } else { "" },
+                                                ));
+                                                let mut visible_edit = visible;
+                                                if ui.checkbox(&mut visible_edit, "Visible").changed() {
+                                                    ecs_world
+                                                        .borrow_mut()
+                                                        .set_visible(obj_id, visible_edit);
+                                                    sync_ecs_visibility_to_main(
+                                                        &ecs_world.borrow(),
+                                                        &mut main_db,
+                                                    );
+                                                    accumulation_dirty = true;
+                                                }
+                                                ui.label(format!(
+                                                    "Inherited: {}  View: {}",
+                                                    if inherited_visible { "visible" } else { "hidden" },
+                                                    if view_visible { "visible" } else { "hidden" },
                                                 ));
                                                 ui.horizontal(|ui| {
                                                     if ui.button("Attach Physics").clicked() {

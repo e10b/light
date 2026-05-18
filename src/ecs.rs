@@ -36,6 +36,73 @@ impl Default for TransformComponent {
 }
 
 #[derive(Clone, Debug)]
+pub struct GlobalTransformComponent {
+    pub translation: Vec3,
+    pub rotation: Quat,
+    pub scale: Vec3,
+}
+
+impl Default for GlobalTransformComponent {
+    fn default() -> Self {
+        Self {
+            translation: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        }
+    }
+}
+
+impl GlobalTransformComponent {
+    fn from_transform(transform: &TransformComponent) -> Self {
+        Self {
+            translation: transform.translation,
+            rotation: transform.rotation,
+            scale: transform.scale,
+        }
+    }
+
+    fn combine(parent: &GlobalTransformComponent, child: &TransformComponent) -> Self {
+        let scaled = Vec3::new(
+            child.translation.x * parent.scale.x,
+            child.translation.y * parent.scale.y,
+            child.translation.z * parent.scale.z,
+        );
+        Self {
+            translation: parent.translation + parent.rotation * scaled,
+            rotation: parent.rotation * child.rotation,
+            scale: parent.scale * child.scale,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    Visible,
+    Hidden,
+}
+
+impl Default for Visibility {
+    fn default() -> Self {
+        Self::Visible
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct InheritedVisibility {
+    pub visible: bool,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ViewVisibility {
+    pub visible: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ParentComponent {
+    pub parent: Id,
+}
+
+#[derive(Clone, Debug)]
 pub struct MeshComponent {
     pub mesh_asset_id: u32,
 }
@@ -100,6 +167,11 @@ pub struct World {
     pub entities: Vec<EntityRecord>,
     pub names: HashMap<Id, NameComponent>,
     pub transforms: HashMap<Id, TransformComponent>,
+    pub global_transforms: HashMap<Id, GlobalTransformComponent>,
+    pub parents: HashMap<Id, ParentComponent>,
+    pub visibility: HashMap<Id, Visibility>,
+    pub inherited_visibility: HashMap<Id, InheritedVisibility>,
+    pub view_visibility: HashMap<Id, ViewVisibility>,
     pub meshes: HashMap<Id, MeshComponent>,
     pub cameras: HashMap<Id, CameraComponent>,
     pub physics: HashMap<Id, PhysicsComponent>,
@@ -130,13 +202,28 @@ impl World {
             self.entities.push(EntityRecord { id });
         }
         self.names.insert(id, NameComponent { name: name.into() });
+        self.global_transforms
+            .insert(id, GlobalTransformComponent::from_transform(&transform));
         self.transforms.insert(id, transform);
+        self.visibility.entry(id).or_insert(Visibility::Visible);
+        self.inherited_visibility
+            .entry(id)
+            .or_insert(InheritedVisibility { visible: true });
+        self.view_visibility
+            .entry(id)
+            .or_insert(ViewVisibility { visible: true });
     }
 
     pub fn despawn(&mut self, id: Id) {
         self.entities.retain(|entity| entity.id != id);
         self.names.remove(&id);
         self.transforms.remove(&id);
+        self.global_transforms.remove(&id);
+        self.parents.remove(&id);
+        self.parents.retain(|_, parent| parent.parent != id);
+        self.visibility.remove(&id);
+        self.inherited_visibility.remove(&id);
+        self.view_visibility.remove(&id);
         self.meshes.remove(&id);
         self.cameras.remove(&id);
         self.physics.remove(&id);
@@ -176,6 +263,41 @@ impl World {
         );
     }
 
+    pub fn set_parent(&mut self, id: Id, parent: Id) {
+        if id != parent && self.entities.iter().any(|entity| entity.id == parent) {
+            self.parents.insert(id, ParentComponent { parent });
+        }
+    }
+
+    pub fn clear_parent(&mut self, id: Id) {
+        self.parents.remove(&id);
+    }
+
+    pub fn set_visible(&mut self, id: Id, visible: bool) {
+        self.visibility.insert(
+            id,
+            if visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            },
+        );
+    }
+
+    pub fn is_visible(&self, id: Id) -> bool {
+        self.visibility.get(&id).copied().unwrap_or_default() == Visibility::Visible
+            && self
+                .inherited_visibility
+                .get(&id)
+                .map(|v| v.visible)
+                .unwrap_or(true)
+            && self
+                .view_visibility
+                .get(&id)
+                .map(|v| v.visible)
+                .unwrap_or(true)
+    }
+
     pub fn script_status(&self, id: Id) -> &'static str {
         match self.scripts.get(&id) {
             Some(script) if !script.enabled => "disabled",
@@ -197,6 +319,66 @@ impl World {
             if let Some(transform) = self.transforms.get_mut(&id) {
                 transform.translation += physics.velocity * dt;
             }
+        }
+    }
+
+    pub fn update_global_transforms_and_visibility(&mut self) {
+        let ids: Vec<Id> = self.entities.iter().map(|entity| entity.id).collect();
+        for id in &ids {
+            let global = self
+                .transforms
+                .get(id)
+                .map(GlobalTransformComponent::from_transform)
+                .unwrap_or_default();
+            self.global_transforms.insert(*id, global);
+            let local_visible = self.visibility.get(id).copied().unwrap_or_default();
+            self.inherited_visibility.insert(
+                *id,
+                InheritedVisibility {
+                    visible: local_visible == Visibility::Visible,
+                },
+            );
+        }
+
+        for _ in 0..ids.len() {
+            for id in &ids {
+                let Some(parent_id) = self.parents.get(id).map(|p| p.parent) else {
+                    continue;
+                };
+                let Some(parent_global) = self.global_transforms.get(&parent_id).cloned() else {
+                    continue;
+                };
+                let Some(local) = self.transforms.get(id) else {
+                    continue;
+                };
+                self.global_transforms.insert(
+                    *id,
+                    GlobalTransformComponent::combine(&parent_global, local),
+                );
+
+                let parent_visible = self
+                    .inherited_visibility
+                    .get(&parent_id)
+                    .map(|v| v.visible)
+                    .unwrap_or(true);
+                let local_visible = self.visibility.get(id).copied().unwrap_or_default();
+                self.inherited_visibility.insert(
+                    *id,
+                    InheritedVisibility {
+                        visible: parent_visible && local_visible == Visibility::Visible,
+                    },
+                );
+            }
+        }
+
+        for id in ids {
+            let inherited = self
+                .inherited_visibility
+                .get(&id)
+                .map(|v| v.visible)
+                .unwrap_or(true);
+            self.view_visibility
+                .insert(id, ViewVisibility { visible: inherited });
         }
     }
 
@@ -306,6 +488,21 @@ impl UserData for LuaEntity {
             let mut world = this.world.borrow_mut();
             let transform = world.transforms.entry(this.id).or_default();
             transform.rotation *= Quat::from_rotation_y(radians);
+            Ok(())
+        });
+        methods.add_method("is_visible", |_, this, ()| {
+            Ok(this.world.borrow().is_visible(this.id))
+        });
+        methods.add_method_mut("set_visible", |_, this, visible: bool| {
+            this.world.borrow_mut().set_visible(this.id, visible);
+            Ok(())
+        });
+        methods.add_method_mut("show", |_, this, ()| {
+            this.world.borrow_mut().set_visible(this.id, true);
+            Ok(())
+        });
+        methods.add_method_mut("hide", |_, this, ()| {
+            this.world.borrow_mut().set_visible(this.id, false);
             Ok(())
         });
         methods.add_method("has_mesh", |_, this, ()| {
