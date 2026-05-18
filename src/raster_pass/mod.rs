@@ -23,7 +23,7 @@ impl RasterPass {
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raster_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/raster.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/raster.wgsl").into()),
         });
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("raster_uniforms"),

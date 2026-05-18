@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::blender_data::{Id, MainDatabase, Transform as DbTransform};
+use crate::scene_data::{Id, MainDatabase, Transform as DbTransform};
 use crate::prism_file::{
     CollectionData as PrismCollectionData, MaterialData as PrismMaterialData,
     MeshData as PrismMeshData, ObjectData as PrismObjectData, ObjectDataLink as PrismObjectDataLink,

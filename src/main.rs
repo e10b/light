@@ -1,4 +1,4 @@
-mod blender_data;
+mod scene_data;
 mod prism_file;
 mod application;
 mod compute_pass;

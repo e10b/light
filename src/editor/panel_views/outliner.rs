@@ -1,4 +1,4 @@
-use crate::blender_data::Id;
+use crate::scene_data::Id;
 
 pub struct OutlinerItem {
     pub object_id: Id,

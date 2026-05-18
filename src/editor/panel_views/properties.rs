@@ -4,7 +4,7 @@ use egui::Color32;
 use egui_code_editor::{CodeEditor, ColorTheme, Syntax};
 
 use crate::{
-    blender_data::{Id, MainDatabase},
+    scene_data::{Id, MainDatabase},
     ecs::{CameraComponent, PhysicsComponent, ScriptEngine, World},
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     prism_file::MaterialData as PrismMaterialData,

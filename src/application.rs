@@ -10,7 +10,7 @@ use wgpu::util::DeviceExt;
 use winit::{event::*, event_loop::EventLoop};
 
 use crate::{
-    blender_data::{Id, MainDatabase, Transform as DbTransform},
+    scene_data::{Id, MainDatabase, Transform as DbTransform},
     compute_pass,
     editor::panels::{
         draw_outliner_panel, draw_properties_panel, CameraProjectionKind, GizmoModeKind,

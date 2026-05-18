@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::blender_data::Id;
+use crate::scene_data::Id;
 use crate::ecs::script_path_for_entity_name;
 
 fn default_lua_script(entity_name: &str) -> String {

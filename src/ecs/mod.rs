@@ -11,7 +11,7 @@ use std::{
 use glam::{Quat, Vec3};
 use mlua::{AnyUserData, Lua, Table, UserData, UserDataMethods, Value};
 
-use crate::blender_data::Id;
+use crate::scene_data::Id;
 
 #[derive(Clone, Debug)]
 pub struct NameComponent {
