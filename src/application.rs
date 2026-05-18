@@ -41,6 +41,73 @@ fn db_transform_to_ecs(transform: &DbTransform) -> TransformComponent {
     }
 }
 
+fn make_prism_mesh(center: glam::Vec3, radius: f32, height: f32) -> MeshData {
+    let half_h = height * 0.5;
+    let angles = [
+        0.0f32,
+        std::f32::consts::TAU / 3.0,
+        2.0 * std::f32::consts::TAU / 3.0,
+    ];
+    let mut vertices = Vec::new();
+    let mut positions4 = Vec::new();
+
+    for angle in angles {
+        let x = angle.cos() * radius;
+        let z = angle.sin() * radius;
+        let p = center + glam::Vec3::new(x, -half_h, z);
+        vertices.push(Vertex {
+            position: p.to_array(),
+        });
+        positions4.push([p.x, p.y, p.z, 0.0]);
+    }
+    for angle in angles {
+        let x = angle.cos() * radius;
+        let z = angle.sin() * radius;
+        let p = center + glam::Vec3::new(x, half_h, z);
+        vertices.push(Vertex {
+            position: p.to_array(),
+        });
+        positions4.push([p.x, p.y, p.z, 0.0]);
+    }
+
+    let indices: Vec<u32> = vec![
+        0, 2, 1, // bottom
+        3, 4, 5, // top
+        0, 1, 4, 0, 4, 3, // side 0-1
+        1, 2, 5, 1, 5, 4, // side 1-2
+        2, 0, 3, 2, 3, 5, // side 2-0
+    ];
+
+    let mut normals = vec![glam::Vec3::ZERO; vertices.len()];
+    for tri in indices.chunks_exact(3) {
+        let p0 = glam::Vec3::from(vertices[tri[0] as usize].position);
+        let p1 = glam::Vec3::from(vertices[tri[1] as usize].position);
+        let p2 = glam::Vec3::from(vertices[tri[2] as usize].position);
+        let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+        for idx in tri {
+            normals[*idx as usize] += n;
+        }
+    }
+
+    MeshData {
+        vertices,
+        indices,
+        positions4,
+        normals4: normals
+            .into_iter()
+            .map(|n| {
+                let n = n.normalize_or_zero();
+                [n.x, n.y, n.z, 0.0]
+            })
+            .collect(),
+        triangle_material_ids: vec![0; 8],
+        materials: vec![crate::mesh::GpuMaterial {
+            base_color: [0.98, 1.0, 1.0, 1.0],
+            params: [0.0, 0.015, 1.0, 1.52],
+        }],
+    }
+}
+
 fn register_object_entity(world: &mut World, main_db: &MainDatabase, object_id: Id) {
     if let Some(obj) = main_db.objects.get(&object_id) {
         world.register_existing(
@@ -1857,6 +1924,49 @@ pub async fn run() {
                                                         );
                                                         object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
                                                         object_material_names.insert(obj_id, "Glass".to_string());
+                                                        mesh_instances.push(inst);
+                                                        model_idx = mesh.indices.clone();
+                                                        selected_object_id = Some(obj_id);
+                                                        gizmo_target = GizmoTargetKind::Decanter;
+                                                        has_selection = true;
+                                                        gpu_mesh_dirty = true;
+                                                        geometry_dirty = true;
+                                                        accumulation_dirty = true;
+                                                        suppress_scene_click = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Prism (Glass)").clicked() {
+                                                        let count = main_db
+                                                            .objects
+                                                            .values()
+                                                            .filter(|o| o.name.starts_with("Prism"))
+                                                            .count()
+                                                            + 1;
+                                                        let prism_center = active_center
+                                                            + glam::Vec3::new(count as f32 * 4.0, 1.0, -2.0);
+                                                        let prism_mesh = make_prism_mesh(glam::Vec3::ZERO, 1.25, 3.2);
+                                                        let mesh_id = main_db.create_mesh(
+                                                            format!("PrismMesh{count}"),
+                                                            prism_mesh.vertices.len(),
+                                                        );
+                                                        let obj_id = main_db.create_object(
+                                                            format!("Prism {count}"),
+                                                            Some(mesh_id),
+                                                            DbTransform::default(),
+                                                        );
+                                                        let mut inst =
+                                                            append_object_mesh(&mut mesh, prism_mesh, obj_id, 5);
+                                                        place_instance_center(&mut inst, prism_center);
+                                                        main_db.collection_link_object(decanter_master, obj_id);
+                                                        main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                        register_object_entity(
+                                                            &mut ecs_world.borrow_mut(),
+                                                            &main_db,
+                                                            obj_id,
+                                                        );
+                                                        object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
+                                                        object_material_names
+                                                            .insert(obj_id, "Glass".to_string());
                                                         mesh_instances.push(inst);
                                                         model_idx = mesh.indices.clone();
                                                         selected_object_id = Some(obj_id);
