@@ -11,16 +11,15 @@ use winit::{event::*, event_loop::EventLoop};
 use crate::{
     blender_data::{Id, MainDatabase, Transform as DbTransform},
     compute_pass,
-    mesh::{load_gltf_mesh, MeshData, Vertex},
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
+    mesh::{load_gltf_mesh, MeshData, Vertex},
+    photon_mapper::PhotonMapper,
     prism_file::{
         load_prism_database, save_prism_file, CollectionData as PrismCollectionData,
-        MaterialData as PrismMaterialData,
-        MeshData as PrismMeshData, NodeProperties, NodeType, ObjectData as PrismObjectData,
-        ObjectDataLink as PrismObjectDataLink, PrismDatabase, SceneData as PrismSceneData,
-        ShaderNode,
+        MaterialData as PrismMaterialData, MeshData as PrismMeshData, NodeProperties, NodeType,
+        ObjectData as PrismObjectData, ObjectDataLink as PrismObjectDataLink, PrismDatabase,
+        SceneData as PrismSceneData, ShaderNode,
     },
-    photon_mapper::PhotonMapper,
     quad_pass,
     scene::SceneKind,
     window::create_window,
@@ -84,6 +83,30 @@ enum GizmoTargetKind {
     WineSpotlight,
 }
 
+#[derive(Clone)]
+struct MeshObjectInstance {
+    object_id: Id,
+    vertex_start: usize,
+    vertex_count: usize,
+    index_start: usize,
+    index_count: usize,
+    material_start: usize,
+    material_count: usize,
+    base_positions: Vec<glam::Vec3>,
+    base_normals: Vec<glam::Vec3>,
+    pivot: glam::Vec3,
+    max_extent: f32,
+    rotation: glam::Quat,
+    translation: glam::Vec3,
+    scale: glam::Vec3,
+}
+
+impl MeshObjectInstance {
+    fn center(&self) -> glam::Vec3 {
+        self.pivot + self.translation
+    }
+}
+
 fn default_target_for_scene(scene_kind: SceneKind) -> GizmoTargetKind {
     match scene_kind {
         SceneKind::Decanter => GizmoTargetKind::Decanter,
@@ -102,7 +125,10 @@ fn target_allowed_in_scene(scene_kind: SceneKind, target: GizmoTargetKind) -> bo
                 | GizmoTargetKind::CornellBox
                 | GizmoTargetKind::SunLamp
         ),
-        SceneKind::Wine => matches!(target, GizmoTargetKind::WineGlass | GizmoTargetKind::WineSpotlight),
+        SceneKind::Wine => matches!(
+            target,
+            GizmoTargetKind::WineGlass | GizmoTargetKind::WineSpotlight
+        ),
         SceneKind::CornellBox => matches!(target, GizmoTargetKind::CornellBox),
     }
 }
@@ -417,14 +443,179 @@ fn append_mesh(base: &mut MeshData, extra: MeshData) {
     base.materials.extend(extra.materials);
 }
 
+fn make_cube_mesh(center: glam::Vec3, half_extent: f32) -> MeshData {
+    let corners = [
+        [-1.0, -1.0, -1.0],
+        [1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [1.0, -1.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+    ];
+    let indices: Vec<u32> = vec![
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6, 5,
+        3, 0, 4, 3, 4, 7,
+    ];
+    let mut vertices = Vec::new();
+    let mut positions4 = Vec::new();
+    for c in corners {
+        let p = center + glam::Vec3::new(c[0], c[1], c[2]) * half_extent;
+        vertices.push(Vertex {
+            position: p.to_array(),
+        });
+        positions4.push([p.x, p.y, p.z, 0.0]);
+    }
+    let mut normals = vec![glam::Vec3::ZERO; vertices.len()];
+    for tri in indices.chunks_exact(3) {
+        let p0 = glam::Vec3::from(vertices[tri[0] as usize].position);
+        let p1 = glam::Vec3::from(vertices[tri[1] as usize].position);
+        let p2 = glam::Vec3::from(vertices[tri[2] as usize].position);
+        let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+        for idx in tri {
+            normals[*idx as usize] += n;
+        }
+    }
+    MeshData {
+        vertices,
+        indices,
+        positions4,
+        normals4: normals
+            .into_iter()
+            .map(|n| {
+                let n = n.normalize_or_zero();
+                [n.x, n.y, n.z, 0.0]
+            })
+            .collect(),
+        triangle_material_ids: vec![0; 12],
+        materials: vec![crate::mesh::GpuMaterial {
+            base_color: [0.98, 1.0, 1.0, 1.0],
+            params: [0.0, 0.02, 1.0, 1.52],
+        }],
+    }
+}
+
+fn append_object_mesh(
+    combined: &mut MeshData,
+    extra: MeshData,
+    object_id: Id,
+) -> MeshObjectInstance {
+    let (pivot, size, _, _) = mesh_bounds(&extra.vertices);
+    let vertex_start = combined.positions4.len();
+    let vertex_count = extra.positions4.len();
+    let index_start = combined.indices.len();
+    let index_count = extra.indices.len();
+    let material_start = combined.materials.len();
+    let material_count = extra.materials.len();
+    let base_positions: Vec<glam::Vec3> = extra
+        .positions4
+        .iter()
+        .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
+        .collect();
+    let base_normals: Vec<glam::Vec3> = extra
+        .normals4
+        .iter()
+        .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
+        .collect();
+    append_mesh(combined, extra);
+    MeshObjectInstance {
+        object_id,
+        vertex_start,
+        vertex_count,
+        index_start,
+        index_count,
+        material_start,
+        material_count,
+        base_positions,
+        base_normals,
+        pivot,
+        max_extent: size.max_element().max(0.1),
+        rotation: glam::Quat::IDENTITY,
+        translation: glam::Vec3::ZERO,
+        scale: glam::Vec3::ONE,
+    }
+}
+
+fn visible_render_geometry(
+    mesh: &MeshData,
+    instances: &[MeshObjectInstance],
+    visible_ids: &[Id],
+) -> (Vec<Vertex>, Vec<u32>, Vec<[f32; 4]>, Vec<[f32; 4]>, Vec<u32>) {
+    let mut verts = Vec::new();
+    let mut indices = Vec::new();
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut triangle_material_ids = Vec::new();
+
+    for inst in instances {
+        if !visible_ids.contains(&inst.object_id) {
+            continue;
+        }
+        let vertex_offset = verts.len() as u32;
+        let vertex_end = inst.vertex_start + inst.vertex_count;
+        positions.extend_from_slice(&mesh.positions4[inst.vertex_start..vertex_end]);
+        normals.extend_from_slice(&mesh.normals4[inst.vertex_start..vertex_end]);
+        verts.extend(
+            mesh.positions4[inst.vertex_start..vertex_end]
+                .iter()
+                .map(|p| Vertex {
+                    position: [p[0], p[1], p[2]],
+                }),
+        );
+
+        let index_end = inst.index_start + inst.index_count;
+        indices.extend(
+            mesh.indices[inst.index_start..index_end]
+                .iter()
+                .map(|index| index - inst.vertex_start as u32 + vertex_offset),
+        );
+
+        let tri_start = inst.index_start / 3;
+        let tri_count = inst.index_count / 3;
+        let tri_end = tri_start + tri_count;
+        triangle_material_ids.extend_from_slice(&mesh.triangle_material_ids[tri_start..tri_end]);
+    }
+
+    if verts.is_empty() {
+        verts = vec![
+            Vertex {
+                position: [1.0e6, 1.0e6, 1.0e6],
+            },
+            Vertex {
+                position: [1.0e6 + 1.0, 1.0e6, 1.0e6],
+            },
+            Vertex {
+                position: [1.0e6, 1.0e6 + 1.0, 1.0e6],
+            },
+        ];
+        indices = vec![0, 1, 2];
+        positions = verts
+            .iter()
+            .map(|v| [v.position[0], v.position[1], v.position[2], 0.0])
+            .collect();
+        normals = vec![[0.0, 1.0, 0.0, 0.0]; 3];
+        triangle_material_ids = vec![0];
+    }
+
+    (verts, indices, positions, normals, triangle_material_ids)
+}
+
 fn sphere_position_for(center: glam::Vec3, size: glam::Vec3, radius: f32) -> glam::Vec3 {
     glam::Vec3::new(center.x + size.x * 0.6 + 2.0, -1.5 + radius, center.z)
 }
 
-fn scene_camera(scene_kind: SceneKind, center: glam::Vec3, size: glam::Vec3) -> (glam::Vec3, glam::Vec3) {
+fn scene_camera(
+    scene_kind: SceneKind,
+    center: glam::Vec3,
+    size: glam::Vec3,
+) -> (glam::Vec3, glam::Vec3) {
     if scene_kind == SceneKind::Wine {
         let distance = size.max_element().max(12.0) * 1.35;
-        return (center + glam::Vec3::new(0.0, size.y * 0.2, distance), center);
+        return (
+            center + glam::Vec3::new(0.0, size.y * 0.2, distance),
+            center,
+        );
     }
     scene_kind.default_camera(center)
 }
@@ -480,7 +671,12 @@ fn world_to_screen(
     Some([x, y])
 }
 
-fn intersect_sphere(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, radius: f32) -> Option<f32> {
+fn intersect_sphere(
+    origin: glam::Vec3,
+    dir: glam::Vec3,
+    center: glam::Vec3,
+    radius: f32,
+) -> Option<f32> {
     let oc = origin - center;
     let a = dir.dot(dir);
     let b = oc.dot(dir);
@@ -501,13 +697,30 @@ fn intersect_sphere(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, rad
     }
 }
 
-fn intersect_cube(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, half_extent: glam::Vec3) -> Option<f32> {
+fn intersect_cube(
+    origin: glam::Vec3,
+    dir: glam::Vec3,
+    center: glam::Vec3,
+    half_extent: glam::Vec3,
+) -> Option<f32> {
     let min = center - half_extent;
     let max = center + half_extent;
     let inv = glam::Vec3::new(
-        if dir.x.abs() > 1e-6 { 1.0 / dir.x } else { f32::INFINITY },
-        if dir.y.abs() > 1e-6 { 1.0 / dir.y } else { f32::INFINITY },
-        if dir.z.abs() > 1e-6 { 1.0 / dir.z } else { f32::INFINITY },
+        if dir.x.abs() > 1e-6 {
+            1.0 / dir.x
+        } else {
+            f32::INFINITY
+        },
+        if dir.y.abs() > 1e-6 {
+            1.0 / dir.y
+        } else {
+            f32::INFINITY
+        },
+        if dir.z.abs() > 1e-6 {
+            1.0 / dir.z
+        } else {
+            f32::INFINITY
+        },
     );
     let t0 = (min - origin) * inv;
     let t1 = (max - origin) * inv;
@@ -606,6 +819,8 @@ pub async fn run() {
     let decanter_material_count = mesh.materials.len();
     let decanter_vertex_start = 0usize;
     let decanter_vertex_count = mesh.positions4.len();
+    let decanter_index_start = 0usize;
+    let decanter_index_count = mesh.indices.len();
     let decanter_base_positions: Vec<glam::Vec3> = mesh
         .positions4
         .iter()
@@ -635,22 +850,24 @@ pub async fn run() {
     let (wine_center, wine_size, _, _) = mesh_bounds(&wine_mesh.vertices);
     let wine_vertex_start = mesh.positions4.len();
     let wine_vertex_count = wine_mesh.positions4.len();
+    let wine_index_start = mesh.indices.len();
+    let wine_index_count = wine_mesh.indices.len();
     append_mesh(&mut mesh, wine_mesh);
     let wine_material_start = decanter_material_start + decanter_material_count;
     let wine_material_count = mesh.materials.len().saturating_sub(wine_material_start);
-    let wine_base_positions: Vec<glam::Vec3> =
-        mesh.positions4[wine_vertex_start..wine_vertex_start + wine_vertex_count]
-            .iter()
-            .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
-            .collect();
-    let wine_base_normals: Vec<glam::Vec3> =
-        mesh.normals4[wine_vertex_start..wine_vertex_start + wine_vertex_count]
-            .iter()
-            .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
-            .collect();
+    let wine_base_positions: Vec<glam::Vec3> = mesh.positions4
+        [wine_vertex_start..wine_vertex_start + wine_vertex_count]
+        .iter()
+        .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
+        .collect();
+    let wine_base_normals: Vec<glam::Vec3> = mesh.normals4
+        [wine_vertex_start..wine_vertex_start + wine_vertex_count]
+        .iter()
+        .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
+        .collect();
 
     let mut model_verts = mesh.vertices.clone();
-    let model_idx = mesh.indices.clone();
+    let mut model_idx = mesh.indices.clone();
 
     println!(
         "Loaded {} vertices and {} indices from decanter + wine",
@@ -671,9 +888,12 @@ pub async fn run() {
     let sphere_obj_id = main_db.create_object("Cube", None, DbTransform::default());
     let sun_obj_id = main_db.create_object("SunLamp", None, DbTransform::default());
     let spot_obj_id = main_db.create_object("Spotlight", None, DbTransform::default());
-    let decanter_obj_id = main_db.create_object("Decanter", Some(decanter_mesh_id), DbTransform::default());
-    let wine_obj_id = main_db.create_object("WineGlass", Some(wine_mesh_id), DbTransform::default());
-    let cornell_obj_id = main_db.create_object("CornellBox", Some(cornell_mesh_id), DbTransform::default());
+    let decanter_obj_id =
+        main_db.create_object("Decanter", Some(decanter_mesh_id), DbTransform::default());
+    let wine_obj_id =
+        main_db.create_object("WineGlass", Some(wine_mesh_id), DbTransform::default());
+    let cornell_obj_id =
+        main_db.create_object("CornellBox", Some(cornell_mesh_id), DbTransform::default());
     let mut material_library: std::collections::HashMap<String, PrismMaterialData> =
         std::collections::HashMap::new();
     material_library.insert("White".to_string(), make_white_material());
@@ -685,6 +905,40 @@ pub async fn run() {
     object_material_names.insert(wine_obj_id, "Glass".to_string());
     object_material_names.insert(cornell_obj_id, "White".to_string());
     let mut last_material_signature = String::new();
+    let mut mesh_instances = vec![
+        MeshObjectInstance {
+            object_id: decanter_obj_id,
+            vertex_start: decanter_vertex_start,
+            vertex_count: decanter_vertex_count,
+            index_start: decanter_index_start,
+            index_count: decanter_index_count,
+            material_start: decanter_material_start,
+            material_count: decanter_material_count,
+            base_positions: decanter_base_positions.clone(),
+            base_normals: decanter_base_normals.clone(),
+            pivot: decanter_center,
+            max_extent: decanter_max_extent,
+            rotation: glam::Quat::IDENTITY,
+            translation: glam::Vec3::ZERO,
+            scale: glam::Vec3::ONE,
+        },
+        MeshObjectInstance {
+            object_id: wine_obj_id,
+            vertex_start: wine_vertex_start,
+            vertex_count: wine_vertex_count,
+            index_start: wine_index_start,
+            index_count: wine_index_count,
+            material_start: wine_material_start,
+            material_count: wine_material_count,
+            base_positions: wine_base_positions.clone(),
+            base_normals: wine_base_normals.clone(),
+            pivot: wine_center,
+            max_extent: wine_max_extent,
+            rotation: glam::Quat::IDENTITY,
+            translation: glam::Vec3::ZERO,
+            scale: glam::Vec3::ONE,
+        },
+    ];
 
     let mut object_target_by_id: std::collections::HashMap<Id, GizmoTargetKind> =
         std::collections::HashMap::new();
@@ -710,52 +964,52 @@ pub async fn run() {
         decanter_center, wine_center, center, size
     );
 
-    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let mut vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("model_vbuf"),
         contents: bytemuck::cast_slice(&model_verts),
         usage: wgpu::BufferUsages::VERTEX
             | wgpu::BufferUsages::BLAS_INPUT
             | wgpu::BufferUsages::COPY_DST,
     });
-    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let mut ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("model_ibuf"),
         contents: bytemuck::cast_slice(&model_idx),
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::BLAS_INPUT,
     });
-    let pos_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let mut pos_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_pos_buf"),
         contents: bytemuck::cast_slice(&mesh.positions4),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    let nrm_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let mut nrm_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_nrm_buf"),
         contents: bytemuck::cast_slice(&mesh.normals4),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    let idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let mut idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_idx_buf"),
         contents: bytemuck::cast_slice(&model_idx),
         usage: wgpu::BufferUsages::STORAGE,
     });
-    let tri_mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let mut tri_mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_tri_mat_buf"),
         contents: bytemuck::cast_slice(&mesh.triangle_material_ids),
         usage: wgpu::BufferUsages::STORAGE,
     });
-    let mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let mut mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_materials_buf"),
         contents: bytemuck::cast_slice(&mesh.materials),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
 
-    let model_blas_desc = wgpu::BlasTriangleGeometrySizeDescriptor {
+    let mut model_blas_desc = wgpu::BlasTriangleGeometrySizeDescriptor {
         vertex_format: wgpu::VertexFormat::Float32x3,
         vertex_count: model_verts.len() as u32,
         index_format: Some(wgpu::IndexFormat::Uint32),
         index_count: Some(model_idx.len() as u32),
         flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
     };
-    let model_blas = device.create_blas(
+    let mut model_blas = device.create_blas(
         &wgpu::CreateBlasDescriptor {
             label: Some("model_blas"),
             flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
@@ -822,8 +1076,18 @@ pub async fn run() {
         sphere_params: [0.02, 1.52, 1.0, 0.0],
         sphere_rot: [0.0, 0.0, 0.0, 1.0],
         sphere_extent: [sphere_radius, sphere_radius, sphere_radius, 0.0],
-        mesh_center: [wine_center.x, wine_center.y, wine_center.z, wine_max_extent * 0.8],
-        decanter_center: [decanter_center.x, decanter_center.y, decanter_center.z, decanter_max_extent * 0.7],
+        mesh_center: [
+            wine_center.x,
+            wine_center.y,
+            wine_center.z,
+            wine_max_extent * 0.8,
+        ],
+        decanter_center: [
+            decanter_center.x,
+            decanter_center.y,
+            decanter_center.z,
+            decanter_max_extent * 0.7,
+        ],
         cornell_center: [0.0, 0.5, -1.0, 1.0],
         cornell_color: [1.0, 1.0, 1.0, 0.0],
         cornell_params: [0.7, 1.0, 0.0, 0.0],
@@ -1041,7 +1305,7 @@ pub async fn run() {
         &mat_buf,
     );
 
-    let ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let mut ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("ugroup"),
         layout: &ubind,
         entries: &[
@@ -1129,6 +1393,7 @@ pub async fn run() {
     let mut show_editor_ui = true;
     let mut gizmo_mode = GizmoModeKind::Translate;
     let mut gizmo_target = default_target_for_scene(scene_kind);
+    let mut selected_object_id = Some(decanter_obj_id);
     let mut has_selection = true;
     let mut sphere_rotation = glam::Quat::IDENTITY;
     let mut sphere_scale = glam::Vec3::ONE;
@@ -1142,6 +1407,7 @@ pub async fn run() {
     let mut wine_translation = glam::Vec3::ZERO;
     let mut wine_scale = glam::Vec3::ONE;
     let mut geometry_dirty = false;
+    let mut gpu_mesh_dirty = false;
     let mut project_status = String::new();
     let mut mouse_pos = [0.0f32, 0.0f32];
     let mut mouse_left_down = false;
@@ -1385,6 +1651,7 @@ pub async fn run() {
                             let mut sphere_visible_for_photons = false;
                             let full_output = egui_ctx.run(raw_input, |ctx| {
                                 let mut requested_scene = scene_kind;
+                                let mut suppress_scene_click = false;
                                 let current_scene_exists = match scene_kind {
                                     SceneKind::Decanter => decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id),
                                     SceneKind::Wine => wine_scene_id.0 != 0 && main_db.scenes.contains_key(&wine_scene_id),
@@ -1411,28 +1678,199 @@ pub async fn run() {
                                             match scene_kind {
                                                 SceneKind::Decanter => {
                                                     if ui.button("Cube").clicked() {
-                                                        main_db.collection_link_object(decanter_master, sphere_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        let count = main_db
+                                                            .objects
+                                                            .values()
+                                                            .filter(|o| o.name.starts_with("Cube"))
+                                                            .count()
+                                                            + 1;
+                                                        let cube_center = active_center
+                                                            + glam::Vec3::new(count as f32 * 4.0, 0.5, 0.0);
+                                                        let cube_mesh = make_cube_mesh(cube_center, 1.5);
+                                                        let mesh_id = main_db.create_mesh("CubeMesh", cube_mesh.vertices.len());
+                                                        let obj_id = main_db.create_object(
+                                                            format!("Cube {count}"),
+                                                            Some(mesh_id),
+                                                            DbTransform::default(),
+                                                        );
+                                                        let inst = append_object_mesh(&mut mesh, cube_mesh, obj_id);
+                                                        main_db.collection_link_object(decanter_master, obj_id);
+                                                        main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                        object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
+                                                        object_material_names.insert(obj_id, "Glass".to_string());
+                                                        mesh_instances.push(inst);
+                                                        model_idx = mesh.indices.clone();
+                                                        selected_object_id = Some(obj_id);
+                                                        gizmo_target = GizmoTargetKind::Decanter;
+                                                        has_selection = true;
+                                                        gpu_mesh_dirty = true;
+                                                        geometry_dirty = true;
+                                                        accumulation_dirty = true;
+                                                        suppress_scene_click = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Sun Lamp").clicked() {
                                                         main_db.collection_link_object(decanter_master, sun_obj_id);
                                                         main_db.ensure_scene_base(scene_id, sun_obj_id, true, true);
+                                                        suppress_scene_click = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Decanter").clicked() {
-                                                        main_db.collection_link_object(decanter_master, decanter_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, decanter_obj_id, true, true);
+                                                        let count = main_db
+                                                            .objects
+                                                            .values()
+                                                            .filter(|o| o.name.starts_with("Decanter"))
+                                                            .count()
+                                                            + 1;
+                                                        match load_gltf_mesh(decanter_path) {
+                                                            Ok(mut new_mesh) => {
+                                                                translate_mesh(
+                                                                    &mut new_mesh,
+                                                                    glam::Vec3::new(count as f32 * 8.0, 0.0, 0.0),
+                                                                );
+                                                                let mesh_id = main_db.create_mesh(
+                                                                    "DecanterMesh",
+                                                                    new_mesh.vertices.len(),
+                                                                );
+                                                                let obj_id = main_db.create_object(
+                                                                    format!("Decanter {count}"),
+                                                                    Some(mesh_id),
+                                                                    DbTransform::default(),
+                                                                );
+                                                                let inst = append_object_mesh(&mut mesh, new_mesh, obj_id);
+                                                                main_db.collection_link_object(decanter_master, obj_id);
+                                                                main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                                object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
+                                                                object_material_names.insert(obj_id, "Glass".to_string());
+                                                                mesh_instances.push(inst);
+                                                                model_idx = mesh.indices.clone();
+                                                                selected_object_id = Some(obj_id);
+                                                                gizmo_target = GizmoTargetKind::Decanter;
+                                                                has_selection = true;
+                                                                gpu_mesh_dirty = true;
+                                                                geometry_dirty = true;
+                                                                accumulation_dirty = true;
+                                                            }
+                                                            Err(e) => project_status = format!("Add decanter failed: {e}"),
+                                                        }
+                                                        suppress_scene_click = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Wine Glass").clicked() {
-                                                        main_db.collection_link_object(decanter_master, wine_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, wine_obj_id, true, true);
+                                                        let count = main_db
+                                                            .objects
+                                                            .values()
+                                                            .filter(|o| o.name.starts_with("Wine Glass"))
+                                                            .count()
+                                                            + 1;
+                                                        match load_gltf_mesh(wine_path) {
+                                                            Ok(mut new_mesh) => {
+                                                                let (c0, _, _, _) = mesh_bounds(&new_mesh.vertices);
+                                                                orient_and_scale_mesh(
+                                                                    &mut new_mesh,
+                                                                    c0,
+                                                                    glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                                                                    25.0,
+                                                                );
+                                                                translate_mesh(
+                                                                    &mut new_mesh,
+                                                                    wine_center - c0 + glam::Vec3::new(count as f32 * 8.0, 0.0, 0.0),
+                                                                );
+                                                                let mesh_id = main_db.create_mesh(
+                                                                    "WineGlassMesh",
+                                                                    new_mesh.vertices.len(),
+                                                                );
+                                                                let obj_id = main_db.create_object(
+                                                                    format!("Wine Glass {count}"),
+                                                                    Some(mesh_id),
+                                                                    DbTransform::default(),
+                                                                );
+                                                                let inst = append_object_mesh(&mut mesh, new_mesh, obj_id);
+                                                                main_db.collection_link_object(decanter_master, obj_id);
+                                                                main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                                object_target_by_id.insert(obj_id, GizmoTargetKind::WineGlass);
+                                                                object_material_names.insert(obj_id, "Glass".to_string());
+                                                                mesh_instances.push(inst);
+                                                                model_idx = mesh.indices.clone();
+                                                                selected_object_id = Some(obj_id);
+                                                                gizmo_target = GizmoTargetKind::WineGlass;
+                                                                has_selection = true;
+                                                                gpu_mesh_dirty = true;
+                                                                geometry_dirty = true;
+                                                                accumulation_dirty = true;
+                                                            }
+                                                            Err(e) => project_status = format!("Add wine glass failed: {e}"),
+                                                        }
+                                                        suppress_scene_click = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Import GLB...").clicked() {
+                                                        if let Some(path) = rfd::FileDialog::new()
+                                                            .add_filter("glTF Binary", &["glb"])
+                                                            .pick_file()
+                                                        {
+                                                            match load_gltf_mesh(&path) {
+                                                                Ok(mut imported) => {
+                                                                    let (c0, size0, _, _) = mesh_bounds(&imported.vertices);
+                                                                    let fit = 8.0 / size0.max_element().max(0.001);
+                                                                    orient_and_scale_mesh(
+                                                                        &mut imported,
+                                                                        c0,
+                                                                        glam::Quat::IDENTITY,
+                                                                        fit,
+                                                                    );
+                                                                    let (c1, _, _, _) = mesh_bounds(&imported.vertices);
+                                                                    let offset_index = mesh_instances.len() as f32;
+                                                                    translate_mesh(
+                                                                        &mut imported,
+                                                                        active_center
+                                                                            + glam::Vec3::new(offset_index * 4.0, 0.0, 0.0)
+                                                                            - c1,
+                                                                    );
+                                                                    let stem = path
+                                                                        .file_stem()
+                                                                        .and_then(|s| s.to_str())
+                                                                        .unwrap_or("Imported");
+                                                                    let mesh_id = main_db.create_mesh(
+                                                                        format!("{stem}Mesh"),
+                                                                        imported.vertices.len(),
+                                                                    );
+                                                                    let obj_id = main_db.create_object(
+                                                                        stem.to_string(),
+                                                                        Some(mesh_id),
+                                                                        DbTransform::default(),
+                                                                    );
+                                                                    let inst = append_object_mesh(&mut mesh, imported, obj_id);
+                                                                    main_db.collection_link_object(decanter_master, obj_id);
+                                                                    main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                                    object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
+                                                                    object_material_names.insert(obj_id, "Glass".to_string());
+                                                                    mesh_instances.push(inst);
+                                                                    model_idx = mesh.indices.clone();
+                                                                    selected_object_id = Some(obj_id);
+                                                                    gizmo_target = GizmoTargetKind::Decanter;
+                                                                    has_selection = true;
+                                                                    gpu_mesh_dirty = true;
+                                                                    geometry_dirty = true;
+                                                                    accumulation_dirty = true;
+                                                                    project_status =
+                                                                        format!("Imported: {}", path.display());
+                                                                }
+                                                                Err(e) => {
+                                                                    project_status = format!(
+                                                                        "Import failed ({}): {e}",
+                                                                        path.display()
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        suppress_scene_click = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Cornell Box").clicked() {
                                                         main_db.collection_link_object(decanter_master, cornell_obj_id);
                                                         main_db.ensure_scene_base(scene_id, cornell_obj_id, true, true);
+                                                        suppress_scene_click = true;
                                                         ui.close();
                                                     }
                                                 }
@@ -1440,11 +1878,13 @@ pub async fn run() {
                                                     if ui.button("Wine Glass").clicked() {
                                                         main_db.collection_link_object(wine_master, wine_obj_id);
                                                         main_db.ensure_scene_base(scene_id, wine_obj_id, true, true);
+                                                        suppress_scene_click = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Spotlight").clicked() {
                                                         main_db.collection_link_object(wine_master, spot_obj_id);
                                                         main_db.ensure_scene_base(scene_id, spot_obj_id, true, true);
+                                                        suppress_scene_click = true;
                                                         ui.close();
                                                     }
                                                 }
@@ -1452,11 +1892,13 @@ pub async fn run() {
                                                     if ui.button("Cornell Box").clicked() {
                                                         main_db.collection_link_object(cornell_master, cornell_obj_id);
                                                         main_db.ensure_scene_base(scene_id, cornell_obj_id, true, true);
+                                                        suppress_scene_click = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Cube").clicked() {
                                                         main_db.collection_link_object(cornell_master, sphere_obj_id);
                                                         main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        suppress_scene_click = true;
                                                         ui.close();
                                                     }
                                                 }
@@ -1641,8 +2083,9 @@ pub async fn run() {
                                                     continue;
                                                 }
                                                 let label = main_db.objects.get(&object_id).map(|o| o.name.as_str()).unwrap_or("Object");
-                                                if ui.selectable_label(has_selection && gizmo_target == target, label).clicked() {
+                                                if ui.selectable_label(has_selection && selected_object_id == Some(object_id), label).clicked() {
                                                     gizmo_target = target;
+                                                    selected_object_id = Some(object_id);
                                                     has_selection = true;
                                                 }
                                             }
@@ -1681,8 +2124,22 @@ pub async fn run() {
                                         ui.separator();
                                         if !target_allowed_in_scene(scene_kind, gizmo_target) {
                                             gizmo_target = default_target_for_scene(scene_kind);
+                                            selected_object_id = match gizmo_target {
+                                                GizmoTargetKind::Sphere => Some(sphere_obj_id),
+                                                GizmoTargetKind::Decanter => Some(decanter_obj_id),
+                                                GizmoTargetKind::WineGlass => Some(wine_obj_id),
+                                                GizmoTargetKind::CornellBox => Some(cornell_obj_id),
+                                                GizmoTargetKind::SunLamp => Some(sun_obj_id),
+                                                GizmoTargetKind::WineSpotlight => Some(spot_obj_id),
+                                            };
                                         }
-                                        ui.label(format!("Selected: {}", if has_selection { target_label(gizmo_target) } else { "None" }));
+                                        let selected_label = selected_object_id
+                                            .and_then(|id| main_db.objects.get(&id).map(|o| o.name.clone()))
+                                            .unwrap_or_else(|| "None".to_string());
+                                        ui.label(format!(
+                                            "Selected: {}",
+                                            if has_selection { selected_label.as_str() } else { "None" }
+                                        ));
                                         ui.horizontal(|ui| {
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Translate, "Move");
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Rotate, "Rotate");
@@ -1710,19 +2167,8 @@ pub async fn run() {
                                         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                                             ui.separator();
                                             ui.collapsing("Shader Graph", |ui| {
-                                                let selected_object_id = if has_selection {
-                                                    match gizmo_target {
-                                                        GizmoTargetKind::Sphere => Some(sphere_obj_id),
-                                                        GizmoTargetKind::Decanter => Some(decanter_obj_id),
-                                                        GizmoTargetKind::WineGlass => Some(wine_obj_id),
-                                                        GizmoTargetKind::CornellBox => Some(cornell_obj_id),
-                                                        GizmoTargetKind::SunLamp => Some(sun_obj_id),
-                                                        GizmoTargetKind::WineSpotlight => Some(spot_obj_id),
-                                                    }
-                                                } else {
-                                                    None
-                                                };
-                                                if let Some(obj_id) = selected_object_id {
+                                                let material_object_id = if has_selection { selected_object_id } else { None };
+                                                if let Some(obj_id) = material_object_id {
                                                     let mut mat_name = object_material_names
                                                         .get(&obj_id)
                                                         .cloned()
@@ -1769,6 +2215,14 @@ pub async fn run() {
                             if requested_scene != scene_kind && requested_scene_exists {
                                 scene_kind = requested_scene;
                                 gizmo_target = default_target_for_scene(scene_kind);
+                                selected_object_id = match gizmo_target {
+                                    GizmoTargetKind::Sphere => Some(sphere_obj_id),
+                                    GizmoTargetKind::Decanter => Some(decanter_obj_id),
+                                    GizmoTargetKind::WineGlass => Some(wine_obj_id),
+                                    GizmoTargetKind::CornellBox => Some(cornell_obj_id),
+                                    GizmoTargetKind::SunLamp => Some(sun_obj_id),
+                                    GizmoTargetKind::WineSpotlight => Some(spot_obj_id),
+                                };
                                 has_selection = true;
                                 uniforms.scene_kind = scene_kind.index();
                                 let (next_center, next_size, next_extent) = match scene_kind {
@@ -1964,42 +2418,48 @@ pub async fn run() {
                                     ),
                                 ),
                                 GizmoTargetKind::Decanter => {
+                                    let inst = selected_object_id
+                                        .and_then(|id| mesh_instances.iter().find(|inst| inst.object_id == id))
+                                        .or_else(|| mesh_instances.iter().find(|inst| inst.object_id == decanter_obj_id));
                                     GizmoTransform::from_scale_rotation_translation(
                                         transform_gizmo::math::DVec3::new(
-                                            decanter_scale.x as f64,
-                                            decanter_scale.y as f64,
-                                            decanter_scale.z as f64,
+                                            inst.map(|i| i.scale.x).unwrap_or(decanter_scale.x) as f64,
+                                            inst.map(|i| i.scale.y).unwrap_or(decanter_scale.y) as f64,
+                                            inst.map(|i| i.scale.z).unwrap_or(decanter_scale.z) as f64,
                                         ),
                                         transform_gizmo::math::DQuat::from_xyzw(
-                                            decanter_rotation.x as f64,
-                                            decanter_rotation.y as f64,
-                                            decanter_rotation.z as f64,
-                                            decanter_rotation.w as f64,
+                                            inst.map(|i| i.rotation.x).unwrap_or(decanter_rotation.x) as f64,
+                                            inst.map(|i| i.rotation.y).unwrap_or(decanter_rotation.y) as f64,
+                                            inst.map(|i| i.rotation.z).unwrap_or(decanter_rotation.z) as f64,
+                                            inst.map(|i| i.rotation.w).unwrap_or(decanter_rotation.w) as f64,
                                         ),
                                         transform_gizmo::math::DVec3::new(
-                                            (decanter_center.x + decanter_translation.x) as f64,
-                                            (decanter_center.y + decanter_translation.y) as f64,
-                                            (decanter_center.z + decanter_translation.z) as f64,
+                                            inst.map(|i| i.center().x).unwrap_or(decanter_center.x + decanter_translation.x) as f64,
+                                            inst.map(|i| i.center().y).unwrap_or(decanter_center.y + decanter_translation.y) as f64,
+                                            inst.map(|i| i.center().z).unwrap_or(decanter_center.z + decanter_translation.z) as f64,
                                         ),
                                     )
                                 }
                                 GizmoTargetKind::WineGlass => {
+                                    let inst = selected_object_id
+                                        .and_then(|id| mesh_instances.iter().find(|inst| inst.object_id == id))
+                                        .or_else(|| mesh_instances.iter().find(|inst| inst.object_id == wine_obj_id));
                                     GizmoTransform::from_scale_rotation_translation(
                                         transform_gizmo::math::DVec3::new(
-                                            wine_scale.x as f64,
-                                            wine_scale.y as f64,
-                                            wine_scale.z as f64,
+                                            inst.map(|i| i.scale.x).unwrap_or(wine_scale.x) as f64,
+                                            inst.map(|i| i.scale.y).unwrap_or(wine_scale.y) as f64,
+                                            inst.map(|i| i.scale.z).unwrap_or(wine_scale.z) as f64,
                                         ),
                                         transform_gizmo::math::DQuat::from_xyzw(
-                                            wine_rotation.x as f64,
-                                            wine_rotation.y as f64,
-                                            wine_rotation.z as f64,
-                                            wine_rotation.w as f64,
+                                            inst.map(|i| i.rotation.x).unwrap_or(wine_rotation.x) as f64,
+                                            inst.map(|i| i.rotation.y).unwrap_or(wine_rotation.y) as f64,
+                                            inst.map(|i| i.rotation.z).unwrap_or(wine_rotation.z) as f64,
+                                            inst.map(|i| i.rotation.w).unwrap_or(wine_rotation.w) as f64,
                                         ),
                                         transform_gizmo::math::DVec3::new(
-                                            (wine_center.x + wine_translation.x) as f64,
-                                            (wine_center.y + wine_translation.y) as f64,
-                                            (wine_center.z + wine_translation.z) as f64,
+                                            inst.map(|i| i.center().x).unwrap_or(wine_center.x + wine_translation.x) as f64,
+                                            inst.map(|i| i.center().y).unwrap_or(wine_center.y + wine_translation.y) as f64,
+                                            inst.map(|i| i.center().z).unwrap_or(wine_center.z + wine_translation.z) as f64,
                                         ),
                                     )
                                 }
@@ -2087,11 +2547,17 @@ pub async fn run() {
                                                 translation = cur + (translation - cur) * 3.0;
                                             }
                                             GizmoTargetKind::Decanter => {
-                                                let cur = decanter_center + decanter_translation;
+                                                let cur = selected_object_id
+                                                    .and_then(|id| mesh_instances.iter().find(|inst| inst.object_id == id))
+                                                    .map(|inst| inst.center())
+                                                    .unwrap_or(decanter_center + decanter_translation);
                                                 translation = cur + (translation - cur) * 3.0;
                                             }
                                             GizmoTargetKind::WineGlass => {
-                                                let cur = wine_center + wine_translation;
+                                                let cur = selected_object_id
+                                                    .and_then(|id| mesh_instances.iter().find(|inst| inst.object_id == id))
+                                                    .map(|inst| inst.center())
+                                                    .unwrap_or(wine_center + wine_translation);
                                                 translation = cur + (translation - cur) * 3.0;
                                             }
                                             GizmoTargetKind::CornellBox => {
@@ -2142,34 +2608,64 @@ pub async fn run() {
                                     }
                                     GizmoTargetKind::Decanter => {
                                         let new_center = glam::Vec3::new(translation.x, translation.y, translation.z);
-                                        decanter_translation = new_center - decanter_center;
-                                        decanter_rotation = glam::Quat::from_array([
+                                        let new_rotation = glam::Quat::from_array([
                                             new_t.rotation.v.x as f32,
                                             new_t.rotation.v.y as f32,
                                             new_t.rotation.v.z as f32,
                                             new_t.rotation.s as f32,
                                         ]);
-                                        decanter_scale = glam::Vec3::new(
+                                        let new_scale = glam::Vec3::new(
                                             (new_t.scale.x as f32).clamp(0.1, 8.0),
                                             (new_t.scale.y as f32).clamp(0.1, 8.0),
                                             (new_t.scale.z as f32).clamp(0.1, 8.0),
                                         );
+                                        if let Some(inst) = selected_object_id
+                                            .and_then(|id| mesh_instances.iter_mut().find(|inst| inst.object_id == id))
+                                        {
+                                            inst.translation = new_center - inst.pivot;
+                                            inst.rotation = new_rotation;
+                                            inst.scale = new_scale;
+                                            if inst.object_id == decanter_obj_id {
+                                                decanter_translation = inst.translation;
+                                                decanter_rotation = inst.rotation;
+                                                decanter_scale = inst.scale;
+                                            }
+                                        } else {
+                                            decanter_translation = new_center - decanter_center;
+                                            decanter_rotation = new_rotation;
+                                            decanter_scale = new_scale;
+                                        }
                                         geometry_dirty = true;
                                     }
                                     GizmoTargetKind::WineGlass => {
                                         let new_center = glam::Vec3::new(translation.x, translation.y, translation.z);
-                                        wine_translation = new_center - wine_center;
-                                        wine_rotation = glam::Quat::from_array([
+                                        let new_rotation = glam::Quat::from_array([
                                             new_t.rotation.v.x as f32,
                                             new_t.rotation.v.y as f32,
                                             new_t.rotation.v.z as f32,
                                             new_t.rotation.s as f32,
                                         ]);
-                                        wine_scale = glam::Vec3::new(
+                                        let new_scale = glam::Vec3::new(
                                             (new_t.scale.x as f32).clamp(0.1, 8.0),
                                             (new_t.scale.y as f32).clamp(0.1, 8.0),
                                             (new_t.scale.z as f32).clamp(0.1, 8.0),
                                         );
+                                        if let Some(inst) = selected_object_id
+                                            .and_then(|id| mesh_instances.iter_mut().find(|inst| inst.object_id == id))
+                                        {
+                                            inst.translation = new_center - inst.pivot;
+                                            inst.rotation = new_rotation;
+                                            inst.scale = new_scale;
+                                            if inst.object_id == wine_obj_id {
+                                                wine_translation = inst.translation;
+                                                wine_rotation = inst.rotation;
+                                                wine_scale = inst.scale;
+                                            }
+                                        } else {
+                                            wine_translation = new_center - wine_center;
+                                            wine_rotation = new_rotation;
+                                            wine_scale = new_scale;
+                                        }
                                         geometry_dirty = true;
                                     }
                                     GizmoTargetKind::CornellBox => {
@@ -2222,6 +2718,7 @@ pub async fn run() {
                             }
 
                             if mouse_left_clicked
+                                && !suppress_scene_click
                                 && !pointer_captured
                                 && !gizmo.is_focused()
                                 && !mouse_left_dragging
@@ -2233,8 +2730,6 @@ pub async fn run() {
                                 };
                                 let selectable_ids = main_db.scene_visible_selectable_objects(scene_id);
                                 let sphere_allowed = selectable_ids.contains(&sphere_obj_id);
-                                let decanter_allowed = selectable_ids.contains(&decanter_obj_id);
-                                let wine_allowed = selectable_ids.contains(&wine_obj_id);
                                 let cornell_allowed = selectable_ids.contains(&cornell_obj_id);
                                 let sun_allowed = selectable_ids.contains(&sun_obj_id);
                                 let spot_allowed = selectable_ids.contains(&spot_obj_id);
@@ -2249,8 +2744,6 @@ pub async fn run() {
                                     uniforms.sphere_pos[1],
                                     uniforms.sphere_pos[2],
                                 );
-                                let decanter_center_now = decanter_center + decanter_translation;
-                                let wine_center_now = wine_center + wine_translation;
                                 let sphere_hit = if scene_kind == SceneKind::Decanter && sphere_allowed {
                                     intersect_cube(
                                         ro,
@@ -2261,27 +2754,6 @@ pub async fn run() {
                                             uniforms.sphere_extent[1],
                                             uniforms.sphere_extent[2],
                                         ),
-                                    )
-                                } else {
-                                    None
-                                };
-                                let decanter_hit = if scene_kind == SceneKind::Decanter && decanter_allowed {
-                                    intersect_sphere(
-                                        ro,
-                                        rd,
-                                        decanter_center_now,
-                                        (decanter_max_extent * decanter_scale.max_element() * 0.55)
-                                            .max(0.25),
-                                    )
-                                } else {
-                                    None
-                                };
-                                let wine_hit = if wine_allowed {
-                                    intersect_sphere(
-                                        ro,
-                                        rd,
-                                        wine_center_now,
-                                        (wine_max_extent * 0.55).max(0.25),
                                     )
                                 } else {
                                     None
@@ -2306,48 +2778,63 @@ pub async fn run() {
                                 } else {
                                     None
                                 };
-                                let mut best: Option<GizmoTargetKind> = None;
+                                let mut best: Option<(GizmoTargetKind, Id)> = None;
                                 let mut best_t = f32::INFINITY;
                                 if let Some(t) = sphere_hit {
                                     if t < best_t {
                                         best_t = t;
-                                        best = Some(GizmoTargetKind::Sphere);
+                                        best = Some((GizmoTargetKind::Sphere, sphere_obj_id));
                                     }
                                 }
-                                if let Some(t) = decanter_hit {
-                                    if t < best_t {
-                                        best_t = t;
-                                        best = Some(GizmoTargetKind::Decanter);
+                                for inst in &mesh_instances {
+                                    if !selectable_ids.contains(&inst.object_id) {
+                                        continue;
                                     }
-                                }
-                                if let Some(t) = wine_hit {
-                                    if t < best_t {
-                                        best_t = t;
-                                        best = Some(GizmoTargetKind::WineGlass);
+                                    let Some(target) = object_target_by_id.get(&inst.object_id).copied() else {
+                                        continue;
+                                    };
+                                    if !matches!(target, GizmoTargetKind::Decanter | GizmoTargetKind::WineGlass) {
+                                        continue;
+                                    }
+                                    if scene_kind == SceneKind::Wine && target != GizmoTargetKind::WineGlass {
+                                        continue;
+                                    }
+                                    if let Some(t) = intersect_sphere(
+                                        ro,
+                                        rd,
+                                        inst.center(),
+                                        (inst.max_extent * inst.scale.max_element() * 0.55).max(0.25),
+                                    ) {
+                                        if t < best_t {
+                                            best_t = t;
+                                            best = Some((target, inst.object_id));
+                                        }
                                     }
                                 }
                                 if let Some(t) = cornell_hit {
                                     if t < best_t {
                                         best_t = t;
-                                        best = Some(GizmoTargetKind::CornellBox);
+                                        best = Some((GizmoTargetKind::CornellBox, cornell_obj_id));
                                     }
                                 }
                                 if let Some(t) = sun_hit {
                                     if t < best_t {
                                         best_t = t;
-                                        best = Some(GizmoTargetKind::SunLamp);
+                                        best = Some((GizmoTargetKind::SunLamp, sun_obj_id));
                                     }
                                 }
                                 if let Some(t) = spot_hit {
                                     if t < best_t {
-                                        best = Some(GizmoTargetKind::WineSpotlight);
+                                        best = Some((GizmoTargetKind::WineSpotlight, spot_obj_id));
                                     }
                                 }
-                                if let Some(selected) = best {
+                                if let Some((selected, object_id)) = best {
                                     gizmo_target = selected;
+                                    selected_object_id = Some(object_id);
                                     has_selection = true;
                                 } else {
                                     has_selection = false;
+                                    selected_object_id = None;
                                 }
                             }
 
@@ -2446,6 +2933,25 @@ pub async fn run() {
                                 active_center.z + cornell_translation.z,
                                 cornell_scale.max_element().max(0.1),
                             ];
+                            if let Some(selected_inst) = selected_object_id
+                                .and_then(|id| mesh_instances.iter().find(|inst| inst.object_id == id))
+                            {
+                                let center = selected_inst.center();
+                                uniforms.decanter_center = [
+                                    center.x,
+                                    center.y,
+                                    center.z,
+                                    selected_inst.max_extent * selected_inst.scale.max_element() * 0.7,
+                                ];
+                                if gizmo_target == GizmoTargetKind::WineGlass {
+                                    uniforms.mesh_center = [
+                                        center.x,
+                                        center.y,
+                                        center.z,
+                                        selected_inst.max_extent * selected_inst.scale.max_element() * 0.8,
+                                    ];
+                                }
+                            }
                             uniforms.selected_object = if has_selection {
                                 match gizmo_target {
                                     GizmoTargetKind::Sphere => 1,
@@ -2478,7 +2984,13 @@ pub async fn run() {
                             uniforms.decanter_enabled = if decanter_visible { 1 } else { 0 };
                             uniforms.wine_enabled = if wine_visible { 1 } else { 0 };
                             uniforms.cornell_enabled = if cornell_visible { 1 } else { 0 };
-                            uniforms.mesh_enabled = if decanter_visible || wine_visible { 1 } else { 0 };
+                            let any_mesh_visible = if current_scene_exists {
+                                let visible = main_db.scene_visible_selectable_objects(active_scene_id);
+                                mesh_instances.iter().any(|inst| visible.contains(&inst.object_id))
+                            } else {
+                                false
+                            };
+                            uniforms.mesh_enabled = if any_mesh_visible { 1 } else { 0 };
                             let sphere_mat = object_material_names
                                 .get(&sphere_obj_id)
                                 .cloned()
@@ -2544,9 +3056,16 @@ pub async fn run() {
                                 if cornell_preview.bsdf_connected { 1.0 } else { 0.0 },
                                 0.0,
                             ];
-                            let material_signature = format!(
+                            let mut material_signature = format!(
                                 "{sphere_mat}:{sphere_preview:?}|{decanter_mat}:{decanter_preview:?}|{wine_mat}:{wine_preview:?}|{cornell_mat}:{cornell_preview:?}"
                             );
+                            for inst in &mesh_instances {
+                                let mat = object_material_names
+                                    .get(&inst.object_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| "Glass".to_string());
+                                material_signature.push_str(&format!("|{}:{mat}", inst.object_id.0));
+                            }
                             if material_signature != last_material_signature {
                                 let set_range = |materials: &mut [crate::mesh::GpuMaterial],
                                                  start: usize,
@@ -2603,7 +3122,34 @@ pub async fn run() {
                                     wine_preview,
                                     true,
                                 );
-                                queue.write_buffer(&mat_buf, 0, bytemuck::cast_slice(&mesh.materials));
+                                for inst in &mesh_instances {
+                                    let mat = object_material_names
+                                        .get(&inst.object_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| "Glass".to_string());
+                                    let preview = material_runtime_overrides
+                                        .get(&mat)
+                                        .copied()
+                                        .unwrap_or_else(|| preview_from_material_data(material_library.get(&mat)));
+                                    let wine_style = object_target_by_id
+                                        .get(&inst.object_id)
+                                        .copied()
+                                        == Some(GizmoTargetKind::WineGlass);
+                                    set_range(
+                                        &mut mesh.materials,
+                                        inst.material_start,
+                                        inst.material_count,
+                                        preview,
+                                        wine_style,
+                                    );
+                                }
+                                if !gpu_mesh_dirty {
+                                    queue.write_buffer(
+                                        &mat_buf,
+                                        0,
+                                        bytemuck::cast_slice(&mesh.materials),
+                                    );
+                                }
                                 last_material_signature = material_signature;
                                 accumulation_dirty = true;
                             }
@@ -2648,6 +3194,13 @@ pub async fn run() {
                                 obj.transform.rotation = wine_rotation;
                                 obj.transform.scale = wine_scale;
                             }
+                            for inst in &mesh_instances {
+                                if let Some(obj) = main_db.objects.get_mut(&inst.object_id) {
+                                    obj.transform.location = inst.center();
+                                    obj.transform.rotation = inst.rotation;
+                                    obj.transform.scale = inst.scale;
+                                }
+                            }
                             if let Some(obj) = main_db.objects.get_mut(&sun_obj_id) {
                                 obj.transform.location = sun_empty_position;
                                 obj.transform.rotation = sun_empty_rotation;
@@ -2679,33 +3232,141 @@ pub async fn run() {
 
                             if accumulation_dirty || sun_changed {
                                 if geometry_dirty {
-                                    update_mesh_transform(
-                                        &mut mesh,
-                                        &mut model_verts,
-                                        decanter_vertex_start,
-                                        decanter_vertex_count,
-                                        &decanter_base_positions,
-                                        &decanter_base_normals,
-                                        decanter_center,
-                                        decanter_scale,
-                                        decanter_rotation,
-                                        decanter_translation,
+                                    model_verts = mesh.vertices.clone();
+                                    for inst in &mesh_instances {
+                                        update_mesh_transform(
+                                            &mut mesh,
+                                            &mut model_verts,
+                                            inst.vertex_start,
+                                            inst.vertex_count,
+                                            &inst.base_positions,
+                                            &inst.base_normals,
+                                            inst.pivot,
+                                            inst.scale,
+                                            inst.rotation,
+                                            inst.translation,
+                                        );
+                                    }
+                                    let render_scene_id = match scene_kind {
+                                        SceneKind::Decanter => decanter_scene_id,
+                                        SceneKind::Wine => wine_scene_id,
+                                        SceneKind::CornellBox => cornell_scene_id,
+                                    };
+                                    let visible_render_ids = main_db.scene_visible_selectable_objects(render_scene_id);
+                                    let (
+                                        render_verts,
+                                        render_indices,
+                                        render_positions,
+                                        render_normals,
+                                        render_triangle_material_ids,
+                                    ) = visible_render_geometry(
+                                        &mesh,
+                                        &mesh_instances,
+                                        &visible_render_ids,
                                     );
-                                    update_mesh_transform(
-                                        &mut mesh,
-                                        &mut model_verts,
-                                        wine_vertex_start,
-                                        wine_vertex_count,
-                                        &wine_base_positions,
-                                        &wine_base_normals,
-                                        wine_center,
-                                        wine_scale,
-                                        wine_rotation,
-                                        wine_translation,
-                                    );
-                                    queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&model_verts));
-                                    queue.write_buffer(&pos_buf, 0, bytemuck::cast_slice(&mesh.positions4));
-                                    queue.write_buffer(&nrm_buf, 0, bytemuck::cast_slice(&mesh.normals4));
+                                    model_idx = render_indices;
+                                    if gpu_mesh_dirty {
+                                        vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                            label: Some("model_vbuf"),
+                                            contents: bytemuck::cast_slice(&render_verts),
+                                            usage: wgpu::BufferUsages::VERTEX
+                                                | wgpu::BufferUsages::BLAS_INPUT
+                                                | wgpu::BufferUsages::COPY_DST,
+                                        });
+                                        ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                            label: Some("model_ibuf"),
+                                            contents: bytemuck::cast_slice(&model_idx),
+                                            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::BLAS_INPUT,
+                                        });
+                                        pos_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                            label: Some("mesh_pos_buf"),
+                                            contents: bytemuck::cast_slice(&render_positions),
+                                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                                        });
+                                        nrm_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                            label: Some("mesh_nrm_buf"),
+                                            contents: bytemuck::cast_slice(&render_normals),
+                                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                                        });
+                                        idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                            label: Some("mesh_idx_buf"),
+                                            contents: bytemuck::cast_slice(&model_idx),
+                                            usage: wgpu::BufferUsages::STORAGE,
+                                        });
+                                        tri_mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                            label: Some("mesh_tri_mat_buf"),
+                                            contents: bytemuck::cast_slice(&render_triangle_material_ids),
+                                            usage: wgpu::BufferUsages::STORAGE,
+                                        });
+                                        mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                            label: Some("mesh_materials_buf"),
+                                            contents: bytemuck::cast_slice(&mesh.materials),
+                                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                                        });
+                                        model_blas_desc = wgpu::BlasTriangleGeometrySizeDescriptor {
+                                            vertex_format: wgpu::VertexFormat::Float32x3,
+                                            vertex_count: render_verts.len() as u32,
+                                            index_format: Some(wgpu::IndexFormat::Uint32),
+                                            index_count: Some(model_idx.len() as u32),
+                                            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+                                        };
+                                        model_blas = device.create_blas(
+                                            &wgpu::CreateBlasDescriptor {
+                                                label: Some("model_blas"),
+                                                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                                                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                                            },
+                                            wgpu::BlasGeometrySizeDescriptors::Triangles {
+                                                descriptors: vec![model_blas_desc.clone()],
+                                            },
+                                        );
+                                        tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+                                            label: Some("scene_tlas"),
+                                            flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                                            update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                                            max_instances: 1,
+                                        });
+                                        tlas[0] = Some(wgpu::TlasInstance::new(
+                                            &model_blas,
+                                            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                                            0,
+                                            0xff,
+                                        ));
+                                        photon_mapper = PhotonMapper::new(
+                                            &device,
+                                            &queue,
+                                            &tlas,
+                                            &pos_buf,
+                                            &nrm_buf,
+                                            &idx_buf,
+                                            &tri_mat_buf,
+                                            &mat_buf,
+                                        );
+                                        ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                            label: Some("ugroup"),
+                                            layout: &ubind,
+                                            entries: &[
+                                                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::AccelerationStructure(&tlas) },
+                                                wgpu::BindGroupEntry { binding: 2, resource: accum_buf.as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 3, resource: pos_buf.as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 4, resource: nrm_buf.as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 5, resource: idx_buf.as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 6, resource: tri_mat_buf.as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 7, resource: mat_buf.as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(compute_pass.output_view()) },
+                                                wgpu::BindGroupEntry { binding: 9, resource: photon_mapper.photon_buffer().as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 10, resource: photon_mapper.hash_heads().as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 11, resource: photon_mapper.uniforms_buffer().as_entire_binding() },
+                                                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(compute_pass.selection_mask_view()) },
+                                            ],
+                                        });
+                                        gpu_mesh_dirty = false;
+                                    } else {
+                                        queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&render_verts));
+                                        queue.write_buffer(&pos_buf, 0, bytemuck::cast_slice(&render_positions));
+                                        queue.write_buffer(&nrm_buf, 0, bytemuck::cast_slice(&render_normals));
+                                    }
 
                                     let model_build = wgpu::BlasBuildEntry {
                                         blas: &model_blas,
@@ -2814,7 +3475,7 @@ pub async fn run() {
                                 quad_pass.render(&mut present_rpass);
                             }
                             {
-                                let mut ui_rpass =
+                                let ui_rpass =
                                     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                         label: Some("egui-pass"),
                                         color_attachments: &[Some(

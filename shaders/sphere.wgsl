@@ -505,14 +505,6 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
         tri_bary = tri_hit.barycentrics;
       }
     }
-    if (t_tri < 1e37) {
-      let tri_pos = ro + rd * t_tri;
-      let in_wine = uniforms.wine_enabled != 0u && distance(tri_pos, uniforms.mesh_center.xyz) <= uniforms.mesh_center.w;
-      let in_decanter = uniforms.decanter_enabled != 0u && distance(tri_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
-      if (!in_wine && !in_decanter) {
-        t_tri = 1e38;
-      }
-    }
 
     var t_cornell = 1e38;
     if (!is_wine_scene && uniforms.cornell_enabled != 0u) {
@@ -763,14 +755,6 @@ fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
     rayQueryProceed(&rq);
     let tri_hit = rayQueryGetCommittedIntersection(&rq);
     if (tri_hit.kind != RAY_QUERY_INTERSECTION_NONE) { t_tri = tri_hit.t; }
-  }
-  if (t_tri < 1e37) {
-    let tri_pos = ro + rd * t_tri;
-    let in_wine = uniforms.wine_enabled != 0u && distance(tri_pos, uniforms.mesh_center.xyz) <= uniforms.mesh_center.w;
-    let in_decanter = uniforms.decanter_enabled != 0u && distance(tri_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
-    if (!in_wine && !in_decanter) {
-      t_tri = 1e38;
-    }
   }
   var t_cornell = 1e38;
   if (!is_wine_scene && uniforms.cornell_enabled != 0u) {

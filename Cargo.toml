@@ -20,3 +20,4 @@ slotmap = { version = "1.0", features = ["serde"] }
 petgraph = { version = "0.6", features = ["serde-1"] }
 zstd = "0.13"
 egui_node_editor = "0.10.0"
+rfd = "0.15"
