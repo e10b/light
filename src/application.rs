@@ -545,6 +545,10 @@ fn append_object_mesh(
     }
 }
 
+fn place_instance_center(instance: &mut MeshObjectInstance, center: glam::Vec3) {
+    instance.translation = center - instance.pivot;
+}
+
 fn visible_render_geometry(
     mesh: &MeshData,
     instances: &[MeshObjectInstance],
@@ -825,7 +829,7 @@ pub async fn run() {
 
     let sphere_radius = 6.0;
     let default_cube_center = glam::Vec3::new(0.0, -1.5 + sphere_radius, 0.0);
-    let default_cube_mesh = make_cube_mesh(default_cube_center, 1.5);
+    let default_cube_mesh = make_cube_mesh(glam::Vec3::ZERO, 1.5);
     let default_cube_vertex_len = default_cube_mesh.vertices.len();
     let (cube_center, cube_size, _, _) = mesh_bounds(&default_cube_mesh.vertices);
     let cube_max_extent = cube_size.max_element().max(0.1);
@@ -863,7 +867,7 @@ pub async fn run() {
     let mut main_db = MainDatabase::new();
     let decanter_mesh_id = main_db.create_mesh("DecanterMesh", decanter_vertex_count);
     let wine_mesh_id = main_db.create_mesh("WineGlassMesh", wine_vertex_count);
-    let cornell_mesh_id = main_db.create_mesh("CornellBoxMesh", 0);
+    let cornell_mesh_id = main_db.create_mesh("CornellBoxMesh", make_cube_mesh(glam::Vec3::ZERO, 2.0).vertices.len());
     let sphere_obj_id = main_db.create_object("Cube", None, DbTransform::default());
     let sun_obj_id = main_db.create_object("SunLamp", None, DbTransform::default());
     let spot_obj_id = main_db.create_object("Spotlight", None, DbTransform::default());
@@ -913,7 +917,7 @@ pub async fn run() {
         pivot: cube_center,
         max_extent: cube_max_extent,
         rotation: glam::Quat::IDENTITY,
-        translation: glam::Vec3::ZERO,
+        translation: default_cube_center - cube_center,
         scale: glam::Vec3::ONE,
     };
 
@@ -1399,7 +1403,7 @@ pub async fn run() {
     let mut wine_rotation = glam::Quat::IDENTITY;
     let mut wine_translation = glam::Vec3::ZERO;
     let mut wine_scale = glam::Vec3::ONE;
-    let mut geometry_dirty = false;
+    let mut geometry_dirty = true;
     let mut gpu_mesh_dirty = false;
     let mut project_status = String::new();
     let mut mouse_pos = [0.0f32, 0.0f32];
@@ -1666,14 +1670,18 @@ pub async fn run() {
                                                             + 1;
                                                         let cube_center = active_center
                                                             + glam::Vec3::new(count as f32 * 4.0, 0.5, 0.0);
-                                                        let cube_mesh = make_cube_mesh(cube_center, 1.5);
-                                                        let mesh_id = main_db.create_mesh("CubeMesh", cube_mesh.vertices.len());
+                                                        let cube_mesh = make_cube_mesh(glam::Vec3::ZERO, 1.5);
+                                                        let mesh_id = default_cube_mesh_id;
+                                                        if let Some(mesh_db) = main_db.meshes.get_mut(&mesh_id) {
+                                                            mesh_db.user_count = mesh_db.user_count.saturating_add(1);
+                                                        }
                                                         let obj_id = main_db.create_object(
                                                             format!("Cube {count}"),
                                                             Some(mesh_id),
                                                             DbTransform::default(),
                                                         );
-                                                        let inst = append_object_mesh(&mut mesh, cube_mesh, obj_id);
+                                                        let mut inst = append_object_mesh(&mut mesh, cube_mesh, obj_id);
+                                                        place_instance_center(&mut inst, cube_center);
                                                         main_db.collection_link_object(decanter_master, obj_id);
                                                         main_db.ensure_scene_base(scene_id, obj_id, true, true);
                                                         object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
@@ -1881,17 +1889,18 @@ pub async fn run() {
                                                             + 1;
                                                         let box_center = active_center
                                                             + glam::Vec3::new(count as f32 * 4.0, 1.0, -2.0);
-                                                        let box_mesh = make_cube_mesh(box_center, 2.0);
-                                                        let mesh_id = main_db.create_mesh(
-                                                            "CornellBoxMesh",
-                                                            box_mesh.vertices.len(),
-                                                        );
+                                                        let box_mesh = make_cube_mesh(glam::Vec3::ZERO, 2.0);
+                                                        let mesh_id = cornell_mesh_id;
+                                                        if let Some(mesh_db) = main_db.meshes.get_mut(&mesh_id) {
+                                                            mesh_db.user_count = mesh_db.user_count.saturating_add(1);
+                                                        }
                                                         let obj_id = main_db.create_object(
                                                             format!("Cornell Box {count}"),
                                                             Some(mesh_id),
                                                             DbTransform::default(),
                                                         );
-                                                        let inst = append_object_mesh(&mut mesh, box_mesh, obj_id);
+                                                        let mut inst = append_object_mesh(&mut mesh, box_mesh, obj_id);
+                                                        place_instance_center(&mut inst, box_center);
                                                         main_db.collection_link_object(decanter_master, obj_id);
                                                         main_db.ensure_scene_base(scene_id, obj_id, true, true);
                                                         object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
