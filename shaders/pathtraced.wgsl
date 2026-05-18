@@ -179,6 +179,18 @@ fn sky(dir: vec3<f32>) -> vec3<f32> {
   return sky_rgb + vec3<f32>(1.0, 0.97, 0.9) * sun_disk * 0.35;
 }
 
+fn sample_sun_disk_dir(base_dir: vec3<f32>, u1: f32, u2: f32, angular_radius: f32) -> vec3<f32> {
+  let pi = 3.141592653589793;
+  let n = normalize(base_dir);
+  let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.98);
+  let tangent = normalize(cross(up, n));
+  let bitangent = normalize(cross(n, tangent));
+  let r = angular_radius * sqrt(max(u1, 1e-6));
+  let theta = 2.0 * pi * u2;
+  let offset = tangent * (r * cos(theta)) + bitangent * (r * sin(theta));
+  return normalize(n + offset);
+}
+
 fn preetham_perez(cos_t: f32, g: f32, cos_g: f32, a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {
   let ct = max(cos_t, 0.01);
   return (1.0 + a * exp(b / ct)) * (1.0 + c * exp(d * g) + e * cos_g * cos_g);
@@ -664,27 +676,35 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       }
     } else {
       let count = max(uniforms.sun_light_count, 1u);
+      let shadow_samples = 2u;
+      let sun_angular_radius = 0.03;
       for (var li = 0u; li < 8u; li = li + 1u) {
         if (li >= count) { break; }
-        let to_light = normalize(select(uniforms.light_pos.xyz, uniforms.sun_lights[li].xyz, uniforms.sun_light_count > 0u));
-        var shadow_rq: ray_query;
-        let shadow_origin = hit_pos + normal * 0.02;
-        rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, 10000.0, shadow_origin, to_light));
-        rayQueryProceed(&shadow_rq);
-        let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
-        var cube_shadow_t = 1e38;
-        let qsh = uniforms.sphere_rot;
-        let qsh_inv = vec4<f32>(-qsh.xyz, qsh.w);
-        let local_shadow_origin = quat_mul_vec(qsh_inv, shadow_origin - cube_center);
-        let local_to_light = quat_mul_vec(qsh_inv, to_light);
-        let cube_half_vec_sh = uniforms.sphere_extent.xyz;
-        let t_local_sh = cube_intersection_t(local_shadow_origin, local_to_light, vec3<f32>(0.0), cube_half_vec_sh);
-        if (t_local_sh < 1e37) { cube_shadow_t = t_local_sh; }
-        let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (cube_shadow_t >= 1e37);
-        if (visible) {
-          let nl = max(dot(normal, to_light), 0.0);
-          direct_light = direct_light + vec3<f32>(1.0, 0.94, 0.82) * nl;
-          any_visible_light = true;
+        let sun_dir = normalize(select(uniforms.light_pos.xyz, uniforms.sun_lights[li].xyz, uniforms.sun_light_count > 0u));
+        for (var si = 0u; si < shadow_samples; si = si + 1u) {
+          let s0 = rng_seed ^ (li * 9781u + si * 6271u + bounce * 1871u + 0x9e3779b9u);
+          let u1 = rand01(s0);
+          let u2 = rand01(s0 ^ 0x85ebca6bu);
+          let to_light = sample_sun_disk_dir(sun_dir, u1, u2, sun_angular_radius);
+          var shadow_rq: ray_query;
+          let shadow_origin = hit_pos + normal * 0.02;
+          rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, 10000.0, shadow_origin, to_light));
+          rayQueryProceed(&shadow_rq);
+          let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
+          var cube_shadow_t = 1e38;
+          let qsh = uniforms.sphere_rot;
+          let qsh_inv = vec4<f32>(-qsh.xyz, qsh.w);
+          let local_shadow_origin = quat_mul_vec(qsh_inv, shadow_origin - cube_center);
+          let local_to_light = quat_mul_vec(qsh_inv, to_light);
+          let cube_half_vec_sh = uniforms.sphere_extent.xyz;
+          let t_local_sh = cube_intersection_t(local_shadow_origin, local_to_light, vec3<f32>(0.0), cube_half_vec_sh);
+          if (t_local_sh < 1e37) { cube_shadow_t = t_local_sh; }
+          let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (cube_shadow_t >= 1e37);
+          if (visible) {
+            let nl = max(dot(normal, to_light), 0.0);
+            direct_light = direct_light + vec3<f32>(1.0, 0.94, 0.82) * (nl / f32(shadow_samples));
+            any_visible_light = true;
+          }
         }
       }
     }
