@@ -681,6 +681,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       for (var li = 0u; li < 8u; li = li + 1u) {
         if (li >= count) { break; }
         let sun_dir = normalize(select(uniforms.light_pos.xyz, uniforms.sun_lights[li].xyz, uniforms.sun_light_count > 0u));
+        let sun_intensity = max(select(uniforms.light_pos.w, uniforms.sun_lights[li].w, uniforms.sun_light_count > 0u), 0.0);
         for (var si = 0u; si < shadow_samples; si = si + 1u) {
           let s0 = rng_seed ^ (li * 9781u + si * 6271u + bounce * 1871u + 0x9e3779b9u);
           let u1 = rand01(s0);
@@ -702,7 +703,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
           let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (cube_shadow_t >= 1e37);
           if (visible) {
             let nl = max(dot(normal, to_light), 0.0);
-            direct_light = direct_light + vec3<f32>(1.0, 0.94, 0.82) * (nl / f32(shadow_samples));
+            direct_light = direct_light + vec3<f32>(1.0, 0.94, 0.82) * (nl / f32(shadow_samples)) * sun_intensity;
             any_visible_light = true;
           }
         }
@@ -713,7 +714,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       if (is_wine_scene && hit_type == 3u) {
         L = L + throughput * (photon_indirect * 8.0 + albedo * direct_light * uniforms.sun_intensity) * spectral_weight;
       } else {
-        L = L + throughput * (base + photon_indirect * albedo + albedo * direct_light * uniforms.sun_intensity) * spectral_weight;
+        L = L + throughput * (base + photon_indirect * albedo + albedo * direct_light) * spectral_weight;
       }
       break;
     }

@@ -105,7 +105,8 @@ fn normalized_photon_power() -> f32 {
   let target_count = min(uniforms.sphere_enabled.y, MAX_PHOTON_TARGETS);
   let count_scale = REFERENCE_PHOTON_COUNT / f32(max(uniforms.photon_count, 1u));
   let object_share_scale = select(1.0, f32(target_count), target_count > 0u);
-  return REFERENCE_PHOTON_POWER * count_scale * object_share_scale;
+  let light_intensity_scale = max(abs(uniforms.light_pos.w), 0.0);
+  return REFERENCE_PHOTON_POWER * count_scale * object_share_scale * light_intensity_scale;
 }
 
 fn ground_plane_intersection(origin: vec3<f32>, direction: vec3<f32>) -> f32 {

@@ -127,6 +127,7 @@ struct LightObjectInstance {
     position: glam::Vec3,
     rotation: glam::Quat,
     scale: glam::Vec3,
+    intensity: f32,
 }
 
 fn default_target_for_scene(_scene_kind: SceneKind) -> GizmoTargetKind {
@@ -1169,6 +1170,7 @@ pub async fn run() {
         position: sun_empty_position,
         rotation: sun_empty_rotation,
         scale: sun_empty_scale,
+        intensity: sun_intensity,
     }];
     let wine_spotlight_azimuth_deg = -55.0;
     let wine_spotlight_elevation_deg = 54.0;
@@ -1785,6 +1787,7 @@ pub async fn run() {
                                                             position: pos,
                                                             rotation: glam::Quat::IDENTITY,
                                                             scale: glam::Vec3::ONE,
+                                                            intensity: sun_intensity,
                                                         });
                                                         selected_object_id = Some(obj_id);
                                                         gizmo_target = GizmoTargetKind::SunLamp;
@@ -2244,7 +2247,13 @@ pub async fn run() {
                                         ui.collapsing("Sun", |ui| {
                                             ui.add(egui::Slider::new(&mut sun_azimuth_deg, -180.0..=180.0).text("Azimuth"));
                                             ui.add(egui::Slider::new(&mut sun_elevation_deg, -10.0..=89.0).text("Elevation"));
-                                            ui.add(egui::Slider::new(&mut sun_intensity, 0.0..=5.0).text("Intensity"));
+                                            if let Some(light) = selected_object_id
+                                                .and_then(|id| light_instances.iter_mut().find(|l| l.object_id == id))
+                                            {
+                                                ui.add(egui::Slider::new(&mut light.intensity, 0.0..=5.0).text("Intensity"));
+                                            } else {
+                                                ui.add(egui::Slider::new(&mut sun_intensity, 0.0..=5.0).text("Intensity"));
+                                            }
                                         });
                                         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                                             ui.separator();
@@ -2339,6 +2348,12 @@ pub async fn run() {
                             }
 
                             let sun_lamp_pos = sun_empty_position;
+                            let primary_sun_intensity = light_instances
+                                .iter()
+                                .find(|l| l.object_id == sun_obj_id)
+                                .map(|l| l.intensity)
+                                .unwrap_or(sun_intensity)
+                                .max(0.0);
                             let old_light = uniforms.light_pos;
                             let old_intensity = uniforms.sun_intensity;
                             uniforms.light_pos = {
@@ -2346,7 +2361,7 @@ pub async fn run() {
                                 sun_azimuth_deg = d.z.atan2(d.x).to_degrees();
                                 let len_xz = (d.x * d.x + d.z * d.z).sqrt().max(1e-5);
                                 sun_elevation_deg = d.y.atan2(len_xz).to_degrees();
-                                [d.x, d.y, d.z, 1.0]
+                                [d.x, d.y, d.z, primary_sun_intensity]
                             };
                             uniforms.sun_lights = [[0.0, 0.0, 0.0, 0.0]; MAX_SUN_LIGHTS];
                             uniforms.sun_light_count = 0;
@@ -2360,12 +2375,12 @@ pub async fn run() {
                                 {
                                     let d = (light.position - active_center).normalize_or_zero();
                                     let idx = uniforms.sun_light_count as usize;
-                                    uniforms.sun_lights[idx] = [d.x, d.y, d.z, 1.0];
+                                    uniforms.sun_lights[idx] = [d.x, d.y, d.z, light.intensity.max(0.0)];
                                     uniforms.sun_light_count += 1;
                                 }
                                 if uniforms.sun_light_count == 0 {
                                     let d = (sun_lamp_pos - active_center).normalize_or_zero();
-                                    uniforms.sun_lights[0] = [d.x, d.y, d.z, 1.0];
+                                    uniforms.sun_lights[0] = [d.x, d.y, d.z, primary_sun_intensity];
                                     uniforms.sun_light_count = 1;
                                 }
                             }
