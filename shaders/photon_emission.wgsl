@@ -207,6 +207,13 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = 1.0 - bary.x - bary.y;
     var normal = normalize(mesh_normals[i0].xyz * w + mesh_normals[i1].xyz * bary.x + mesh_normals[i2].xyz * bary.y);
     let mat = materials[mesh_triangle_material[prim]];
+    let transmission = clamp(mat.params.z, 0.0, 1.0);
+    if (transmission <= 0.01) {
+      if (passed_glass) {
+        write_photon(gid.x, hit_pos, -rd, lambda_nm, power);
+      }
+      break;
+    }
     let ior = max(snell_ior_for_wavelength(lambda_nm, mat.params.w, 0.12), 1.01);
 
     let entering = dot(rd, normal) < 0.0;
@@ -219,7 +226,7 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     passed_glass = true;
     let spectral_filter = dot(max(mat.base_color.rgb, vec3<f32>(0.05)), wl(lambda_nm)) / max(dot(vec3<f32>(1.0), wl(lambda_nm)), 0.001);
-    power = power * mix(0.9, clamp(spectral_filter, 0.05, 1.0), 0.3);
+    power = power * transmission * mix(0.9, clamp(spectral_filter, 0.05, 1.0), 0.3);
     rd = normalize(next_dir);
     ro = hit_pos + rd * 0.01;
   }

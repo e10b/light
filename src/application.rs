@@ -3299,23 +3299,24 @@ pub async fn run() {
                                 accumulation_dirty = true;
                             }
                             if current_scene_exists {
-                                if scene_kind == SceneKind::Wine && wine_visible {
-                                    photon_emitter_center = [
-                                        uniforms.mesh_center[0],
-                                        uniforms.mesh_center[1],
-                                        uniforms.mesh_center[2],
-                                        uniforms.mesh_center[3].max(0.25),
-                                    ];
-                                    photons_per_frame = 262_144;
-                                } else if scene_kind == SceneKind::Decanter
-                                    && (decanter_visible || wine_visible)
-                                {
-                                    photon_emitter_center = [
-                                        uniforms.decanter_center[0],
-                                        uniforms.decanter_center[1],
-                                        uniforms.decanter_center[2],
-                                        uniforms.decanter_center[3].max(0.25),
-                                    ];
+                                let visible_ids = main_db.scene_visible_selectable_objects(active_scene_id);
+                                let mut visible_mesh_instances: Vec<&MeshObjectInstance> = mesh_instances
+                                    .iter()
+                                    .filter(|inst| visible_ids.contains(&inst.object_id))
+                                    .collect();
+                                if !visible_mesh_instances.is_empty() {
+                                    let selected_mesh_instance = selected_object_id.and_then(|id| {
+                                        visible_mesh_instances
+                                            .iter()
+                                            .find(|inst| inst.object_id == id)
+                                            .copied()
+                                    });
+                                    let emitter = selected_mesh_instance
+                                        .or_else(|| visible_mesh_instances.first().copied())
+                                        .unwrap_or(visible_mesh_instances[0]);
+                                    let c = emitter.center();
+                                    let r = (emitter.max_extent * emitter.scale.max_element() * 0.6).max(0.25);
+                                    photon_emitter_center = [c.x, c.y, c.z, r];
                                     photons_per_frame = 262_144;
                                 }
                             }
@@ -3576,9 +3577,25 @@ pub async fn run() {
                                 &clipped_primitives,
                                 &screen_descriptor,
                             );
+                            let photon_light_pos = if scene_kind != SceneKind::Wine
+                                && uniforms.sun_light_count > 0
+                            {
+                                let count = uniforms.sun_light_count.min(MAX_SUN_LIGHTS as u32);
+                                let idx = (uniforms.frame % count) as usize;
+                                uniforms.sun_lights[idx]
+                            } else {
+                                uniforms.light_pos
+                            };
+                            let photon_frame_count = if scene_kind != SceneKind::Wine {
+                                photons_per_frame
+                                    .saturating_mul(uniforms.sun_light_count.max(1))
+                                    .min(1_000_000)
+                            } else {
+                                photons_per_frame
+                            };
                             photon_mapper.update(
                                 &queue,
-                                uniforms.light_pos,
+                                photon_light_pos,
                                 photon_emitter_center,
                                 uniforms.sphere_pos,
                                 uniforms.sphere_rot,
@@ -3592,7 +3609,7 @@ pub async fn run() {
                                 sphere_visible_for_photons,
                                 uniforms.frame,
                             );
-                            photon_mapper.emit_photons(&mut encoder, photons_per_frame);
+                            photon_mapper.emit_photons(&mut encoder, photon_frame_count);
                             photon_mapper.build_spatial_structure(&mut encoder);
                             {
                                 compute_pass.record(
