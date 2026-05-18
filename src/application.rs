@@ -1047,9 +1047,9 @@ pub async fn run() {
         1000.0,
     );
 
-    let mut scene_kind = SceneKind::Decanter;
-    let mut active_center = decanter_center;
-    let mut active_max_extent = decanter_max_extent;
+    let scene_kind = SceneKind::Decanter;
+    let active_center = decanter_center;
+    let active_max_extent = decanter_max_extent;
     let (camera_pos, camera_target) = scene_camera(scene_kind, active_center, decanter_size);
     let mut camera = Camera::look_at(camera_pos, camera_target);
     let mut uniforms = SceneUniforms {
@@ -1116,9 +1116,9 @@ pub async fn run() {
         rotation: sun_empty_rotation,
         scale: sun_empty_scale,
     }];
-    let mut wine_spotlight_azimuth_deg = -55.0;
-    let mut wine_spotlight_elevation_deg = 54.0;
-    let mut wine_spotlight_distance = wine_max_extent.max(10.0) * 1.4;
+    let wine_spotlight_azimuth_deg = -55.0;
+    let wine_spotlight_elevation_deg = 54.0;
+    let wine_spotlight_distance = wine_max_extent.max(10.0) * 1.4;
     let mut spot_empty_rotation = glam::Quat::IDENTITY;
     let mut spot_empty_scale = glam::Vec3::ONE;
     let mut spot_empty_position = wine_spotlight_position(
@@ -2205,14 +2205,6 @@ pub async fn run() {
                                     });
                                 }
 
-                            let sun_az = sun_azimuth_deg.to_radians();
-                            let sun_el = sun_elevation_deg.to_radians();
-                            let sun_dir = glam::Vec3::new(
-                                sun_az.cos() * sun_el.cos(),
-                                sun_el.sin(),
-                                sun_az.sin() * sun_el.cos(),
-                            )
-                            .normalize_or_zero();
                             let sun_lamp_pos = sun_empty_position;
                             let old_light = uniforms.light_pos;
                             let old_intensity = uniforms.sun_intensity;
