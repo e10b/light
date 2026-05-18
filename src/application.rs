@@ -67,6 +67,12 @@ struct Camera {
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
+enum CameraProjectionKind {
+    Perspective,
+    Orthographic,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
 enum GizmoModeKind {
     Translate,
     Rotate,
@@ -670,6 +676,48 @@ fn scene_camera(
     scene_kind.default_camera(center)
 }
 
+fn camera_projection_matrix(
+    mode: CameraProjectionKind,
+    fov_radians: f32,
+    ortho_height: f32,
+    near: f32,
+    far: f32,
+    width: u32,
+    height: u32,
+) -> glam::Mat4 {
+    let aspect = width.max(1) as f32 / height.max(1) as f32;
+    match mode {
+        CameraProjectionKind::Perspective => glam::Mat4::perspective_rh(fov_radians, aspect, near, far),
+        CameraProjectionKind::Orthographic => {
+            let half_h = (ortho_height * 0.5).max(0.001);
+            let half_w = (half_h * aspect).max(0.001);
+            glam::Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, near, far)
+        }
+    }
+}
+
+fn gizmo_projection_matrix(
+    mode: CameraProjectionKind,
+    fov_radians: f32,
+    ortho_height: f32,
+    near: f32,
+    far: f32,
+    width: u32,
+    height: u32,
+) -> glam::Mat4 {
+    let aspect = width.max(1) as f32 / height.max(1) as f32;
+    match mode {
+        CameraProjectionKind::Perspective => {
+            glam::Mat4::perspective_rh_gl(fov_radians, aspect, near, far)
+        }
+        CameraProjectionKind::Orthographic => {
+            let half_h = (ortho_height * 0.5).max(0.001);
+            let half_w = (half_h * aspect).max(0.001);
+            glam::Mat4::orthographic_rh_gl(-half_w, half_w, -half_h, half_h, near, far)
+        }
+    }
+}
+
 fn wine_spotlight_position(
     center: glam::Vec3,
     azimuth_deg: f32,
@@ -1095,11 +1143,19 @@ pub async fn run() {
     accel_encoder.build_acceleration_structures([model_build].iter(), iter::once(&tlas));
     queue.submit(Some(accel_encoder.finish()));
 
-    let projection = glam::Mat4::perspective_rh(
-        std::f32::consts::FRAC_PI_3 * 1.2,
-        config.width as f32 / config.height as f32,
-        0.1,
-        1000.0,
+    let mut camera_projection_mode = CameraProjectionKind::Perspective;
+    let mut camera_fov_radians = std::f32::consts::FRAC_PI_3 * 1.2;
+    let mut camera_ortho_height = 12.0f32;
+    let mut camera_near = 0.1f32;
+    let mut camera_far = 1000.0f32;
+    let projection = camera_projection_matrix(
+        camera_projection_mode,
+        camera_fov_radians,
+        camera_ortho_height,
+        camera_near,
+        camera_far,
+        config.width,
+        config.height,
     );
 
     let scene_kind = SceneKind::Decanter;
@@ -1608,11 +1664,14 @@ pub async fn run() {
             } => {
                 config.width = size.width;
                 config.height = size.height;
-                let projection = glam::Mat4::perspective_rh(
-                    std::f32::consts::FRAC_PI_3 * 1.2,
-                    config.width as f32 / config.height as f32,
-                    0.1,
-                    1000.0,
+                let projection = camera_projection_matrix(
+                    camera_projection_mode,
+                    camera_fov_radians,
+                    camera_ortho_height,
+                    camera_near,
+                    camera_far,
+                    config.width,
+                    config.height,
                 );
                 uniforms.proj_inv = projection.inverse().to_cols_array_2d();
                 uniforms.frame = 0;
@@ -1691,6 +1750,16 @@ pub async fn run() {
                     }
 
                     uniforms.view_inv = camera.view_matrix().inverse().to_cols_array_2d();
+                    let projection = camera_projection_matrix(
+                        camera_projection_mode,
+                        camera_fov_radians,
+                        camera_ortho_height,
+                        camera_near,
+                        camera_far,
+                        config.width,
+                        config.height,
+                    );
+                    uniforms.proj_inv = projection.inverse().to_cols_array_2d();
                     if camera.pos != prev_cam_pos
                         || camera.yaw != prev_cam_yaw
                         || camera.pitch != prev_cam_pitch
@@ -2244,6 +2313,67 @@ pub async fn run() {
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Scale, "Scale");
                                         });
                                         ui.separator();
+                                        ui.collapsing("Camera", |ui| {
+                                            let mut projection_changed = false;
+                                            ui.horizontal(|ui| {
+                                                projection_changed |= ui
+                                                    .selectable_value(
+                                                        &mut camera_projection_mode,
+                                                        CameraProjectionKind::Perspective,
+                                                        "Perspective",
+                                                    )
+                                                    .changed();
+                                                projection_changed |= ui
+                                                    .selectable_value(
+                                                        &mut camera_projection_mode,
+                                                        CameraProjectionKind::Orthographic,
+                                                        "Orthographic",
+                                                    )
+                                                    .changed();
+                                            });
+                                            projection_changed |= ui
+                                                .add(
+                                                    egui::Slider::new(&mut camera_near, 0.01..=10.0)
+                                                        .text("Near"),
+                                                )
+                                                .changed();
+                                            projection_changed |= ui
+                                                .add(
+                                                    egui::Slider::new(&mut camera_far, 10.0..=5000.0)
+                                                        .text("Far"),
+                                                )
+                                                .changed();
+                                            match camera_projection_mode {
+                                                CameraProjectionKind::Perspective => {
+                                                    let mut fov_deg = camera_fov_radians.to_degrees();
+                                                    if ui
+                                                        .add(egui::Slider::new(&mut fov_deg, 10.0..=140.0).text("FOV"))
+                                                        .changed()
+                                                    {
+                                                        camera_fov_radians = fov_deg.to_radians();
+                                                        projection_changed = true;
+                                                    }
+                                                }
+                                                CameraProjectionKind::Orthographic => {
+                                                    projection_changed |= ui
+                                                        .add(
+                                                            egui::Slider::new(
+                                                                &mut camera_ortho_height,
+                                                                0.1..=200.0,
+                                                            )
+                                                            .text("Height"),
+                                                        )
+                                                        .changed();
+                                                }
+                                            }
+                                            if camera_far <= camera_near + 0.001 {
+                                                camera_far = camera_near + 0.001;
+                                            }
+                                            if projection_changed {
+                                                accumulation_dirty = true;
+                                            }
+                                        });
+                                        ui.separator();
                                         ui.collapsing("Sun", |ui| {
                                             ui.add(egui::Slider::new(&mut sun_azimuth_deg, -180.0..=180.0).text("Azimuth"));
                                             ui.add(egui::Slider::new(&mut sun_elevation_deg, -10.0..=89.0).text("Elevation"));
@@ -2386,11 +2516,23 @@ pub async fn run() {
                             }
 
                             let view = camera.view_matrix();
-                            let projection = glam::Mat4::perspective_rh(
-                                std::f32::consts::FRAC_PI_3 * 1.2,
-                                config.width as f32 / config.height as f32,
-                                0.1,
-                                1000.0,
+                            let projection = camera_projection_matrix(
+                                camera_projection_mode,
+                                camera_fov_radians,
+                                camera_ortho_height,
+                                camera_near,
+                                camera_far,
+                                config.width,
+                                config.height,
+                            );
+                            let gizmo_projection = gizmo_projection_matrix(
+                                camera_projection_mode,
+                                camera_fov_radians,
+                                camera_ortho_height,
+                                camera_near,
+                                camera_far,
+                                config.width,
+                                config.height,
                             );
                             if show_editor_ui {
                             let pixels_per_point = ctx.pixels_per_point().max(1.0);
@@ -2417,7 +2559,7 @@ pub async fn run() {
                                 GizmoModeKind::Scale => GizmoMode::all_scale(),
                             };
                             let view_cols = view.to_cols_array();
-                            let proj_cols = projection.to_cols_array();
+                            let proj_cols = gizmo_projection.to_cols_array();
                             let view_matrix = transform_gizmo::math::DMat4::from_cols_array(&[
                                 view_cols[0] as f64,
                                 view_cols[1] as f64,
@@ -3037,7 +3179,7 @@ pub async fn run() {
                                     center.x,
                                     center.y,
                                     center.z,
-                                    selected_inst.max_extent * selected_inst.scale.max_element() * 0.45,
+                                    selected_inst.max_extent * selected_inst.scale.max_element() * 0.9,
                                 ];
                                 if gizmo_target == GizmoTargetKind::WineGlass {
                                     uniforms.mesh_center = [
