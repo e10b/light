@@ -1,6 +1,7 @@
 use wgpu::util::DeviceExt;
 
 const MAX_PHOTONS: u32 = 1_000_000;
+const MAX_PHOTON_TARGETS: usize = 4096;
 const VOXEL_SIZE: f32 = 0.12;
 const HASH_TABLE_SIZE: u32 = 1_048_576; // 2^20
 
@@ -31,6 +32,13 @@ pub struct Photon {
     _pad3: [u32; 3],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PhotonTarget {
+    pub center_radius: [f32; 4],
+    pub cumulative_area: [f32; 4],
+}
+
 pub struct PhotonMapper {
     emission_pipeline: wgpu::ComputePipeline,
     emission_bind_group: wgpu::BindGroup,
@@ -40,6 +48,7 @@ pub struct PhotonMapper {
     photon_counter: wgpu::Buffer,
     hash_heads: wgpu::Buffer,
     uniforms_buffer: wgpu::Buffer,
+    photon_targets: wgpu::Buffer,
     photon_count: u32,
 }
 
@@ -72,6 +81,12 @@ impl PhotonMapper {
         let hash_heads = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("photon_hash_heads"),
             size: (HASH_TABLE_SIZE as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let photon_targets = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("photon_targets"),
+            size: (MAX_PHOTON_TARGETS * std::mem::size_of::<PhotonTarget>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -115,6 +130,7 @@ impl PhotonMapper {
                 storage_entry(6, true),
                 storage_entry(7, true),
                 storage_entry(8, true),
+                storage_entry(9, true),
             ],
         });
 
@@ -166,6 +182,10 @@ impl PhotonMapper {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: mesh_mat_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: photon_targets.as_entire_binding(),
                 },
             ],
         });
@@ -238,6 +258,7 @@ impl PhotonMapper {
             photon_counter,
             hash_heads,
             uniforms_buffer,
+            photon_targets,
             photon_count: 0,
         }
     }
@@ -252,8 +273,19 @@ impl PhotonMapper {
         sphere_extent: [f32; 4],
         sphere_material: [f32; 4],
         sphere_enabled: bool,
+        photon_count: u32,
+        targets: &[PhotonTarget],
         frame: u32,
     ) {
+        let photon_count = photon_count.min(MAX_PHOTONS);
+        let target_count = targets.len().min(MAX_PHOTON_TARGETS) as u32;
+        if target_count > 0 {
+            queue.write_buffer(
+                &self.photon_targets,
+                0,
+                bytemuck::cast_slice(&targets[..target_count as usize]),
+            );
+        }
         let uniforms = PhotonMapUniforms {
             light_pos,
             emitter_center,
@@ -261,8 +293,8 @@ impl PhotonMapper {
             sphere_rot,
             sphere_extent,
             sphere_material,
-            sphere_enabled: [if sphere_enabled { 1 } else { 0 }, 0, 0, 0],
-            photon_count: self.photon_count,
+            sphere_enabled: [if sphere_enabled { 1 } else { 0 }, target_count, 0, 0],
+            photon_count,
             voxel_size: VOXEL_SIZE,
             hash_table_size: HASH_TABLE_SIZE,
             frame,

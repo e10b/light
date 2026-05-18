@@ -13,7 +13,7 @@ use crate::{
     compute_pass,
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     mesh::{load_gltf_mesh, MeshData, Vertex},
-    photon_mapper::PhotonMapper,
+    photon_mapper::{PhotonMapper, PhotonTarget},
     prism_file::{
         load_prism_database, save_prism_file, CollectionData as PrismCollectionData,
         MaterialData as PrismMaterialData, MeshData as PrismMeshData, NodeProperties, NodeType,
@@ -27,6 +27,7 @@ use crate::{
 };
 
 const MAX_SUN_LIGHTS: usize = 8;
+const MAX_PHOTON_TARGETS: usize = 4096;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -622,6 +623,31 @@ fn visible_render_geometry(
     }
 
     (verts, indices, positions, normals, triangle_material_ids)
+}
+
+fn build_photon_targets(
+    instances: &[MeshObjectInstance],
+    visible_ids: &[Id],
+    include_all: bool,
+) -> Vec<PhotonTarget> {
+    let mut cumulative_area = 0.0f32;
+    let mut targets = Vec::new();
+    for inst in instances {
+        if !include_all && !visible_ids.contains(&inst.object_id) {
+            continue;
+        }
+        if targets.len() >= MAX_PHOTON_TARGETS {
+            break;
+        }
+        let center = inst.center();
+        let radius = (inst.max_extent * inst.scale.max_element() * 0.6).max(0.25);
+        cumulative_area += 4.0 * std::f32::consts::PI * radius * radius;
+        targets.push(PhotonTarget {
+            center_radius: [center.x, center.y, center.z, radius],
+            cumulative_area: [cumulative_area, 0.0, 0.0, 0.0],
+        });
+    }
+    targets
 }
 
 fn sphere_position_for(center: glam::Vec3, size: glam::Vec3, radius: f32) -> glam::Vec3 {
@@ -3517,6 +3543,13 @@ pub async fn run() {
                                 let photon_frame_count = photons_per_frame
                                     .saturating_mul(uniforms.sun_light_count.max(1))
                                     .min(1_000_000);
+                                let photon_visible_ids =
+                                    main_db.scene_visible_selectable_objects(decanter_scene_id);
+                                let photon_targets = build_photon_targets(
+                                    &mesh_instances,
+                                    &photon_visible_ids,
+                                    stress_instance_count > 0,
+                                );
                                 photon_mapper.update(
                                     &queue,
                                     photon_light_pos,
@@ -3531,6 +3564,8 @@ pub async fn run() {
                                         0.0,
                                     ],
                                     sphere_visible_for_photons,
+                                    photon_frame_count,
+                                    &photon_targets,
                                     uniforms.frame,
                                 );
                                 photon_mapper.emit_photons(&mut encoder, photon_frame_count);

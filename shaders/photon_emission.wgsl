@@ -28,6 +28,11 @@ struct MaterialData {
   params: vec4<f32>,
 };
 
+struct PhotonTarget {
+  center_radius: vec4<f32>,
+  cumulative_area: vec4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> uniforms: PhotonMapUniforms;
 @group(0) @binding(1) var acc_struct: acceleration_structure;
 @group(0) @binding(2) var<storage, read_write> photons: array<Photon>;
@@ -37,9 +42,13 @@ struct MaterialData {
 @group(0) @binding(6) var<storage, read> mesh_indices: array<u32>;
 @group(0) @binding(7) var<storage, read> mesh_triangle_material: array<u32>;
 @group(0) @binding(8) var<storage, read> materials: array<MaterialData>;
+@group(0) @binding(9) var<storage, read> photon_targets: array<PhotonTarget>;
 
 const MAX_PHOTONS: u32 = 1000000u;
+const MAX_PHOTON_TARGETS: u32 = 4096u;
 const PI: f32 = 3.141592653589793;
+const REFERENCE_PHOTON_COUNT: f32 = 262144.0;
+const REFERENCE_PHOTON_POWER: f32 = 0.035;
 
 fn hash(x: u32) -> u32 {
   var v = x;
@@ -78,6 +87,25 @@ fn write_photon(slot: u32, position: vec3<f32>, direction: vec3<f32>, wavelength
   photons[slot].direction = direction;
   photons[slot].power = power;
   photons[slot].next = 0u;
+}
+
+fn sample_photon_target(seed: u32) -> vec4<f32> {
+  let target_count = min(uniforms.sphere_enabled.y, MAX_PHOTON_TARGETS);
+  if (target_count == 0u) {
+    return uniforms.emitter_center;
+  }
+
+  let selected_index = min(u32(rand01(seed ^ 0xa511e9b3u) * f32(target_count)), target_count - 1u);
+  var selected = photon_targets[selected_index].center_radius;
+  selected.w = max(selected.w, 0.25);
+  return selected;
+}
+
+fn normalized_photon_power() -> f32 {
+  let target_count = min(uniforms.sphere_enabled.y, MAX_PHOTON_TARGETS);
+  let count_scale = REFERENCE_PHOTON_COUNT / f32(max(uniforms.photon_count, 1u));
+  let object_share_scale = select(1.0, f32(target_count), target_count > 0u);
+  return REFERENCE_PHOTON_POWER * count_scale * object_share_scale;
 }
 
 fn ground_plane_intersection(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
@@ -123,23 +151,25 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= uniforms.photon_count) { return; }
 
   let center = uniforms.emitter_center.xyz;
-  let radius = max(uniforms.emitter_center.w, 1.0);
-  let disk = disk_sample(gid.x * 9781u + uniforms.frame * 6271u, radius);
+  let photon_target = sample_photon_target(gid.x * 9127u + uniforms.frame * 7331u);
+  let target_center = photon_target.xyz;
+  let target_radius = max(photon_target.w, 0.25);
+  let disk = disk_sample(gid.x * 9781u + uniforms.frame * 6271u, target_radius);
 
   let is_spotlight = uniforms.light_pos.w < 0.0;
   let sun_to_scene = -normalize(uniforms.light_pos.xyz);
   let spot_position = uniforms.light_pos.xyz;
-  let spot_axis = normalize(center - spot_position);
+  let spot_axis = normalize(target_center - spot_position);
   let light_axis = select(sun_to_scene, spot_axis, is_spotlight);
   let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light_axis.y) < 0.95);
   let tangent = normalize(cross(up, light_axis));
   let bitangent = cross(light_axis, tangent);
-  let aperture = disk * select(1.0, 0.08, is_spotlight);
+  let target_point = target_center + tangent * disk.x + bitangent * disk.y;
 
-  var ro = select(center - light_axis * 70.0 + tangent * disk.x + bitangent * disk.y, spot_position, is_spotlight);
-  var rd = normalize(select(light_axis, center + tangent * aperture.x + bitangent * aperture.y - spot_position, is_spotlight));
+  var ro = select(target_point - light_axis * (target_radius * 2.0 + 0.05), spot_position, is_spotlight);
+  var rd = normalize(select(light_axis, target_point - spot_position, is_spotlight));
   let lambda_nm = 380.0 + 400.0 * rand01(gid.x * 8191u + uniforms.frame * 131u + 17u);
-  var power = 0.035;
+  var power = normalized_photon_power();
   var passed_glass = false;
   write_photon(gid.x, center, vec3<f32>(0.0, 1.0, 0.0), lambda_nm, 0.0);
 
