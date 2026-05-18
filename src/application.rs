@@ -119,30 +119,12 @@ struct LightObjectInstance {
     scale: glam::Vec3,
 }
 
-fn default_target_for_scene(scene_kind: SceneKind) -> GizmoTargetKind {
-    match scene_kind {
-        SceneKind::Decanter => GizmoTargetKind::Decanter,
-        SceneKind::Wine => GizmoTargetKind::WineGlass,
-        SceneKind::CornellBox => GizmoTargetKind::CornellBox,
-    }
+fn default_target_for_scene(_scene_kind: SceneKind) -> GizmoTargetKind {
+    GizmoTargetKind::Decanter
 }
 
-fn target_allowed_in_scene(scene_kind: SceneKind, target: GizmoTargetKind) -> bool {
-    match scene_kind {
-        SceneKind::Decanter => matches!(
-            target,
-            GizmoTargetKind::Sphere
-                | GizmoTargetKind::Decanter
-                | GizmoTargetKind::WineGlass
-                | GizmoTargetKind::CornellBox
-                | GizmoTargetKind::SunLamp
-        ),
-        SceneKind::Wine => matches!(
-            target,
-            GizmoTargetKind::WineGlass | GizmoTargetKind::WineSpotlight
-        ),
-        SceneKind::CornellBox => matches!(target, GizmoTargetKind::CornellBox),
-    }
+fn target_allowed_in_scene(_scene_kind: SceneKind, _target: GizmoTargetKind) -> bool {
+    true
 }
 
 fn target_label(target: GizmoTargetKind) -> &'static str {
@@ -840,70 +822,41 @@ pub async fn run() {
 
     let decanter_path = std::path::Path::new("res/wine_decanter_and_glass.glb");
     let wine_path = std::path::Path::new("res/red_wine_glass.glb");
-    let mut mesh = load_gltf_mesh(decanter_path).expect("Failed to load decanter model");
+
+    let sphere_radius = 6.0;
+    let default_cube_center = glam::Vec3::new(0.0, -1.5 + sphere_radius, 0.0);
+    let default_cube_mesh = make_cube_mesh(default_cube_center, 1.5);
+    let default_cube_vertex_len = default_cube_mesh.vertices.len();
+    let (cube_center, cube_size, _, _) = mesh_bounds(&default_cube_mesh.vertices);
+    let cube_max_extent = cube_size.max_element().max(0.1);
+    let mut mesh = default_cube_mesh;
+
+    // No preloaded scene-specific geometry: start from one mesh object path only.
     let decanter_material_start = 0usize;
-    let decanter_material_count = mesh.materials.len();
+    let decanter_material_count = 0usize;
     let decanter_vertex_start = 0usize;
-    let decanter_vertex_count = mesh.positions4.len();
+    let decanter_vertex_count = 0usize;
     let decanter_index_start = 0usize;
-    let decanter_index_count = mesh.indices.len();
-    let decanter_base_positions: Vec<glam::Vec3> = mesh
-        .positions4
-        .iter()
-        .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
-        .collect();
-    let decanter_base_normals: Vec<glam::Vec3> = mesh
-        .normals4
-        .iter()
-        .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
-        .collect();
-    let mut wine_mesh = load_gltf_mesh(wine_path).expect("Failed to load red wine model");
-    let (decanter_center, decanter_size, _, decanter_max) = mesh_bounds(&mesh.vertices);
-    let (wine_original_center, _, _, _) = mesh_bounds(&wine_mesh.vertices);
-    orient_and_scale_mesh(
-        &mut wine_mesh,
-        wine_original_center,
-        glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
-        25.0,
-    );
-    let (wine_oriented_center, wine_size, wine_min, _) = mesh_bounds(&wine_mesh.vertices);
-    let wine_target_center = glam::Vec3::new(
-        decanter_max.x + wine_size.x * 0.5 + 36.0,
-        wine_oriented_center.y + (-1.5 - wine_min.y),
-        decanter_center.z,
-    );
-    translate_mesh(&mut wine_mesh, wine_target_center - wine_oriented_center);
-    let (wine_center, wine_size, _, _) = mesh_bounds(&wine_mesh.vertices);
-    let wine_vertex_start = mesh.positions4.len();
-    let wine_vertex_count = wine_mesh.positions4.len();
-    let wine_index_start = mesh.indices.len();
-    let wine_index_count = wine_mesh.indices.len();
-    append_mesh(&mut mesh, wine_mesh);
-    let wine_material_start = decanter_material_start + decanter_material_count;
-    let wine_material_count = mesh.materials.len().saturating_sub(wine_material_start);
-    let wine_base_positions: Vec<glam::Vec3> = mesh.positions4
-        [wine_vertex_start..wine_vertex_start + wine_vertex_count]
-        .iter()
-        .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
-        .collect();
-    let wine_base_normals: Vec<glam::Vec3> = mesh.normals4
-        [wine_vertex_start..wine_vertex_start + wine_vertex_count]
-        .iter()
-        .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
-        .collect();
+    let decanter_index_count = 0usize;
+    let decanter_base_positions: Vec<glam::Vec3> = Vec::new();
+    let decanter_base_normals: Vec<glam::Vec3> = Vec::new();
+    let decanter_center = cube_center;
+    let decanter_size = cube_size;
 
-    let mut model_verts = mesh.vertices.clone();
-    let mut model_idx = mesh.indices.clone();
+    let wine_center = cube_center;
+    let wine_size = cube_size;
+    let wine_vertex_start = 0usize;
+    let wine_vertex_count = 0usize;
+    let wine_index_start = 0usize;
+    let wine_index_count = 0usize;
+    let wine_material_start = 0usize;
+    let wine_material_count = 0usize;
+    let wine_base_positions: Vec<glam::Vec3> = Vec::new();
+    let wine_base_normals: Vec<glam::Vec3> = Vec::new();
 
-    println!(
-        "Loaded {} vertices and {} indices from decanter + wine",
-        model_verts.len(),
-        model_idx.len()
-    );
-
-    let (center, size, _, _) = mesh_bounds(&model_verts);
-    let decanter_max_extent = decanter_size.max_element();
-    let wine_max_extent = wine_size.max_element();
+    let (center, size, _, _) = mesh_bounds(&mesh.vertices);
+    let decanter_max_extent = cube_max_extent;
+    let wine_max_extent = cube_max_extent;
     let render_width = 1280u32;
     let render_height = 720u32;
 
@@ -932,44 +885,51 @@ pub async fn run() {
     object_material_names.insert(wine_obj_id, "Glass".to_string());
     object_material_names.insert(cornell_obj_id, "Empty".to_string());
     let mut last_material_signature = String::new();
-    let mut mesh_instances = vec![
-        MeshObjectInstance {
-            object_id: decanter_obj_id,
-            vertex_start: decanter_vertex_start,
-            vertex_count: decanter_vertex_count,
-            index_start: decanter_index_start,
-            index_count: decanter_index_count,
-            material_start: decanter_material_start,
-            material_count: decanter_material_count,
-            base_positions: decanter_base_positions.clone(),
-            base_normals: decanter_base_normals.clone(),
-            pivot: decanter_center,
-            max_extent: decanter_max_extent,
-            rotation: glam::Quat::IDENTITY,
-            translation: glam::Vec3::ZERO,
-            scale: glam::Vec3::ONE,
-        },
-        MeshObjectInstance {
-            object_id: wine_obj_id,
-            vertex_start: wine_vertex_start,
-            vertex_count: wine_vertex_count,
-            index_start: wine_index_start,
-            index_count: wine_index_count,
-            material_start: wine_material_start,
-            material_count: wine_material_count,
-            base_positions: wine_base_positions.clone(),
-            base_normals: wine_base_normals.clone(),
-            pivot: wine_center,
-            max_extent: wine_max_extent,
-            rotation: glam::Quat::IDENTITY,
-            translation: glam::Vec3::ZERO,
-            scale: glam::Vec3::ONE,
-        },
-    ];
+    let default_cube_mesh_id = main_db.create_mesh("CubeMesh", default_cube_vertex_len);
+    if let Some(mesh_db) = main_db.meshes.get_mut(&default_cube_mesh_id) {
+        mesh_db.user_count = 1;
+    }
+    if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
+        obj.mesh_id = Some(default_cube_mesh_id);
+    }
+    let default_cube_instance = MeshObjectInstance {
+        object_id: sphere_obj_id,
+        vertex_start: 0,
+        vertex_count: mesh.positions4.len(),
+        index_start: 0,
+        index_count: mesh.indices.len(),
+        material_start: 0,
+        material_count: mesh.materials.len(),
+        base_positions: mesh
+            .positions4
+            .iter()
+            .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
+            .collect(),
+        base_normals: mesh
+            .normals4
+            .iter()
+            .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
+            .collect(),
+        pivot: cube_center,
+        max_extent: cube_max_extent,
+        rotation: glam::Quat::IDENTITY,
+        translation: glam::Vec3::ZERO,
+        scale: glam::Vec3::ONE,
+    };
+
+    let mut model_verts = mesh.vertices.clone();
+    let mut model_idx = mesh.indices.clone();
+    println!(
+        "Loaded {} vertices and {} indices from default cube mesh object",
+        model_verts.len(),
+        model_idx.len()
+    );
+
+    let mut mesh_instances = vec![default_cube_instance];
 
     let mut object_target_by_id: std::collections::HashMap<Id, GizmoTargetKind> =
         std::collections::HashMap::new();
-    object_target_by_id.insert(sphere_obj_id, GizmoTargetKind::Sphere);
+    object_target_by_id.insert(sphere_obj_id, GizmoTargetKind::Decanter);
     object_target_by_id.insert(sun_obj_id, GizmoTargetKind::SunLamp);
     object_target_by_id.insert(spot_obj_id, GizmoTargetKind::WineSpotlight);
     object_target_by_id.insert(decanter_obj_id, GizmoTargetKind::Decanter);
@@ -1088,21 +1048,19 @@ pub async fn run() {
     );
 
     let mut scene_kind = SceneKind::Decanter;
-    let sphere_radius = 6.0;
     let mut active_center = decanter_center;
     let mut active_max_extent = decanter_max_extent;
-    let sphere_pos = sphere_position_for(active_center, decanter_size, sphere_radius);
     let (camera_pos, camera_target) = scene_camera(scene_kind, active_center, decanter_size);
     let mut camera = Camera::look_at(camera_pos, camera_target);
     let mut uniforms = SceneUniforms {
         view_inv: camera.view_matrix().inverse().to_cols_array_2d(),
         proj_inv: projection.inverse().to_cols_array_2d(),
         light_pos: [10.0, 8.0, 10.0, 1.0],
-        sphere_pos: [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius],
+        sphere_pos: [1.0e9, 1.0e9, 1.0e9, 0.001],
         sphere_color: [0.98, 1.0, 1.0, 1.0],
         sphere_params: [0.02, 1.52, 1.0, 0.0],
         sphere_rot: [0.0, 0.0, 0.0, 1.0],
-        sphere_extent: [sphere_radius, sphere_radius, sphere_radius, 0.0],
+        sphere_extent: [0.001, 0.001, 0.001, 0.0],
         mesh_center: [
             wine_center.x,
             wine_center.y,
@@ -1685,31 +1643,18 @@ pub async fn run() {
                             let mut photons_per_frame = 0u32;
                             let mut sphere_visible_for_photons = false;
                             let full_output = egui_ctx.run(raw_input, |ctx| {
-                                let mut requested_scene = scene_kind;
                                 let mut suppress_scene_click = false;
-                                let current_scene_exists = match scene_kind {
-                                    SceneKind::Decanter => decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id),
-                                    SceneKind::Wine => wine_scene_id.0 != 0 && main_db.scenes.contains_key(&wine_scene_id),
-                                    SceneKind::CornellBox => cornell_scene_id.0 != 0 && main_db.scenes.contains_key(&cornell_scene_id),
-                                };
-                                let has_decanter = decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id);
-                                let has_wine = wine_scene_id.0 != 0 && main_db.scenes.contains_key(&wine_scene_id);
-                                let has_cornell = cornell_scene_id.0 != 0 && main_db.scenes.contains_key(&cornell_scene_id);
+                                let current_scene_exists =
+                                    decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id);
 
                                 if show_editor_ui {
                                 egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.strong("Prism");
                                         ui.separator();
-                                        if ui.button("New Cube Scene").clicked() {
-                                            requested_scene = SceneKind::Decanter;
-                                        }
+                                        let _ = ui.button("New Cube Scene");
                                         ui.menu_button("Add", |ui| {
-                                            let scene_id = match scene_kind {
-                                                SceneKind::Decanter => decanter_scene_id,
-                                                SceneKind::Wine => wine_scene_id,
-                                                SceneKind::CornellBox => cornell_scene_id,
-                                            };
+                                            let scene_id = decanter_scene_id;
                                             match scene_kind {
                                                 SceneKind::Decanter => {
                                                     if ui.button("Cube").clicked() {
@@ -2114,13 +2059,6 @@ pub async fn run() {
                                                             }
                                                         }
                                                     }
-                                                    if decanter_scene_id.0 != 0 {
-                                                        requested_scene = SceneKind::Decanter;
-                                                    } else if wine_scene_id.0 != 0 {
-                                                        requested_scene = SceneKind::Wine;
-                                                    } else if cornell_scene_id.0 != 0 {
-                                                        requested_scene = SceneKind::CornellBox;
-                                                    }
                                                     accumulation_dirty = true;
                                                     project_status = "Opened: res/scenes.prism".to_string();
                                                 }
@@ -2149,23 +2087,9 @@ pub async fn run() {
                                     .default_width(230.0)
                                     .show(ctx, |ui| {
                                         ui.heading("Outliner");
-                                        ui.horizontal(|ui| {
-                                            if has_decanter && ui.selectable_label(scene_kind == SceneKind::Decanter, "Scene").clicked() {
-                                                requested_scene = SceneKind::Decanter;
-                                            }
-                                            if has_wine && ui.selectable_label(scene_kind == SceneKind::Wine, "Wine").clicked() {
-                                                requested_scene = SceneKind::Wine;
-                                            }
-                                            if has_cornell && ui.selectable_label(scene_kind == SceneKind::CornellBox, "Cornell").clicked() {
-                                                requested_scene = SceneKind::CornellBox;
-                                            }
-                                        });
+                                        ui.label("Scene");
                                         ui.separator();
-                                        let scene_id = match scene_kind {
-                                            SceneKind::Decanter => decanter_scene_id,
-                                            SceneKind::Wine => wine_scene_id,
-                                            SceneKind::CornellBox => cornell_scene_id,
-                                        };
+                                        let scene_id = decanter_scene_id;
                                         for object_id in main_db.scene_visible_selectable_objects(scene_id) {
                                             if let Some(target) = object_target_by_id.get(&object_id).copied() {
                                                 if !target_allowed_in_scene(scene_kind, target) {
@@ -2240,19 +2164,6 @@ pub async fn run() {
                                             ui.add(egui::Slider::new(&mut sun_elevation_deg, -10.0..=89.0).text("Elevation"));
                                             ui.add(egui::Slider::new(&mut sun_intensity, 0.0..=5.0).text("Intensity"));
                                         });
-                                        ui.collapsing("Spotlight", |ui| {
-                                            let az_changed = ui.add(egui::Slider::new(&mut wine_spotlight_azimuth_deg, -180.0..=180.0).text("Azimuth")).changed();
-                                            let el_changed = ui.add(egui::Slider::new(&mut wine_spotlight_elevation_deg, 5.0..=85.0).text("Elevation")).changed();
-                                            let dist_changed = ui.add(egui::Slider::new(&mut wine_spotlight_distance, 2.0..=wine_max_extent.max(10.0) * 4.0).text("Distance")).changed();
-                                            if scene_kind == SceneKind::Wine && (az_changed || el_changed || dist_changed) {
-                                                spot_empty_position = wine_spotlight_position(
-                                                    active_center,
-                                                    wine_spotlight_azimuth_deg,
-                                                    wine_spotlight_elevation_deg,
-                                                    wine_spotlight_distance,
-                                                );
-                                            }
-                                        });
                                         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                                             ui.separator();
                                             ui.collapsing("Shader Graph", |ui| {
@@ -2294,80 +2205,6 @@ pub async fn run() {
                                     });
                                 }
 
-                            let requested_scene_exists = match requested_scene {
-                                SceneKind::Decanter => decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id),
-                                SceneKind::Wine => wine_scene_id.0 != 0 && main_db.scenes.contains_key(&wine_scene_id),
-                                SceneKind::CornellBox => {
-                                    cornell_scene_id.0 != 0 && main_db.scenes.contains_key(&cornell_scene_id)
-                                }
-                            };
-                            if requested_scene != scene_kind && requested_scene_exists {
-                                scene_kind = requested_scene;
-                                gizmo_target = default_target_for_scene(scene_kind);
-                                selected_object_id = match gizmo_target {
-                                    GizmoTargetKind::Sphere => Some(sphere_obj_id),
-                                    GizmoTargetKind::Decanter => Some(decanter_obj_id),
-                                    GizmoTargetKind::WineGlass => Some(wine_obj_id),
-                                    GizmoTargetKind::CornellBox => Some(cornell_obj_id),
-                                    GizmoTargetKind::SunLamp => Some(sun_obj_id),
-                                    GizmoTargetKind::WineSpotlight => Some(spot_obj_id),
-                                };
-                                has_selection = true;
-                                uniforms.scene_kind = scene_kind.index();
-                                let (next_center, next_size, next_extent) = match scene_kind {
-                                    SceneKind::Decanter => {
-                                        (decanter_center, decanter_size, decanter_max_extent)
-                                    }
-                                    SceneKind::Wine => (wine_center, wine_size, wine_max_extent),
-                                    SceneKind::CornellBox => {
-                                        (glam::Vec3::ZERO, glam::Vec3::splat(2.0), 2.0)
-                                    }
-                                };
-                                active_center = next_center;
-                                active_max_extent = next_extent;
-                                let sphere_pos =
-                                    sphere_position_for(active_center, next_size, sphere_radius);
-                                        uniforms.sphere_pos =
-                                    [sphere_pos.x, sphere_pos.y, sphere_pos.z, sphere_radius];
-                                uniforms.sphere_extent = [
-                                    sphere_radius * sphere_scale.x,
-                                    sphere_radius * sphere_scale.y,
-                                    sphere_radius * sphere_scale.z,
-                                    0.0,
-                                ];
-                                uniforms.mesh_center = [
-                                    wine_center.x + wine_translation.x,
-                                    wine_center.y + wine_translation.y,
-                                    wine_center.z + wine_translation.z,
-                                    wine_max_extent * wine_scale.max_element() * 0.8,
-                                ];
-                                let (camera_pos, camera_target) =
-                                    scene_camera(scene_kind, active_center, next_size);
-                                camera = Camera::look_at(camera_pos, camera_target);
-                                uniforms.view_inv =
-                                    camera.view_matrix().inverse().to_cols_array_2d();
-                                if scene_kind != SceneKind::Wine {
-                                    let sun_dir_reset = glam::Vec3::new(
-                                        sun_azimuth_deg.to_radians().cos()
-                                            * sun_elevation_deg.to_radians().cos(),
-                                        sun_elevation_deg.to_radians().sin(),
-                                        sun_azimuth_deg.to_radians().sin()
-                                            * sun_elevation_deg.to_radians().cos(),
-                                    )
-                                    .normalize_or_zero();
-                                    sun_empty_position =
-                                        active_center + sun_dir_reset * sun_lamp_distance.max(1.0);
-                                } else {
-                                    spot_empty_position = wine_spotlight_position(
-                                        active_center,
-                                        wine_spotlight_azimuth_deg,
-                                        wine_spotlight_elevation_deg,
-                                        wine_spotlight_distance,
-                                    );
-                                }
-                                accumulation_dirty = true;
-                            }
-
                             let sun_az = sun_azimuth_deg.to_radians();
                             let sun_el = sun_elevation_deg.to_radians();
                             let sun_dir = glam::Vec3::new(
@@ -2376,23 +2213,10 @@ pub async fn run() {
                                 sun_az.sin() * sun_el.cos(),
                             )
                             .normalize_or_zero();
-                            let sun_lamp_pos = if scene_kind == SceneKind::Wine {
-                                active_center + sun_dir * sun_lamp_distance.max(1.0)
-                            } else {
-                                sun_empty_position
-                            };
+                            let sun_lamp_pos = sun_empty_position;
                             let old_light = uniforms.light_pos;
                             let old_intensity = uniforms.sun_intensity;
-                            uniforms.light_pos = if scene_kind == SceneKind::Wine {
-                                let to_spot = spot_empty_position - active_center;
-                                let spot_len = to_spot.length().max(1.0);
-                                let spot_dir = to_spot / spot_len;
-                                wine_spotlight_distance = spot_len;
-                                wine_spotlight_azimuth_deg = spot_dir.z.atan2(spot_dir.x).to_degrees();
-                                let spot_len_xz = (spot_dir.x * spot_dir.x + spot_dir.z * spot_dir.z).sqrt().max(1e-5);
-                                wine_spotlight_elevation_deg = spot_dir.y.atan2(spot_len_xz).to_degrees();
-                                [spot_empty_position.x, spot_empty_position.y, spot_empty_position.z, -1.0]
-                            } else {
+                            uniforms.light_pos = {
                                 let d = (sun_lamp_pos - active_center).normalize_or_zero();
                                 sun_azimuth_deg = d.z.atan2(d.x).to_degrees();
                                 let len_xz = (d.x * d.x + d.z * d.z).sqrt().max(1e-5);
@@ -2401,12 +2225,8 @@ pub async fn run() {
                             };
                             uniforms.sun_lights = [[0.0, 0.0, 0.0, 0.0]; MAX_SUN_LIGHTS];
                             uniforms.sun_light_count = 0;
-                            if current_scene_exists && scene_kind != SceneKind::Wine {
-                                let scene_id = match scene_kind {
-                                    SceneKind::Decanter => decanter_scene_id,
-                                    SceneKind::Wine => wine_scene_id,
-                                    SceneKind::CornellBox => cornell_scene_id,
-                                };
+                            if current_scene_exists {
+                                let scene_id = decanter_scene_id;
                                 let visible = main_db.scene_visible_selectable_objects(scene_id);
                                 for light in light_instances
                                     .iter()
@@ -2863,11 +2683,7 @@ pub async fn run() {
                                 && !gizmo.is_focused()
                                 && !mouse_left_dragging
                             {
-                                let scene_id = match scene_kind {
-                                    SceneKind::Decanter => decanter_scene_id,
-                                    SceneKind::Wine => wine_scene_id,
-                                    SceneKind::CornellBox => cornell_scene_id,
-                                };
+                                let scene_id = decanter_scene_id;
                                 let selectable_ids = main_db.scene_visible_selectable_objects(scene_id);
                                 let sphere_allowed = selectable_ids.contains(&sphere_obj_id);
                                 let cornell_allowed = selectable_ids.contains(&cornell_obj_id);
@@ -2883,7 +2699,7 @@ pub async fn run() {
                                     uniforms.sphere_pos[1],
                                     uniforms.sphere_pos[2],
                                 );
-                                let sphere_hit = if scene_kind == SceneKind::Decanter && sphere_allowed {
+                                let sphere_hit = if sphere_allowed {
                                     intersect_cube(
                                         ro,
                                         rd,
@@ -2907,7 +2723,7 @@ pub async fn run() {
                                 } else {
                                     None
                                 };
-                                let spot_hit = if scene_kind == SceneKind::Wine && spot_allowed {
+                                let spot_hit = if spot_allowed {
                                     intersect_sphere(ro, rd, spot_empty_position, 1.2)
                                 } else {
                                     None
@@ -2927,10 +2743,7 @@ pub async fn run() {
                                     let Some(target) = object_target_by_id.get(&inst.object_id).copied() else {
                                         continue;
                                     };
-                                    if !matches!(target, GizmoTargetKind::Decanter | GizmoTargetKind::WineGlass) {
-                                        continue;
-                                    }
-                                    if scene_kind == SceneKind::Wine && target != GizmoTargetKind::WineGlass {
+                                    if matches!(target, GizmoTargetKind::SunLamp | GizmoTargetKind::WineSpotlight) {
                                         continue;
                                     }
                                     if let Some(t) = intersect_sphere(
@@ -2951,16 +2764,14 @@ pub async fn run() {
                                         best = Some((GizmoTargetKind::CornellBox, cornell_obj_id));
                                     }
                                 }
-                                if scene_kind == SceneKind::Decanter {
-                                    for light in &light_instances {
-                                        if !selectable_ids.contains(&light.object_id) {
-                                            continue;
-                                        }
-                                        if let Some(t) = intersect_sphere(ro, rd, light.position, 1.2) {
-                                            if t < best_t {
-                                                best_t = t;
-                                                best = Some((GizmoTargetKind::SunLamp, light.object_id));
-                                            }
+                                for light in &light_instances {
+                                    if !selectable_ids.contains(&light.object_id) {
+                                        continue;
+                                    }
+                                    if let Some(t) = intersect_sphere(ro, rd, light.position, 1.2) {
+                                        if t < best_t {
+                                            best_t = t;
+                                            best = Some((GizmoTargetKind::SunLamp, light.object_id));
                                         }
                                     }
                                 }
@@ -3109,11 +2920,7 @@ pub async fn run() {
                             } else {
                                 0
                             };
-                            let active_scene_id = match scene_kind {
-                                SceneKind::Decanter => decanter_scene_id,
-                                SceneKind::Wine => wine_scene_id,
-                                SceneKind::CornellBox => cornell_scene_id,
-                            };
+                            let active_scene_id = decanter_scene_id;
                             let (sphere_visible, decanter_visible, wine_visible, cornell_visible) = if current_scene_exists {
                                 let visible = main_db.scene_visible_selectable_objects(active_scene_id);
                                 (
@@ -3400,11 +3207,7 @@ pub async fn run() {
                                             inst.translation,
                                         );
                                     }
-                                    let render_scene_id = match scene_kind {
-                                        SceneKind::Decanter => decanter_scene_id,
-                                        SceneKind::Wine => wine_scene_id,
-                                        SceneKind::CornellBox => cornell_scene_id,
-                                    };
+                                    let render_scene_id = decanter_scene_id;
                                     let visible_render_ids = main_db.scene_visible_selectable_objects(render_scene_id);
                                     let (
                                         render_verts,
@@ -3577,22 +3380,16 @@ pub async fn run() {
                                 &clipped_primitives,
                                 &screen_descriptor,
                             );
-                            let photon_light_pos = if scene_kind != SceneKind::Wine
-                                && uniforms.sun_light_count > 0
-                            {
+                            let photon_light_pos = if uniforms.sun_light_count > 0 {
                                 let count = uniforms.sun_light_count.min(MAX_SUN_LIGHTS as u32);
                                 let idx = (uniforms.frame % count) as usize;
                                 uniforms.sun_lights[idx]
                             } else {
                                 uniforms.light_pos
                             };
-                            let photon_frame_count = if scene_kind != SceneKind::Wine {
-                                photons_per_frame
-                                    .saturating_mul(uniforms.sun_light_count.max(1))
-                                    .min(1_000_000)
-                            } else {
-                                photons_per_frame
-                            };
+                            let photon_frame_count = photons_per_frame
+                                .saturating_mul(uniforms.sun_light_count.max(1))
+                                .min(1_000_000);
                             photon_mapper.update(
                                 &queue,
                                 photon_light_pos,

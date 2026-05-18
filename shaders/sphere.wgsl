@@ -459,7 +459,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
   if (uniforms.scene_kind == 1u) {
     return trace_cornell(origin, direction, seed_in);
   }
-  let is_wine_scene = uniforms.scene_kind == 2u;
+  let is_wine_scene = false;
 
   var L = vec3<f32>(0.0);
   var throughput = vec3<f32>(1.0);
@@ -757,7 +757,7 @@ fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   if (uniforms.selected_object == 0u) {
     return 0.0;
   }
-  let is_wine_scene = uniforms.scene_kind == 2u;
+  let is_wine_scene = false;
   var ro = origin;
   let rd = direction;
 
