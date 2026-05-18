@@ -25,6 +25,8 @@ use crate::{
     window::create_window,
 };
 
+const MAX_SUN_LIGHTS: usize = 8;
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct SceneUniforms {
@@ -41,6 +43,7 @@ struct SceneUniforms {
     cornell_center: [f32; 4],
     cornell_color: [f32; 4],
     cornell_params: [f32; 4],
+    sun_lights: [[f32; 4]; MAX_SUN_LIGHTS],
     sun_intensity: f32,
     frame: u32,
     scene_kind: u32,
@@ -51,7 +54,8 @@ struct SceneUniforms {
     decanter_enabled: u32,
     wine_enabled: u32,
     cornell_enabled: u32,
-    _pad: [u32; 5],
+    sun_light_count: u32,
+    _pad: [u32; 1],
 }
 
 struct Camera {
@@ -105,6 +109,14 @@ impl MeshObjectInstance {
     fn center(&self) -> glam::Vec3 {
         self.pivot + self.translation
     }
+}
+
+#[derive(Clone)]
+struct LightObjectInstance {
+    object_id: Id,
+    position: glam::Vec3,
+    rotation: glam::Quat,
+    scale: glam::Vec3,
 }
 
 fn default_target_for_scene(scene_kind: SceneKind) -> GizmoTargetKind {
@@ -176,6 +188,20 @@ fn make_white_material() -> PrismMaterialData {
                     input_socket: "Surface".to_string(),
                 },
             );
+            g
+        },
+    }
+}
+
+fn make_empty_material() -> PrismMaterialData {
+    PrismMaterialData {
+        name: "Empty".to_string(),
+        graph: {
+            let mut g = petgraph::graph::DiGraph::new();
+            g.add_node(ShaderNode {
+                node_type: NodeType::MaterialOutput,
+                properties: NodeProperties::default(),
+            });
             g
         },
     }
@@ -897,13 +923,14 @@ pub async fn run() {
     let mut material_library: std::collections::HashMap<String, PrismMaterialData> =
         std::collections::HashMap::new();
     material_library.insert("White".to_string(), make_white_material());
+    material_library.insert("Empty".to_string(), make_empty_material());
     material_library.insert("Glass".to_string(), make_glass_material());
     let mut object_material_names: std::collections::HashMap<Id, String> =
         std::collections::HashMap::new();
     object_material_names.insert(sphere_obj_id, "Glass".to_string());
     object_material_names.insert(decanter_obj_id, "Glass".to_string());
     object_material_names.insert(wine_obj_id, "Glass".to_string());
-    object_material_names.insert(cornell_obj_id, "White".to_string());
+    object_material_names.insert(cornell_obj_id, "Empty".to_string());
     let mut last_material_signature = String::new();
     let mut mesh_instances = vec![
         MeshObjectInstance {
@@ -1091,6 +1118,7 @@ pub async fn run() {
         cornell_center: [0.0, 0.5, -1.0, 1.0],
         cornell_color: [1.0, 1.0, 1.0, 0.0],
         cornell_params: [0.7, 1.0, 0.0, 0.0],
+        sun_lights: [[0.0, 0.0, 0.0, 0.0]; MAX_SUN_LIGHTS],
         sun_intensity: 0.8,
         frame: 0,
         scene_kind: scene_kind.index(),
@@ -1101,7 +1129,8 @@ pub async fn run() {
         decanter_enabled: 0,
         wine_enabled: 0,
         cornell_enabled: 0,
-        _pad: [0; 5],
+        sun_light_count: 0,
+        _pad: [0; 1],
     };
 
     let mut sun_azimuth_deg = uniforms.light_pos[2]
@@ -1123,6 +1152,12 @@ pub async fn run() {
         )
         .normalize_or_zero()
             * sun_lamp_distance;
+    let mut light_instances = vec![LightObjectInstance {
+        object_id: sun_obj_id,
+        position: sun_empty_position,
+        rotation: sun_empty_rotation,
+        scale: sun_empty_scale,
+    }];
     let mut wine_spotlight_azimuth_deg = -55.0;
     let mut wine_spotlight_elevation_deg = 54.0;
     let mut wine_spotlight_distance = wine_max_extent.max(10.0) * 1.4;
@@ -1710,8 +1745,33 @@ pub async fn run() {
                                                         ui.close();
                                                     }
                                                     if ui.button("Sun Lamp").clicked() {
-                                                        main_db.collection_link_object(decanter_master, sun_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sun_obj_id, true, true);
+                                                        let count = main_db
+                                                            .objects
+                                                            .values()
+                                                            .filter(|o| o.name.starts_with("Sun Lamp"))
+                                                            .count()
+                                                            + 1;
+                                                        let obj_id = main_db.create_object(
+                                                            format!("Sun Lamp {count}"),
+                                                            None,
+                                                            DbTransform::default(),
+                                                        );
+                                                        let pos = active_center
+                                                            + glam::Vec3::new(count as f32 * 3.0, 8.0, 10.0);
+                                                        main_db.collection_link_object(decanter_master, obj_id);
+                                                        main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                        object_target_by_id.insert(obj_id, GizmoTargetKind::SunLamp);
+                                                        light_instances.push(LightObjectInstance {
+                                                            object_id: obj_id,
+                                                            position: pos,
+                                                            rotation: glam::Quat::IDENTITY,
+                                                            scale: glam::Vec3::ONE,
+                                                        });
+                                                        selected_object_id = Some(obj_id);
+                                                        gizmo_target = GizmoTargetKind::SunLamp;
+                                                        has_selection = true;
+                                                        sun_empty_position = pos;
+                                                        accumulation_dirty = true;
                                                         suppress_scene_click = true;
                                                         ui.close();
                                                     }
@@ -1868,8 +1928,37 @@ pub async fn run() {
                                                         ui.close();
                                                     }
                                                     if ui.button("Cornell Box").clicked() {
-                                                        main_db.collection_link_object(decanter_master, cornell_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, cornell_obj_id, true, true);
+                                                        let count = main_db
+                                                            .objects
+                                                            .values()
+                                                            .filter(|o| o.name.starts_with("Cornell Box"))
+                                                            .count()
+                                                            + 1;
+                                                        let box_center = active_center
+                                                            + glam::Vec3::new(count as f32 * 4.0, 1.0, -2.0);
+                                                        let box_mesh = make_cube_mesh(box_center, 2.0);
+                                                        let mesh_id = main_db.create_mesh(
+                                                            "CornellBoxMesh",
+                                                            box_mesh.vertices.len(),
+                                                        );
+                                                        let obj_id = main_db.create_object(
+                                                            format!("Cornell Box {count}"),
+                                                            Some(mesh_id),
+                                                            DbTransform::default(),
+                                                        );
+                                                        let inst = append_object_mesh(&mut mesh, box_mesh, obj_id);
+                                                        main_db.collection_link_object(decanter_master, obj_id);
+                                                        main_db.ensure_scene_base(scene_id, obj_id, true, true);
+                                                        object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
+                                                        object_material_names.insert(obj_id, "Empty".to_string());
+                                                        mesh_instances.push(inst);
+                                                        model_idx = mesh.indices.clone();
+                                                        selected_object_id = Some(obj_id);
+                                                        gizmo_target = GizmoTargetKind::Decanter;
+                                                        has_selection = true;
+                                                        gpu_mesh_dirty = true;
+                                                        geometry_dirty = true;
+                                                        accumulation_dirty = true;
                                                         suppress_scene_click = true;
                                                         ui.close();
                                                     }
@@ -1923,7 +2012,7 @@ pub async fn run() {
                                                     object_material_names.insert(sphere_obj_id, "Glass".to_string());
                                                     object_material_names.insert(decanter_obj_id, "Glass".to_string());
                                                     object_material_names.insert(wine_obj_id, "Glass".to_string());
-                                                    object_material_names.insert(cornell_obj_id, "White".to_string());
+                                                    object_material_names.insert(cornell_obj_id, "Empty".to_string());
                                                     for (_mh, mat) in loaded.materials.iter() {
                                                         material_library.insert(mat.name.clone(), mat.clone());
                                                     }
@@ -2310,6 +2399,31 @@ pub async fn run() {
                                 sun_elevation_deg = d.y.atan2(len_xz).to_degrees();
                                 [d.x, d.y, d.z, 1.0]
                             };
+                            uniforms.sun_lights = [[0.0, 0.0, 0.0, 0.0]; MAX_SUN_LIGHTS];
+                            uniforms.sun_light_count = 0;
+                            if current_scene_exists && scene_kind != SceneKind::Wine {
+                                let scene_id = match scene_kind {
+                                    SceneKind::Decanter => decanter_scene_id,
+                                    SceneKind::Wine => wine_scene_id,
+                                    SceneKind::CornellBox => cornell_scene_id,
+                                };
+                                let visible = main_db.scene_visible_selectable_objects(scene_id);
+                                for light in light_instances
+                                    .iter()
+                                    .filter(|light| visible.contains(&light.object_id))
+                                    .take(MAX_SUN_LIGHTS)
+                                {
+                                    let d = (light.position - active_center).normalize_or_zero();
+                                    let idx = uniforms.sun_light_count as usize;
+                                    uniforms.sun_lights[idx] = [d.x, d.y, d.z, 1.0];
+                                    uniforms.sun_light_count += 1;
+                                }
+                                if uniforms.sun_light_count == 0 {
+                                    let d = (sun_lamp_pos - active_center).normalize_or_zero();
+                                    uniforms.sun_lights[0] = [d.x, d.y, d.z, 1.0];
+                                    uniforms.sun_light_count = 1;
+                                }
+                            }
 
                             let view = camera.view_matrix();
                             let projection = glam::Mat4::perspective_rh(
@@ -2484,22 +2598,25 @@ pub async fn run() {
                                     )
                                 }
                                 GizmoTargetKind::SunLamp => {
+                                    let light = selected_object_id
+                                        .and_then(|id| light_instances.iter().find(|l| l.object_id == id))
+                                        .or_else(|| light_instances.iter().find(|l| l.object_id == sun_obj_id));
                                     GizmoTransform::from_scale_rotation_translation(
                                         transform_gizmo::math::DVec3::new(
-                                            sun_empty_scale.x as f64,
-                                            sun_empty_scale.y as f64,
-                                            sun_empty_scale.z as f64,
+                                            light.map(|l| l.scale.x).unwrap_or(sun_empty_scale.x) as f64,
+                                            light.map(|l| l.scale.y).unwrap_or(sun_empty_scale.y) as f64,
+                                            light.map(|l| l.scale.z).unwrap_or(sun_empty_scale.z) as f64,
                                         ),
                                         transform_gizmo::math::DQuat::from_xyzw(
-                                            sun_empty_rotation.x as f64,
-                                            sun_empty_rotation.y as f64,
-                                            sun_empty_rotation.z as f64,
-                                            sun_empty_rotation.w as f64,
+                                            light.map(|l| l.rotation.x).unwrap_or(sun_empty_rotation.x) as f64,
+                                            light.map(|l| l.rotation.y).unwrap_or(sun_empty_rotation.y) as f64,
+                                            light.map(|l| l.rotation.z).unwrap_or(sun_empty_rotation.z) as f64,
+                                            light.map(|l| l.rotation.w).unwrap_or(sun_empty_rotation.w) as f64,
                                         ),
                                         transform_gizmo::math::DVec3::new(
-                                            sun_lamp_pos.x as f64,
-                                            sun_lamp_pos.y as f64,
-                                            sun_lamp_pos.z as f64,
+                                            light.map(|l| l.position.x).unwrap_or(sun_lamp_pos.x) as f64,
+                                            light.map(|l| l.position.y).unwrap_or(sun_lamp_pos.y) as f64,
+                                            light.map(|l| l.position.z).unwrap_or(sun_lamp_pos.z) as f64,
                                         ),
                                     )
                                 }
@@ -2565,7 +2682,10 @@ pub async fn run() {
                                                 translation = cur + (translation - cur) * 3.0;
                                             }
                                             GizmoTargetKind::SunLamp => {
-                                                let cur = sun_empty_position;
+                                                let cur = selected_object_id
+                                                    .and_then(|id| light_instances.iter().find(|l| l.object_id == id))
+                                                    .map(|l| l.position)
+                                                    .unwrap_or(sun_empty_position);
                                                 translation = cur + (translation - cur) * 3.0;
                                             }
                                             GizmoTargetKind::WineSpotlight => {
@@ -2683,20 +2803,40 @@ pub async fn run() {
                                         );
                                     }
                                     GizmoTargetKind::SunLamp => {
-                                        sun_empty_position = translation;
+                                        if let Some(light) = selected_object_id
+                                            .and_then(|id| light_instances.iter_mut().find(|l| l.object_id == id))
+                                        {
+                                            light.position = translation;
+                                            light.rotation = glam::Quat::from_array([
+                                                new_t.rotation.v.x as f32,
+                                                new_t.rotation.v.y as f32,
+                                                new_t.rotation.v.z as f32,
+                                                new_t.rotation.s as f32,
+                                            ]);
+                                            light.scale = glam::Vec3::new(
+                                                (new_t.scale.x as f32).clamp(0.1, 8.0),
+                                                (new_t.scale.y as f32).clamp(0.1, 8.0),
+                                                (new_t.scale.z as f32).clamp(0.1, 8.0),
+                                            );
+                                            sun_empty_position = light.position;
+                                            sun_empty_rotation = light.rotation;
+                                            sun_empty_scale = light.scale;
+                                        } else {
+                                            sun_empty_position = translation;
+                                            sun_empty_rotation = glam::Quat::from_array([
+                                                new_t.rotation.v.x as f32,
+                                                new_t.rotation.v.y as f32,
+                                                new_t.rotation.v.z as f32,
+                                                new_t.rotation.s as f32,
+                                            ]);
+                                            sun_empty_scale = glam::Vec3::new(
+                                                (new_t.scale.x as f32).clamp(0.1, 8.0),
+                                                (new_t.scale.y as f32).clamp(0.1, 8.0),
+                                                (new_t.scale.z as f32).clamp(0.1, 8.0),
+                                            );
+                                        }
                                         let to_sun = sun_empty_position - active_center;
                                         sun_lamp_distance = to_sun.length().max(1.0);
-                                        sun_empty_rotation = glam::Quat::from_array([
-                                            new_t.rotation.v.x as f32,
-                                            new_t.rotation.v.y as f32,
-                                            new_t.rotation.v.z as f32,
-                                            new_t.rotation.s as f32,
-                                        ]);
-                                        sun_empty_scale = glam::Vec3::new(
-                                            (new_t.scale.x as f32).clamp(0.1, 8.0),
-                                            (new_t.scale.y as f32).clamp(0.1, 8.0),
-                                            (new_t.scale.z as f32).clamp(0.1, 8.0),
-                                        );
                                     }
                                     GizmoTargetKind::WineSpotlight => {
                                         spot_empty_position = translation;
@@ -2731,7 +2871,6 @@ pub async fn run() {
                                 let selectable_ids = main_db.scene_visible_selectable_objects(scene_id);
                                 let sphere_allowed = selectable_ids.contains(&sphere_obj_id);
                                 let cornell_allowed = selectable_ids.contains(&cornell_obj_id);
-                                let sun_allowed = selectable_ids.contains(&sun_obj_id);
                                 let spot_allowed = selectable_ids.contains(&spot_obj_id);
                                 let (ro, rd) = world_ray_from_cursor(
                                     pointer_pos,
@@ -2765,11 +2904,6 @@ pub async fn run() {
                                         active_center + cornell_translation,
                                         (2.0 * cornell_scale.max_element()).max(0.25),
                                     )
-                                } else {
-                                    None
-                                };
-                                let sun_hit = if scene_kind == SceneKind::Decanter && sun_allowed {
-                                    intersect_sphere(ro, rd, sun_empty_position, 1.2)
                                 } else {
                                     None
                                 };
@@ -2817,10 +2951,17 @@ pub async fn run() {
                                         best = Some((GizmoTargetKind::CornellBox, cornell_obj_id));
                                     }
                                 }
-                                if let Some(t) = sun_hit {
-                                    if t < best_t {
-                                        best_t = t;
-                                        best = Some((GizmoTargetKind::SunLamp, sun_obj_id));
+                                if scene_kind == SceneKind::Decanter {
+                                    for light in &light_instances {
+                                        if !selectable_ids.contains(&light.object_id) {
+                                            continue;
+                                        }
+                                        if let Some(t) = intersect_sphere(ro, rd, light.position, 1.2) {
+                                            if t < best_t {
+                                                best_t = t;
+                                                best = Some((GizmoTargetKind::SunLamp, light.object_id));
+                                            }
+                                        }
                                     }
                                 }
                                 if let Some(t) = spot_hit {
@@ -2871,21 +3012,25 @@ pub async fn run() {
 
                                 if current_scene_exists && scene_kind != SceneKind::Wine {
                                     let display = [display_size[0].max(1.0), display_size[1].max(1.0)];
-                                    let sun_screen = world_to_screen(sun_lamp_pos, view, projection, display);
                                     let center_screen = world_to_screen(active_center, view, projection, display);
-                                    if let (Some(s), Some(cn)) = (sun_screen, center_screen) {
-                                        let selected = gizmo_target == GizmoTargetKind::SunLamp;
-                                        let line_color = if selected {
-                                            Color32::from_rgb(255, 158, 38)
-                                        } else {
-                                            Color32::from_rgb(255, 242, 153)
-                                        };
-                                        painter.line_segment(
-                                            [Pos2::new(s[0], s[1]), Pos2::new(cn[0], cn[1])],
-                                            Stroke::new(2.0, line_color),
-                                        );
-                                        painter.circle_stroke(Pos2::new(s[0], s[1]), 8.0, Stroke::new(2.0, line_color));
-                                        painter.circle_filled(Pos2::new(s[0], s[1]), 3.0, line_color);
+                                    if let Some(cn) = center_screen {
+                                        for light in &light_instances {
+                                            let Some(s) = world_to_screen(light.position, view, projection, display) else {
+                                                continue;
+                                            };
+                                            let selected = selected_object_id == Some(light.object_id);
+                                            let line_color = if selected {
+                                                Color32::from_rgb(255, 158, 38)
+                                            } else {
+                                                Color32::from_rgb(255, 242, 153)
+                                            };
+                                            painter.line_segment(
+                                                [Pos2::new(s[0], s[1]), Pos2::new(cn[0], cn[1])],
+                                                Stroke::new(2.0, line_color),
+                                            );
+                                            painter.circle_stroke(Pos2::new(s[0], s[1]), 8.0, Stroke::new(2.0, line_color));
+                                            painter.circle_filled(Pos2::new(s[0], s[1]), 3.0, line_color);
+                                        }
                                     }
                                 } else if current_scene_exists {
                                     let display = [display_size[0].max(1.0), display_size[1].max(1.0)];
@@ -2941,7 +3086,7 @@ pub async fn run() {
                                     center.x,
                                     center.y,
                                     center.z,
-                                    selected_inst.max_extent * selected_inst.scale.max_element() * 0.7,
+                                    selected_inst.max_extent * selected_inst.scale.max_element() * 0.45,
                                 ];
                                 if gizmo_target == GizmoTargetKind::WineGlass {
                                     uniforms.mesh_center = [
@@ -3205,6 +3350,13 @@ pub async fn run() {
                                 obj.transform.location = sun_empty_position;
                                 obj.transform.rotation = sun_empty_rotation;
                                 obj.transform.scale = sun_empty_scale;
+                            }
+                            for light in &light_instances {
+                                if let Some(obj) = main_db.objects.get_mut(&light.object_id) {
+                                    obj.transform.location = light.position;
+                                    obj.transform.rotation = light.rotation;
+                                    obj.transform.scale = light.scale;
+                                }
                             }
                             if let Some(obj) = main_db.objects.get_mut(&spot_obj_id) {
                                 obj.transform.location = spot_empty_position;

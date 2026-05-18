@@ -14,6 +14,7 @@ struct Uniforms {
   cornell_center: vec4<f32>,
   cornell_color: vec4<f32>,
   cornell_params: vec4<f32>,
+  sun_lights: array<vec4<f32>, 8>,
   sun_intensity: f32,
   frame: u32,
   scene_kind: u32,
@@ -24,7 +25,8 @@ struct Uniforms {
   decanter_enabled: u32,
   wine_enabled: u32,
   cornell_enabled: u32,
-  pad: vec2<u32>,
+  sun_light_count: u32,
+  pad: u32,
 };
 
 @group(0) @binding(0)
@@ -628,7 +630,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     }
 
 
-    // Decanter uses directional sun; Wine uses a local spotlight aimed at the glass.
+    // Decanter uses one or more directional suns; Wine keeps its local spotlight aimed at the glass.
     let spot_position = uniforms.light_pos.xyz;
     let spot_target = uniforms.mesh_center.xyz;
     let spot_to_hit = hit_pos - spot_position;
@@ -636,43 +638,69 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     let spot_axis = normalize(spot_target - spot_position);
     let spot_cos = dot(normalize(spot_to_hit), spot_axis);
     let spot_shape = smoothstep(cos(24.0 * 3.141592653589793 / 180.0), cos(8.0 * 3.141592653589793 / 180.0), spot_cos);
-    let wine_to_light = normalize(spot_position - hit_pos);
-    let sun_dir = normalize(uniforms.light_pos.xyz);
-    let to_light = select(sun_dir, wine_to_light, is_wine_scene);
-    let light_tmax = select(10000.0, max(spot_distance - 0.05, 0.05), is_wine_scene);
-    var shadow_rq: ray_query;
-    let shadow_origin = hit_pos + normal * 0.02;
-    rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, light_tmax, shadow_origin, to_light));
-    rayQueryProceed(&shadow_rq);
-    let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
-    var cube_shadow_t = 1e38;
-    if (!is_wine_scene) {
-      let qsh = uniforms.sphere_rot;
-      let qsh_inv = vec4<f32>(-qsh.xyz, qsh.w);
-      let local_shadow_origin = quat_mul_vec(qsh_inv, shadow_origin - cube_center);
-      let local_to_light = quat_mul_vec(qsh_inv, to_light);
-      let cube_half_vec_sh = uniforms.sphere_extent.xyz;
-      let t_local_sh = cube_intersection_t(local_shadow_origin, local_to_light, vec3<f32>(0.0), cube_half_vec_sh);
-      if (t_local_sh < 1e37) { cube_shadow_t = t_local_sh; }
-    }
-    let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (cube_shadow_t >= 1e37);
+    let photon_indirect = estimate_photon_density(hit_pos, normal, photon_uniforms.voxel_size * 1.5);
+    let base = select(vec3<f32>(0.08), vec3<f32>(0.05), hit_type == 1u);
     let receives_spot_pool = is_wine_scene && hit_type == 3u;
-    if ((visible || receives_spot_pool) && transmission < 0.5) {
-      let nl = max(dot(normal, to_light), 0.0);
-      let base = select(vec3<f32>(0.08), vec3<f32>(0.05), hit_type == 1u);
-      let light_color = select(vec3<f32>(1.0, 0.94, 0.82), vec3<f32>(1.0, 0.82, 0.58) * spot_shape * 7.5, is_wine_scene);
-      let photon_indirect = estimate_photon_density(hit_pos, normal, photon_uniforms.voxel_size * 1.5);
+    var direct_light = vec3<f32>(0.0);
+    var any_visible_light = false;
+    var wine_spec_to_light = vec3<f32>(0.0, 1.0, 0.0);
+    var wine_spec_visible = false;
+
+    if (is_wine_scene) {
+      let to_light = normalize(spot_position - hit_pos);
+      wine_spec_to_light = to_light;
+      let light_tmax = max(spot_distance - 0.05, 0.05);
+      var shadow_rq: ray_query;
+      let shadow_origin = hit_pos + normal * 0.02;
+      rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, light_tmax, shadow_origin, to_light));
+      rayQueryProceed(&shadow_rq);
+      let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
+      let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE);
+      if (visible || receives_spot_pool) {
+        let nl = max(dot(normal, to_light), 0.0);
+        direct_light = direct_light + vec3<f32>(1.0, 0.82, 0.58) * spot_shape * 7.5 * nl;
+        any_visible_light = true;
+        wine_spec_visible = true;
+      }
+    } else {
+      let count = max(uniforms.sun_light_count, 1u);
+      for (var li = 0u; li < 8u; li = li + 1u) {
+        if (li >= count) { break; }
+        let to_light = normalize(select(uniforms.light_pos.xyz, uniforms.sun_lights[li].xyz, uniforms.sun_light_count > 0u));
+        var shadow_rq: ray_query;
+        let shadow_origin = hit_pos + normal * 0.02;
+        rayQueryInitialize(&shadow_rq, acc_struct, RayDesc(0u, 0xFFu, 0.02, 10000.0, shadow_origin, to_light));
+        rayQueryProceed(&shadow_rq);
+        let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
+        var cube_shadow_t = 1e38;
+        let qsh = uniforms.sphere_rot;
+        let qsh_inv = vec4<f32>(-qsh.xyz, qsh.w);
+        let local_shadow_origin = quat_mul_vec(qsh_inv, shadow_origin - cube_center);
+        let local_to_light = quat_mul_vec(qsh_inv, to_light);
+        let cube_half_vec_sh = uniforms.sphere_extent.xyz;
+        let t_local_sh = cube_intersection_t(local_shadow_origin, local_to_light, vec3<f32>(0.0), cube_half_vec_sh);
+        if (t_local_sh < 1e37) { cube_shadow_t = t_local_sh; }
+        let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (cube_shadow_t >= 1e37);
+        if (visible) {
+          let nl = max(dot(normal, to_light), 0.0);
+          direct_light = direct_light + vec3<f32>(1.0, 0.94, 0.82) * nl;
+          any_visible_light = true;
+        }
+      }
+    }
+
+    if ((any_visible_light || receives_spot_pool) && transmission < 0.5) {
       if (is_wine_scene && hit_type == 3u) {
-        L = L + throughput * (photon_indirect * 8.0 + albedo * light_color * nl * uniforms.sun_intensity) * spectral_weight;
+        L = L + throughput * (photon_indirect * 8.0 + albedo * direct_light * uniforms.sun_intensity) * spectral_weight;
       } else {
-        L = L + throughput * (base + photon_indirect * albedo + albedo * light_color * nl * uniforms.sun_intensity) * spectral_weight;
+        L = L + throughput * (base + photon_indirect * albedo + albedo * direct_light * uniforms.sun_intensity) * spectral_weight;
       }
       break;
     }
 
     if (hit_type == 2u || transmission >= 0.5) {
-      if (is_wine_scene && visible) {
-        let half_vec = normalize(to_light - rd);
+      if (is_wine_scene && wine_spec_visible) {
+        let half_vec = normalize(wine_spec_to_light - rd);
         let spec = pow(max(dot(normal, half_vec), 0.0), 96.0);
         let rim = pow(1.0 - max(dot(-rd, normal), 0.0), 3.0);
         L = L + throughput * vec3<f32>(1.0, 0.55, 0.35) * spot_shape * (spec * 2.5 + rim * 0.08);
@@ -792,12 +820,8 @@ fn selection_mask_ray(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   }
 
   let hit_pos = ro + rd * hit_t;
-  let within_wine = distance(hit_pos, uniforms.mesh_center.xyz) <= uniforms.mesh_center.w;
-  let within_decanter = distance(hit_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
-  if (uniforms.selected_object == 2u && within_wine) {
-    return 1.0;
-  }
-  if (uniforms.selected_object == 3u && within_decanter) {
+  let within_selected_mesh = distance(hit_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
+  if ((uniforms.selected_object == 2u || uniforms.selected_object == 3u) && within_selected_mesh) {
     return 1.0;
   }
   return 0.0;
