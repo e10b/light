@@ -3305,17 +3305,17 @@ pub async fn run() {
                                     .filter(|inst| visible_ids.contains(&inst.object_id))
                                     .collect();
                                 if !visible_mesh_instances.is_empty() {
-                                    let selected_mesh_instance = selected_object_id.and_then(|id| {
-                                        visible_mesh_instances
-                                            .iter()
-                                            .find(|inst| inst.object_id == id)
-                                            .copied()
-                                    });
-                                    let emitter = selected_mesh_instance
-                                        .or_else(|| visible_mesh_instances.first().copied())
-                                        .unwrap_or(visible_mesh_instances[0]);
-                                    let c = emitter.center();
-                                    let r = (emitter.max_extent * emitter.scale.max_element() * 0.6).max(0.25);
+                                    let mut min_p = glam::Vec3::splat(f32::INFINITY);
+                                    let mut max_p = glam::Vec3::splat(f32::NEG_INFINITY);
+                                    for inst in &visible_mesh_instances {
+                                        let c = inst.center();
+                                        let r = (inst.max_extent * inst.scale.max_element() * 0.6).max(0.25);
+                                        let e = glam::Vec3::splat(r);
+                                        min_p = min_p.min(c - e);
+                                        max_p = max_p.max(c + e);
+                                    }
+                                    let c = (min_p + max_p) * 0.5;
+                                    let r = ((max_p - min_p).length() * 0.6).max(0.5);
                                     photon_emitter_center = [c.x, c.y, c.z, r];
                                     photons_per_frame = 262_144;
                                 }
