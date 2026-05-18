@@ -12,10 +12,11 @@ use winit::{event::*, event_loop::EventLoop};
 use crate::{
     blender_data::{Id, MainDatabase, Transform as DbTransform},
     compute_pass,
-    ecs::{CameraComponent, PhysicsComponent, ScriptEngine, TransformComponent, World},
-    editor_ui::{
-        draw_properties_panel, CameraProjectionKind, GizmoModeKind, RenderModeKind,
+    editor::panels::{
+        draw_outliner_panel, draw_properties_panel, CameraProjectionKind, GizmoModeKind,
+        OutlinerItem, RenderModeKind,
     },
+    ecs::{CameraComponent, PhysicsComponent, ScriptEngine, TransformComponent, World},
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     mesh::{load_gltf_mesh, MeshData, Vertex},
     photon_mapper::{PhotonMapper, PhotonTarget},
@@ -24,11 +25,11 @@ use crate::{
     },
     quad_pass, raster_pass,
     scene::SceneKind,
-    tooling_lua::scripts_dir,
-    tooling_materials::{
+    tooling::lua::scripts_dir,
+    tooling::materials::{
         make_empty_material, make_glass_material, make_white_material, preview_from_material_data,
     },
-    tooling_persistence::build_prism_database_from_main,
+    tooling::persistence::build_prism_database_from_main,
     window::create_window,
 };
 
@@ -2326,32 +2327,38 @@ pub async fn run() {
                                     });
                                 });
 
-                                egui::SidePanel::left("outliner")
-                                    .resizable(true)
-                                    .default_width(230.0)
-                                    .show(ctx, |ui| {
-                                        ui.heading("Outliner");
-                                        ui.label("Scene");
-                                        ui.separator();
-                                        let scene_id = decanter_scene_id;
-                                        for object_id in main_db.scene_visible_selectable_objects(scene_id) {
-                                            if let Some(target) = object_target_by_id.get(&object_id).copied() {
-                                                if !target_allowed_in_scene(scene_kind, target) {
-                                                    continue;
-                                                }
-                                                let label = main_db.objects.get(&object_id).map(|o| o.name.as_str()).unwrap_or("Object");
-                                                if ui.selectable_label(has_selection && selected_object_id == Some(object_id), label).clicked() {
-                                                    gizmo_target = target;
-                                                    selected_object_id = Some(object_id);
-                                                    has_selection = true;
-                                                }
-                                            }
+                                let scene_id = decanter_scene_id;
+                                let outliner_items: Vec<OutlinerItem> = main_db
+                                    .scene_visible_selectable_objects(scene_id)
+                                    .into_iter()
+                                    .filter_map(|object_id| {
+                                        let target = object_target_by_id.get(&object_id).copied()?;
+                                        if !target_allowed_in_scene(scene_kind, target) {
+                                            return None;
                                         }
-                                        if !project_status.is_empty() {
-                                            ui.separator();
-                                            ui.label(&project_status);
-                                        }
-                                    });
+                                        let label = main_db
+                                            .objects
+                                            .get(&object_id)
+                                            .map(|o| o.name.clone())
+                                            .unwrap_or_else(|| "Object".to_string());
+                                        Some(OutlinerItem {
+                                            object_id,
+                                            label,
+                                            selected: has_selection
+                                                && selected_object_id == Some(object_id),
+                                        })
+                                    })
+                                    .collect();
+                                if let Some(object_id) =
+                                    draw_outliner_panel(ctx, &outliner_items, &project_status)
+                                {
+                                    if let Some(target) = object_target_by_id.get(&object_id).copied()
+                                    {
+                                        gizmo_target = target;
+                                        selected_object_id = Some(object_id);
+                                        has_selection = true;
+                                    }
+                                }
 
                                 if !target_allowed_in_scene(scene_kind, gizmo_target) {
                                     gizmo_target = default_target_for_scene(scene_kind);
