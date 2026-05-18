@@ -6,6 +6,7 @@ mod mesh;
 mod material_editor;
 mod photon_mapper;
 mod quad_pass;
+mod raster_pass;
 mod scene;
 mod window;
 

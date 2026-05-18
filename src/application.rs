@@ -21,6 +21,7 @@ use crate::{
         SceneData as PrismSceneData, ShaderNode,
     },
     quad_pass,
+    raster_pass,
     scene::SceneKind,
     window::create_window,
 };
@@ -75,6 +76,7 @@ enum GizmoModeKind {
 enum RenderModeKind {
     Pathtraced,
     Raytraced,
+    Rasterized,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -90,6 +92,7 @@ enum GizmoTargetKind {
 #[derive(Clone)]
 struct MeshObjectInstance {
     object_id: Id,
+    mesh_asset_id: u32,
     vertex_start: usize,
     vertex_count: usize,
     index_start: usize,
@@ -109,6 +112,12 @@ impl MeshObjectInstance {
     fn center(&self) -> glam::Vec3 {
         self.pivot + self.translation
     }
+}
+
+struct MeshAsset {
+    asset_id: u32,
+    name: String,
+    mesh: MeshData,
 }
 
 #[derive(Clone)]
@@ -508,6 +517,7 @@ fn append_object_mesh(
     combined: &mut MeshData,
     extra: MeshData,
     object_id: Id,
+    mesh_asset_id: u32,
 ) -> MeshObjectInstance {
     let (pivot, size, _, _) = mesh_bounds(&extra.vertices);
     let vertex_start = combined.positions4.len();
@@ -529,6 +539,7 @@ fn append_object_mesh(
     append_mesh(combined, extra);
     MeshObjectInstance {
         object_id,
+        mesh_asset_id,
         vertex_start,
         vertex_count,
         index_start,
@@ -861,6 +872,18 @@ pub async fn run() {
     let (center, size, _, _) = mesh_bounds(&mesh.vertices);
     let decanter_max_extent = cube_max_extent;
     let wine_max_extent = cube_max_extent;
+    let mesh_assets = vec![
+        MeshAsset {
+            asset_id: 0,
+            name: "Cube".to_string(),
+            mesh: make_cube_mesh(glam::Vec3::ZERO, 1.5),
+        },
+        MeshAsset {
+            asset_id: 4,
+            name: "CornellBox".to_string(),
+            mesh: make_cube_mesh(glam::Vec3::ZERO, 2.0),
+        },
+    ];
     let render_width = 1280u32;
     let render_height = 720u32;
 
@@ -898,6 +921,7 @@ pub async fn run() {
     }
     let default_cube_instance = MeshObjectInstance {
         object_id: sphere_obj_id,
+        mesh_asset_id: 0,
         vertex_start: 0,
         vertex_count: mesh.positions4.len(),
         index_start: 0,
@@ -1291,6 +1315,15 @@ pub async fn run() {
         compute_pass.output_view(),
         compute_pass.selection_mask_view(),
     );
+    let raster_pass = raster_pass::RasterPass::new(&device, surface_format);
+    let mut raster_instance_count: u32 = 0;
+    let mut raster_instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("raster_instance_buf"),
+        contents: bytemuck::cast_slice(&[raster_pass::RasterInstance {
+            offset: [0.0, 0.0, 0.0, 0.0],
+        }]),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+    });
     let mut photon_mapper = PhotonMapper::new(
         &device,
         &queue,
@@ -1405,6 +1438,10 @@ pub async fn run() {
     let mut wine_scale = glam::Vec3::ONE;
     let mut geometry_dirty = true;
     let mut gpu_mesh_dirty = false;
+    let mut stress_test_requested = std::env::var("PRISM_STRESS_1M")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let mut stress_instance_count = 0usize;
     let mut project_status = String::new();
     let mut mouse_pos = [0.0f32, 0.0f32];
     let mut mouse_left_down = false;
@@ -1657,6 +1694,9 @@ pub async fn run() {
                                         ui.strong("Prism");
                                         ui.separator();
                                         let _ = ui.button("New Cube Scene");
+                                        if ui.button("Stress 1M Cubes").clicked() {
+                                            stress_test_requested = true;
+                                        }
                                         ui.menu_button("Add", |ui| {
                                             let scene_id = decanter_scene_id;
                                             match scene_kind {
@@ -1680,7 +1720,7 @@ pub async fn run() {
                                                             Some(mesh_id),
                                                             DbTransform::default(),
                                                         );
-                                                        let mut inst = append_object_mesh(&mut mesh, cube_mesh, obj_id);
+                                                        let mut inst = append_object_mesh(&mut mesh, cube_mesh, obj_id, 0);
                                                         place_instance_center(&mut inst, cube_center);
                                                         main_db.collection_link_object(decanter_master, obj_id);
                                                         main_db.ensure_scene_base(scene_id, obj_id, true, true);
@@ -1750,7 +1790,7 @@ pub async fn run() {
                                                                     Some(mesh_id),
                                                                     DbTransform::default(),
                                                                 );
-                                                                let inst = append_object_mesh(&mut mesh, new_mesh, obj_id);
+                                                                let inst = append_object_mesh(&mut mesh, new_mesh, obj_id, 1);
                                                                 main_db.collection_link_object(decanter_master, obj_id);
                                                                 main_db.ensure_scene_base(scene_id, obj_id, true, true);
                                                                 object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
@@ -1798,7 +1838,7 @@ pub async fn run() {
                                                                     Some(mesh_id),
                                                                     DbTransform::default(),
                                                                 );
-                                                                let inst = append_object_mesh(&mut mesh, new_mesh, obj_id);
+                                                                let inst = append_object_mesh(&mut mesh, new_mesh, obj_id, 2);
                                                                 main_db.collection_link_object(decanter_master, obj_id);
                                                                 main_db.ensure_scene_base(scene_id, obj_id, true, true);
                                                                 object_target_by_id.insert(obj_id, GizmoTargetKind::WineGlass);
@@ -1853,7 +1893,7 @@ pub async fn run() {
                                                                         Some(mesh_id),
                                                                         DbTransform::default(),
                                                                     );
-                                                                    let inst = append_object_mesh(&mut mesh, imported, obj_id);
+                                                                    let inst = append_object_mesh(&mut mesh, imported, obj_id, 3);
                                                                     main_db.collection_link_object(decanter_master, obj_id);
                                                                     main_db.ensure_scene_base(scene_id, obj_id, true, true);
                                                                     object_target_by_id.insert(obj_id, GizmoTargetKind::Decanter);
@@ -1899,7 +1939,7 @@ pub async fn run() {
                                                             Some(mesh_id),
                                                             DbTransform::default(),
                                                         );
-                                                        let mut inst = append_object_mesh(&mut mesh, box_mesh, obj_id);
+                                                        let mut inst = append_object_mesh(&mut mesh, box_mesh, obj_id, 4);
                                                         place_instance_center(&mut inst, box_center);
                                                         main_db.collection_link_object(decanter_master, obj_id);
                                                         main_db.ensure_scene_base(scene_id, obj_id, true, true);
@@ -2139,7 +2179,14 @@ pub async fn run() {
                                                     "Raytraced",
                                                 )
                                                 .changed();
-                                            if path_clicked || ray_clicked {
+                                            let ras_clicked = ui
+                                                .selectable_value(
+                                                    &mut render_mode,
+                                                    RenderModeKind::Rasterized,
+                                                    "Rasterized",
+                                                )
+                                                .changed();
+                                            if path_clicked || ray_clicked || ras_clicked {
                                                 accumulation_dirty = true;
                                             }
                                         });
@@ -2213,6 +2260,57 @@ pub async fn run() {
                                         });
                                     });
                                 }
+
+                            if stress_test_requested {
+                                stress_test_requested = false;
+                                let cube_mesh = make_cube_mesh(glam::Vec3::ZERO, 1.5);
+                                mesh = cube_mesh;
+                                model_idx = mesh.indices.clone();
+                                mesh_instances.clear();
+                                let side = 1000usize;
+                                let total = side * side;
+                                let spacing = 3.2f32;
+                                let half = side as f32 * 0.5;
+                                for i in 0..total {
+                                    let x = (i % side) as f32;
+                                    let z = (i / side) as f32;
+                                    let center = glam::Vec3::new((x - half) * spacing, 0.0, (z - half) * spacing);
+                                    mesh_instances.push(MeshObjectInstance {
+                                        object_id: Id(10_000_000 + i as u64),
+                                        mesh_asset_id: 0,
+                                        vertex_start: 0,
+                                        vertex_count: mesh.positions4.len(),
+                                        index_start: 0,
+                                        index_count: mesh.indices.len(),
+                                        material_start: 0,
+                                        material_count: mesh.materials.len(),
+                                        base_positions: mesh
+                                            .positions4
+                                            .iter()
+                                            .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
+                                            .collect(),
+                                        base_normals: mesh
+                                            .normals4
+                                            .iter()
+                                            .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
+                                            .collect(),
+                                        pivot: glam::Vec3::ZERO,
+                                        max_extent: 3.0,
+                                        rotation: glam::Quat::IDENTITY,
+                                        translation: center,
+                                        scale: glam::Vec3::ONE,
+                                    });
+                                }
+                                stress_instance_count = mesh_instances.len();
+                                gpu_mesh_dirty = true;
+                                geometry_dirty = true;
+                                accumulation_dirty = true;
+                                project_status = format!(
+                                    "Stress scene armed: {} cubes (TLAS instances), {} mesh assets",
+                                    stress_instance_count,
+                                    mesh_assets.len()
+                                );
+                            }
 
                             let sun_lamp_pos = sun_empty_position;
                             let old_light = uniforms.light_pos;
@@ -2937,7 +3035,9 @@ pub async fn run() {
                             uniforms.decanter_enabled = if decanter_visible { 1 } else { 0 };
                             uniforms.wine_enabled = if wine_visible { 1 } else { 0 };
                             uniforms.cornell_enabled = if cornell_visible { 1 } else { 0 };
-                            let any_mesh_visible = if current_scene_exists {
+                            let any_mesh_visible = if stress_instance_count > 0 {
+                                true
+                            } else if current_scene_exists {
                                 let visible = main_db.scene_visible_selectable_objects(active_scene_id);
                                 mesh_instances.iter().any(|inst| visible.contains(&inst.object_id))
                             } else {
@@ -3009,17 +3109,18 @@ pub async fn run() {
                                 if cornell_preview.bsdf_connected { 1.0 } else { 0.0 },
                                 0.0,
                             ];
-                            let mut material_signature = format!(
-                                "{sphere_mat}:{sphere_preview:?}|{decanter_mat}:{decanter_preview:?}|{wine_mat}:{wine_preview:?}|{cornell_mat}:{cornell_preview:?}"
-                            );
-                            for inst in &mesh_instances {
-                                let mat = object_material_names
-                                    .get(&inst.object_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| "Glass".to_string());
-                                material_signature.push_str(&format!("|{}:{mat}", inst.object_id.0));
-                            }
-                            if material_signature != last_material_signature {
+                            if stress_instance_count == 0 {
+                                let mut material_signature = format!(
+                                    "{sphere_mat}:{sphere_preview:?}|{decanter_mat}:{decanter_preview:?}|{wine_mat}:{wine_preview:?}|{cornell_mat}:{cornell_preview:?}"
+                                );
+                                for inst in &mesh_instances {
+                                    let mat = object_material_names
+                                        .get(&inst.object_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| "Glass".to_string());
+                                    material_signature.push_str(&format!("|{}:{mat}", inst.object_id.0));
+                                }
+                                if material_signature != last_material_signature {
                                 let set_range = |materials: &mut [crate::mesh::GpuMaterial],
                                                  start: usize,
                                                  count: usize,
@@ -3103,10 +3204,11 @@ pub async fn run() {
                                         bytemuck::cast_slice(&mesh.materials),
                                     );
                                 }
-                                last_material_signature = material_signature;
-                                accumulation_dirty = true;
+                                    last_material_signature = material_signature;
+                                    accumulation_dirty = true;
+                                }
                             }
-                            if current_scene_exists {
+                            if current_scene_exists && stress_instance_count == 0 {
                                 let visible_ids = main_db.scene_visible_selectable_objects(active_scene_id);
                                 let mut visible_mesh_instances: Vec<&MeshObjectInstance> = mesh_instances
                                     .iter()
@@ -3148,11 +3250,13 @@ pub async fn run() {
                                 obj.transform.rotation = wine_rotation;
                                 obj.transform.scale = wine_scale;
                             }
-                            for inst in &mesh_instances {
-                                if let Some(obj) = main_db.objects.get_mut(&inst.object_id) {
-                                    obj.transform.location = inst.center();
-                                    obj.transform.rotation = inst.rotation;
-                                    obj.transform.scale = inst.scale;
+                            if stress_instance_count == 0 {
+                                for inst in &mesh_instances {
+                                    if let Some(obj) = main_db.objects.get_mut(&inst.object_id) {
+                                        obj.transform.location = inst.center();
+                                        obj.transform.rotation = inst.rotation;
+                                        obj.transform.scale = inst.scale;
+                                    }
                                 }
                             }
                             if let Some(obj) = main_db.objects.get_mut(&sun_obj_id) {
@@ -3194,33 +3298,37 @@ pub async fn run() {
                             if accumulation_dirty || sun_changed {
                                 if geometry_dirty {
                                     model_verts = mesh.vertices.clone();
-                                    for inst in &mesh_instances {
-                                        update_mesh_transform(
-                                            &mut mesh,
-                                            &mut model_verts,
-                                            inst.vertex_start,
-                                            inst.vertex_count,
-                                            &inst.base_positions,
-                                            &inst.base_normals,
-                                            inst.pivot,
-                                            inst.scale,
-                                            inst.rotation,
-                                            inst.translation,
-                                        );
+                                    if stress_instance_count == 0 {
+                                        for inst in &mesh_instances {
+                                            update_mesh_transform(
+                                                &mut mesh,
+                                                &mut model_verts,
+                                                inst.vertex_start,
+                                                inst.vertex_count,
+                                                &inst.base_positions,
+                                                &inst.base_normals,
+                                                inst.pivot,
+                                                inst.scale,
+                                                inst.rotation,
+                                                inst.translation,
+                                            );
+                                        }
                                     }
-                                    let render_scene_id = decanter_scene_id;
-                                    let visible_render_ids = main_db.scene_visible_selectable_objects(render_scene_id);
-                                    let (
-                                        render_verts,
-                                        render_indices,
-                                        render_positions,
-                                        render_normals,
-                                        render_triangle_material_ids,
-                                    ) = visible_render_geometry(
-                                        &mesh,
-                                        &mesh_instances,
-                                        &visible_render_ids,
-                                    );
+                                    let (render_verts, render_indices, render_positions, render_normals, render_triangle_material_ids) =
+                                        if stress_instance_count > 0 {
+                                            let asset_mesh = &mesh_assets[0].mesh;
+                                            (
+                                                asset_mesh.vertices.clone(),
+                                                asset_mesh.indices.clone(),
+                                                asset_mesh.positions4.clone(),
+                                                asset_mesh.normals4.clone(),
+                                                asset_mesh.triangle_material_ids.clone(),
+                                            )
+                                        } else {
+                                            let render_scene_id = decanter_scene_id;
+                                            let visible_render_ids = main_db.scene_visible_selectable_objects(render_scene_id);
+                                            visible_render_geometry(&mesh, &mesh_instances, &visible_render_ids)
+                                        };
                                     model_idx = render_indices;
                                     if gpu_mesh_dirty {
                                         vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3277,18 +3385,35 @@ pub async fn run() {
                                                 descriptors: vec![model_blas_desc.clone()],
                                             },
                                         );
+                                        let tlas_instances: u32 = if stress_instance_count > 0 {
+                                            stress_instance_count.max(1)
+                                        } else {
+                                            1
+                                        } as u32;
                                         tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
                                             label: Some("scene_tlas"),
                                             flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
                                             update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-                                            max_instances: 1,
+                                            max_instances: tlas_instances,
                                         });
-                                        tlas[0] = Some(wgpu::TlasInstance::new(
-                                            &model_blas,
-                                            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                                            0,
-                                            0xff,
-                                        ));
+                                        if stress_instance_count > 0 {
+                                            for (i, inst) in mesh_instances.iter().enumerate() {
+                                                let c = inst.center();
+                                                tlas[i] = Some(wgpu::TlasInstance::new(
+                                                    &model_blas,
+                                                    [1.0, 0.0, 0.0, c.x, 0.0, 1.0, 0.0, c.y, 0.0, 0.0, 1.0, c.z],
+                                                    0,
+                                                    0xff,
+                                                ));
+                                            }
+                                        } else {
+                                            tlas[0] = Some(wgpu::TlasInstance::new(
+                                                &model_blas,
+                                                [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                                                0,
+                                                0xff,
+                                            ));
+                                        }
                                         photon_mapper = PhotonMapper::new(
                                             &device,
                                             &queue,
@@ -3381,45 +3506,114 @@ pub async fn run() {
                                 &clipped_primitives,
                                 &screen_descriptor,
                             );
-                            let photon_light_pos = if uniforms.sun_light_count > 0 {
-                                let count = uniforms.sun_light_count.min(MAX_SUN_LIGHTS as u32);
-                                let idx = (uniforms.frame % count) as usize;
-                                uniforms.sun_lights[idx]
+                            if matches!(render_mode, RenderModeKind::Pathtraced) {
+                                let photon_light_pos = if uniforms.sun_light_count > 0 {
+                                    let count = uniforms.sun_light_count.min(MAX_SUN_LIGHTS as u32);
+                                    let idx = (uniforms.frame % count) as usize;
+                                    uniforms.sun_lights[idx]
+                                } else {
+                                    uniforms.light_pos
+                                };
+                                let photon_frame_count = photons_per_frame
+                                    .saturating_mul(uniforms.sun_light_count.max(1))
+                                    .min(1_000_000);
+                                photon_mapper.update(
+                                    &queue,
+                                    photon_light_pos,
+                                    photon_emitter_center,
+                                    uniforms.sphere_pos,
+                                    uniforms.sphere_rot,
+                                    uniforms.sphere_extent,
+                                    [
+                                        uniforms.sphere_color[3],
+                                        uniforms.sphere_params[1],
+                                        uniforms.sphere_params[2],
+                                        0.0,
+                                    ],
+                                    sphere_visible_for_photons,
+                                    uniforms.frame,
+                                );
+                                photon_mapper.emit_photons(&mut encoder, photon_frame_count);
+                                photon_mapper.build_spatial_structure(&mut encoder);
+                            }
+                            if matches!(render_mode, RenderModeKind::Rasterized) {
+                                if stress_instance_count > 0 {
+                                    let instances: Vec<raster_pass::RasterInstance> = mesh_instances
+                                        .iter()
+                                        .map(|inst| {
+                                            let c = inst.center();
+                                            raster_pass::RasterInstance {
+                                                offset: [c.x, c.y, c.z, 0.0],
+                                            }
+                                        })
+                                        .collect();
+                                    if raster_instance_count != instances.len() as u32 {
+                                        raster_instance_count = instances.len() as u32;
+                                        raster_instance_buf = device.create_buffer_init(
+                                            &wgpu::util::BufferInitDescriptor {
+                                                label: Some("raster_instance_buf"),
+                                                contents: bytemuck::cast_slice(&instances),
+                                                usage: wgpu::BufferUsages::VERTEX
+                                                    | wgpu::BufferUsages::COPY_DST,
+                                            },
+                                        );
+                                    }
+                                } else {
+                                    if raster_instance_count != 1 {
+                                        raster_instance_count = 1;
+                                        raster_instance_buf = device.create_buffer_init(
+                                            &wgpu::util::BufferInitDescriptor {
+                                                label: Some("raster_instance_buf"),
+                                                contents: bytemuck::cast_slice(&[
+                                                    raster_pass::RasterInstance {
+                                                        offset: [0.0, 0.0, 0.0, 0.0],
+                                                    },
+                                                ]),
+                                                usage: wgpu::BufferUsages::VERTEX
+                                                    | wgpu::BufferUsages::COPY_DST,
+                                            },
+                                        );
+                                    }
+                                }
+                                let view_proj = projection * camera.view_matrix();
+                                raster_pass.update_view_proj(&queue, view_proj);
+                                let mut raster_rpass =
+                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("raster_pass"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: &view,
+                                                resolve_target: None,
+                                                depth_slice: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        multiview_mask: None,
+                                        occlusion_query_set: None,
+                                        timestamp_writes: None,
+                                    });
+                                raster_pass.render(
+                                    &mut raster_rpass,
+                                    &vbuf,
+                                    &raster_instance_buf,
+                                    raster_instance_count,
+                                    &ibuf,
+                                    model_idx.len() as u32,
+                                );
                             } else {
-                                uniforms.light_pos
-                            };
-                            let photon_frame_count = photons_per_frame
-                                .saturating_mul(uniforms.sun_light_count.max(1))
-                                .min(1_000_000);
-                            photon_mapper.update(
-                                &queue,
-                                photon_light_pos,
-                                photon_emitter_center,
-                                uniforms.sphere_pos,
-                                uniforms.sphere_rot,
-                                uniforms.sphere_extent,
-                                [
-                                    uniforms.sphere_color[3],
-                                    uniforms.sphere_params[1],
-                                    uniforms.sphere_params[2],
-                                    0.0,
-                                ],
-                                sphere_visible_for_photons,
-                                uniforms.frame,
-                            );
-                            photon_mapper.emit_photons(&mut encoder, photon_frame_count);
-                            photon_mapper.build_spatial_structure(&mut encoder);
-                            {
                                 compute_pass.record(
                                     &mut encoder,
                                     &ugroup,
                                     match render_mode {
                                         RenderModeKind::Pathtraced => compute_pass::RenderPath::Pathtraced,
                                         RenderModeKind::Raytraced => compute_pass::RenderPath::Raytraced,
+                                        RenderModeKind::Rasterized => unreachable!(),
                                     },
                                 );
-                            }
-                            {
                                 let mut present_rpass =
                                     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                         label: Some("present_pass"),
