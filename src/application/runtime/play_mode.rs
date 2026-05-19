@@ -70,6 +70,19 @@ impl PlayMode {
         self.yaw = forward.x.atan2(forward.z);
         self.pitch = camera.pitch;
 
+        let (camera_local_pos, camera_local_rot) = main_db
+            .objects
+            .get(&camera_id)
+            .map(|obj| (obj.transform.location, obj.transform.rotation))
+            .map(|(cam_world_pos, cam_world_rot)| {
+                let player_world_pos = spawn_pos;
+                let inv_player_rot = spawn_rot.conjugate();
+                let local_pos = inv_player_rot * (cam_world_pos - player_world_pos);
+                let local_rot = inv_player_rot * cam_world_rot;
+                (local_pos, local_rot)
+            })
+            .unwrap_or((glam::Vec3::new(0.0, EYE_HEIGHT, 0.0), glam::Quat::IDENTITY));
+
         let mut world = world.borrow_mut();
         world.transforms.insert(
             player_id,
@@ -82,8 +95,8 @@ impl PlayMode {
         world.transforms.insert(
             camera_id,
             TransformComponent {
-                translation: glam::Vec3::new(0.0, EYE_HEIGHT, 0.0),
-                rotation: glam::Quat::IDENTITY,
+                translation: camera_local_pos,
+                rotation: camera_local_rot,
                 scale: glam::Vec3::ONE,
             },
         );
@@ -221,8 +234,6 @@ impl PlayMode {
         }
 
         let mut world = world.borrow_mut();
-        world.transforms.entry(camera_id).or_default().translation =
-            glam::Vec3::new(0.0, EYE_HEIGHT, 0.0);
         world.update_global_transforms_and_visibility();
 
         if let Some(camera_transform) = world.global_transforms.get(&camera_id) {

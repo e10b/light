@@ -216,11 +216,10 @@ pub async fn run() {
             player_camera_obj_id,
             CameraComponent {
                 active: false,
-                attached_to: Some(player_obj_id),
+                attached_to: None,
                 ..CameraComponent::default()
             },
         );
-        world.set_parent(player_camera_obj_id, player_obj_id);
         world.attach_physics(player_obj_id, PhysicsComponent::default());
         world.attach_collider(
             player_obj_id,
