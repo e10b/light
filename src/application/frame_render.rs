@@ -52,9 +52,8 @@ pub fn render_frame_and_present(
     let view = tex
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("enc"),
-    });
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
     let screen_descriptor = ScreenDescriptor {
         size_in_pixels: [config.width, config.height],
         pixels_per_point,
@@ -122,11 +121,12 @@ pub fn render_frame_and_present(
                 .collect();
             if *raster_instance_count != instances.len() as u32 {
                 *raster_instance_count = instances.len() as u32;
-                *raster_instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("raster_instance_buf"),
-                    contents: bytemuck::cast_slice(&instances),
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                });
+                *raster_instance_buf =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("raster_instance_buf"),
+                        contents: bytemuck::cast_slice(&instances),
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    });
             }
         } else if *raster_instance_count != 1 {
             *raster_instance_count = 1;
@@ -139,8 +139,32 @@ pub fn render_frame_and_present(
             });
         }
 
-        let view_proj = projection * camera.view_matrix();
-        raster_pass.update_view_proj(queue, view_proj);
+        let view_matrix = camera.view_matrix();
+        let light_dir = if uniforms.sun_light_count > 0 {
+            glam::Vec3::from_array([
+                uniforms.sun_lights[0][0],
+                uniforms.sun_lights[0][1],
+                uniforms.sun_lights[0][2],
+            ])
+        } else {
+            glam::Vec3::from_array([
+                uniforms.light_pos[0],
+                uniforms.light_pos[1],
+                uniforms.light_pos[2],
+            ])
+        }
+        .normalize_or_zero();
+        raster_pass.update_view_proj(queue, projection, view_matrix, camera.pos, light_dir);
+        raster_pass.render_shadow_maps(
+            &mut encoder,
+            vbuf,
+            raster_instance_buf,
+            *raster_instance_count,
+            ibuf,
+            model_idx_len as u32,
+        );
+        raster_pass.ensure_frame_depth(device, config.width, config.height);
+        let depth_view = raster_pass.frame_depth_view();
         let mut raster_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("raster_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -152,7 +176,14 @@ pub fn render_frame_and_present(
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             multiview_mask: None,
             occlusion_query_set: None,
             timestamp_writes: None,
