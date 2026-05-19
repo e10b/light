@@ -4,7 +4,7 @@ local state = {
 
 return {
     on_start = function(entity)
-        entity:log(\"Player script attached\")
+        entity:log("Player script attached")
     end,
 
     on_update = function(entity, dt)
