@@ -11,9 +11,11 @@ pub struct RasterInstance {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct RasterUniforms {
     view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
 }
 
 pub struct RasterPass {
+    env_pipeline: wgpu::RenderPipeline,
     pipeline: wgpu::RenderPipeline,
     uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -29,6 +31,7 @@ impl RasterPass {
             label: Some("raster_uniforms"),
             contents: bytemuck::bytes_of(&RasterUniforms {
                 view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                inv_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -36,7 +39,7 @@ impl RasterPass {
             label: Some("raster_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -57,6 +60,39 @@ impl RasterPass {
             label: Some("raster_pl"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
+        });
+        let env_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("raster_env_pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_env"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_env"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("raster_pipeline"),
@@ -109,6 +145,7 @@ impl RasterPass {
             cache: None,
         });
         Self {
+            env_pipeline,
             pipeline,
             uniform_buf,
             bind_group,
@@ -118,6 +155,7 @@ impl RasterPass {
     pub fn update_view_proj(&self, queue: &wgpu::Queue, view_proj: glam::Mat4) {
         let data = RasterUniforms {
             view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&data));
     }
@@ -131,6 +169,10 @@ impl RasterPass {
         ibuf: &'a wgpu::Buffer,
         index_count: u32,
     ) {
+        rpass.set_pipeline(&self.env_pipeline);
+        rpass.set_bind_group(0, &self.bind_group, &[]);
+        rpass.draw(0..3, 0..1);
+
         rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &self.bind_group, &[]);
         rpass.set_vertex_buffer(0, vbuf.slice(..));
