@@ -28,7 +28,7 @@ impl QuadPass {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("present_quad"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/quad.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/quad.wgsl").into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

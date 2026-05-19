@@ -53,11 +53,11 @@ impl ComputePass {
 
         let pathtraced_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("compute_pathtracer"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/pathtraced.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/pathtraced.wgsl").into()),
         });
         let raytraced_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("compute_raytracer"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/raytraced.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/raytraced.wgsl").into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

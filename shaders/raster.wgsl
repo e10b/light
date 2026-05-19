@@ -25,6 +25,11 @@ struct EnvVsOut {
   @location(0) ndc_xy: vec2<f32>,
 };
 
+struct EnvFsOut {
+  @location(0) color: vec4<f32>,
+  @builtin(frag_depth) depth: f32,
+};
+
 @vertex
 fn vs_env(@builtin(vertex_index) vi: u32) -> EnvVsOut {
   var out: EnvVsOut;
@@ -118,7 +123,7 @@ fn shadow_factor(world_pos: vec3<f32>, normal: vec3<f32>) -> f32 {
 }
 
 @fragment
-fn fs_env(in: EnvVsOut) -> @location(0) vec4<f32> {
+fn fs_env(in: EnvVsOut) -> EnvFsOut {
   let near_clip = vec4<f32>(in.ndc_xy, 0.0, 1.0);
   let far_clip = vec4<f32>(in.ndc_xy, 1.0, 1.0);
   let near_world4 = uniforms.inv_view_proj * near_clip;
@@ -143,11 +148,12 @@ fn fs_env(in: EnvVsOut) -> @location(0) vec4<f32> {
       ground_col *= mix(0.36, 1.0, shadow);
       let fade = exp(-length(p.xz) * 0.03);
       ground_col *= mix(0.72, 1.0, fade);
-      return vec4<f32>(ground_col, 1.0);
+      let clip = uniforms.view_proj * vec4<f32>(p, 1.0);
+      return EnvFsOut(vec4<f32>(ground_col, 1.0), clamp(clip.z / clip.w, 0.0, 1.0));
     }
   }
 
-  return vec4<f32>(sky(rd), 1.0);
+  return EnvFsOut(vec4<f32>(sky(rd), 1.0), 1.0);
 }
 
 @fragment
