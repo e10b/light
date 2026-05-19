@@ -10,36 +10,29 @@ use wgpu::util::DeviceExt;
 use winit::{event::*, event_loop::EventLoop};
 
 use crate::{
-    scene_data::{Id, MainDatabase, Transform as DbTransform},
     compute_pass,
+    ecs::{
+        CameraComponent, ColliderComponent, ColliderShape, PhysicsComponent, ScriptEngine, World,
+    },
     editor::panels::{CameraProjectionKind, GizmoModeKind, RenderModeKind},
-    ecs::{CameraComponent, PhysicsComponent, ScriptEngine, World},
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     mesh::{load_gltf_mesh, Vertex},
     photon_mapper::PhotonMapper,
     prism_file::MaterialData as PrismMaterialData,
     quad_pass, raster_pass,
     scene::SceneKind,
+    scene_data::{Id, MainDatabase, Transform as DbTransform},
     tooling::lua::scripts_dir,
-    tooling::materials::{make_empty_material, make_glass_material, make_white_material, preview_from_material_data},
+    tooling::materials::{
+        make_empty_material, make_glass_material, make_white_material, preview_from_material_data,
+    },
     window::create_window,
 };
 
-use super::input::{handle_keyboard_input, handle_pointer_window_event};
-use super::{
-    camera_motion::apply_fly_camera_motion,
-    camera_state::write_runtime_back_to_database,
-    fps::update_fps_title,
-    mouse_look::handle_mouse_motion,
-    resize::handle_surface_resize,
-    stress::maybe_build_stress_scene,
-    sun::update_sun_lights,
-    world_tick::tick_world_and_scripts,
-};
 use super::super::{
     add_menu::{draw_add_menu, AddMenuContext},
-    editor_surface::draw_editor_surface,
     ecs_sync::register_object_entity,
+    editor_surface::draw_editor_surface,
     frame_render::render_frame_and_present,
     geometry::{
         append_object_mesh, build_photon_targets, make_cube_mesh, make_prism_mesh, mesh_bounds,
@@ -56,6 +49,18 @@ use super::super::{
         camera_projection_matrix, gizmo_projection_matrix, intersect_cube, intersect_sphere,
         scene_camera, wine_spotlight_position, world_ray_from_cursor, world_to_screen,
     },
+};
+use super::input::{handle_keyboard_input, handle_pointer_window_event};
+use super::{
+    camera_motion::apply_fly_camera_motion,
+    camera_state::write_runtime_back_to_database,
+    fps::update_fps_title,
+    mouse_look::handle_mouse_motion,
+    play_mode::{play_ground_y, player_cube_scale, PlayMode, PLAYER_HALF_EXTENTS},
+    resize::handle_surface_resize,
+    stress::maybe_build_stress_scene,
+    sun::update_sun_lights,
+    world_tick::tick_world_and_scripts,
 };
 
 pub async fn run() {
@@ -170,12 +175,21 @@ pub async fn run() {
         main_db.create_object("WineGlass", Some(wine_mesh_id), DbTransform::default());
     let cornell_obj_id =
         main_db.create_object("CornellBox", Some(cornell_mesh_id), DbTransform::default());
-    let player_obj_id = main_db.create_object("Player", None, DbTransform::default());
+    let player_start = glam::Vec3::new(0.0, play_ground_y() + 0.9, 5.0);
+    let player_obj_id = main_db.create_object(
+        "Player",
+        None,
+        DbTransform {
+            location: player_start,
+            rotation: glam::Quat::IDENTITY,
+            scale: player_cube_scale(),
+        },
+    );
     let player_camera_obj_id = main_db.create_object(
         "Player Camera",
         None,
         DbTransform {
-            location: glam::Vec3::new(0.0, 4.0, 12.0),
+            location: glam::Vec3::new(0.0, 1.55, 0.0),
             rotation: glam::Quat::IDENTITY,
             scale: glam::Vec3::ONE,
         },
@@ -201,13 +215,32 @@ pub async fn run() {
             player_camera_obj_id,
             CameraComponent {
                 active: false,
+                attached_to: Some(player_obj_id),
                 ..CameraComponent::default()
             },
         );
+        world.set_parent(player_camera_obj_id, player_obj_id);
         world.attach_physics(player_obj_id, PhysicsComponent::default());
+        world.attach_collider(
+            player_obj_id,
+            ColliderComponent {
+                shape: ColliderShape::Box {
+                    half_extents: PLAYER_HALF_EXTENTS,
+                },
+            },
+        );
+        world.attach_collider(
+            Id(0),
+            ColliderComponent {
+                shape: ColliderShape::Plane {
+                    normal: glam::Vec3::Y,
+                    offset: play_ground_y(),
+                },
+            },
+        );
     }
-    let mut script_engine =
-        ScriptEngine::new(std::rc::Rc::clone(&ecs_world), scripts_dir()).expect("create Lua engine");
+    let mut script_engine = ScriptEngine::new(std::rc::Rc::clone(&ecs_world), scripts_dir())
+        .expect("create Lua engine");
     let mut material_library: std::collections::HashMap<String, PrismMaterialData> =
         std::collections::HashMap::new();
     material_library.insert("White".to_string(), make_white_material());
@@ -219,14 +252,19 @@ pub async fn run() {
     object_material_names.insert(decanter_obj_id, "Glass".to_string());
     object_material_names.insert(wine_obj_id, "Glass".to_string());
     object_material_names.insert(cornell_obj_id, "Empty".to_string());
+    object_material_names.insert(player_obj_id, "White".to_string());
     let mut last_material_signature = String::new();
     let default_cube_mesh_id = main_db.create_mesh("CubeMesh", default_cube_vertex_len);
     if let Some(mesh_db) = main_db.meshes.get_mut(&default_cube_mesh_id) {
-        mesh_db.user_count = 1;
+        mesh_db.user_count = 2;
     }
     if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
         obj.mesh_id = Some(default_cube_mesh_id);
     }
+    if let Some(obj) = main_db.objects.get_mut(&player_obj_id) {
+        obj.mesh_id = Some(default_cube_mesh_id);
+    }
+    ecs_world.borrow_mut().attach_mesh(player_obj_id, 0);
     let default_cube_instance = MeshObjectInstance {
         object_id: sphere_obj_id,
         mesh_asset_id: 0,
@@ -252,6 +290,31 @@ pub async fn run() {
         translation: default_cube_center - cube_center,
         scale: glam::Vec3::ONE,
     };
+    let player_cube_instance = MeshObjectInstance {
+        object_id: player_obj_id,
+        mesh_asset_id: 0,
+        vertex_start: 0,
+        vertex_count: mesh.positions4.len(),
+        index_start: 0,
+        index_count: mesh.indices.len(),
+        material_start: 0,
+        material_count: mesh.materials.len(),
+        base_positions: mesh
+            .positions4
+            .iter()
+            .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
+            .collect(),
+        base_normals: mesh
+            .normals4
+            .iter()
+            .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
+            .collect(),
+        pivot: cube_center,
+        max_extent: cube_max_extent,
+        rotation: glam::Quat::IDENTITY,
+        translation: player_start - cube_center,
+        scale: player_cube_scale(),
+    };
 
     let mut model_verts = mesh.vertices.clone();
     let mut model_idx = mesh.indices.clone();
@@ -261,7 +324,7 @@ pub async fn run() {
         model_idx.len()
     );
 
-    let mut mesh_instances = vec![default_cube_instance];
+    let mut mesh_instances = vec![default_cube_instance, player_cube_instance];
 
     let mut object_target_by_id: std::collections::HashMap<Id, GizmoTargetKind> =
         std::collections::HashMap::new();
@@ -272,7 +335,7 @@ pub async fn run() {
     object_target_by_id.insert(wine_obj_id, GizmoTargetKind::WineGlass);
     object_target_by_id.insert(cornell_obj_id, GizmoTargetKind::CornellBox);
     object_target_by_id.insert(player_obj_id, GizmoTargetKind::Decanter);
-    object_target_by_id.insert(player_camera_obj_id, GizmoTargetKind::Decanter);
+    object_target_by_id.insert(player_camera_obj_id, GizmoTargetKind::Camera);
 
     let mut decanter_master = main_db.create_collection("SceneMaster");
     let mut wine_master = Id(0);
@@ -303,7 +366,9 @@ pub async fn run() {
     let mut ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("model_ibuf"),
         contents: bytemuck::cast_slice(&model_idx),
-        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::BLAS_INPUT,
+        usage: wgpu::BufferUsages::INDEX
+            | wgpu::BufferUsages::BLAS_INPUT
+            | wgpu::BufferUsages::COPY_DST,
     });
     let mut pos_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_pos_buf"),
@@ -318,12 +383,12 @@ pub async fn run() {
     let mut idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_idx_buf"),
         contents: bytemuck::cast_slice(&model_idx),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let mut tri_mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_tri_mat_buf"),
         contents: bytemuck::cast_slice(&mesh.triangle_material_ids),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let mut mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh_materials_buf"),
@@ -353,14 +418,17 @@ pub async fn run() {
         label: Some("scene_tlas"),
         flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
         update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-        max_instances: 1,
+        max_instances: mesh_instances.len().max(1) as u32,
     });
-    tlas[0] = Some(wgpu::TlasInstance::new(
-        &model_blas,
-        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-        0,
-        0xff,
-    ));
+    for (i, inst) in mesh_instances.iter().enumerate() {
+        let c = inst.center();
+        tlas[i] = Some(wgpu::TlasInstance::new(
+            &model_blas,
+            [1.0, 0.0, 0.0, c.x, 0.0, 1.0, 0.0, c.y, 0.0, 0.0, 1.0, c.z],
+            0,
+            0xff,
+        ));
+    }
 
     let model_build = wgpu::BlasBuildEntry {
         blas: &model_blas,
@@ -778,6 +846,8 @@ pub async fn run() {
     let mut lua_editor_path = String::new();
     let mut lua_editor_text = String::new();
     let mut lua_editor_status = String::new();
+    let mut play_mode = PlayMode::default();
+    let mut show_editor_ui_before_play = show_editor_ui;
 
     let _ = event_loop.run(move |event, active_loop| {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -799,7 +869,21 @@ pub async fn run() {
             Event::WindowEvent {
                 event: WindowEvent::KeyboardInput { event, .. },
                 ..
-            } => handle_keyboard_input(&event, &mut show_editor_ui, &mut keys_pressed),
+            } => {
+                let escape_pressed = event.state == winit::event::ElementState::Pressed
+                    && !event.repeat
+                    && event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape);
+                if escape_pressed && play_mode.active {
+                    play_mode.stop(&ecs_world, player_camera_obj_id, &mut camera);
+                    show_editor_ui = show_editor_ui_before_play;
+                    window.set_cursor_visible(true);
+                    let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                    accumulation_dirty = true;
+                } else {
+                    handle_keyboard_input(&event, &mut show_editor_ui, &mut keys_pressed);
+                }
+            }
             Event::WindowEvent {
                 event: WindowEvent::Resized(size),
                 ..
@@ -823,14 +907,19 @@ pub async fn run() {
                 event: winit::event::DeviceEvent::MouseMotion { delta },
                 ..
             } => {
-                handle_mouse_motion(
-                    delta,
-                    &egui_ctx,
-                    &keys_pressed,
-                    mouse_speed,
-                    &mut camera,
-                    &mut accumulation_dirty,
-                );
+                if play_mode.active {
+                    play_mode.trigger_look_action(delta, mouse_speed);
+                    accumulation_dirty = true;
+                } else {
+                    handle_mouse_motion(
+                        delta,
+                        &egui_ctx,
+                        &keys_pressed,
+                        mouse_speed,
+                        &mut camera,
+                        &mut accumulation_dirty,
+                    );
+                }
             }
             Event::NewEvents(start_cause) => match start_cause {
                 winit::event::StartCause::Init | winit::event::StartCause::Poll => {
@@ -842,14 +931,25 @@ pub async fn run() {
                     let prev_cam_pos = camera.pos;
                     let prev_cam_yaw = camera.yaw;
                     let prev_cam_pitch = camera.pitch;
-                    apply_fly_camera_motion(
-                        &mut camera,
-                        dt,
-                        &keys_pressed,
-                        move_speed,
-                        look_speed,
-                        &egui_ctx,
-                    );
+                    if !play_mode.active {
+                        apply_fly_camera_motion(
+                            &mut camera,
+                            dt,
+                            &keys_pressed,
+                            move_speed,
+                            look_speed,
+                            &egui_ctx,
+                        );
+                    }
+
+                    if play_mode.active {
+                        play_mode.apply_movement_input(
+                            &ecs_world,
+                            player_obj_id,
+                            &keys_pressed,
+                            move_speed,
+                        );
+                    }
 
                     if tick_world_and_scripts(
                         dt,
@@ -862,6 +962,13 @@ pub async fn run() {
                     ) {
                         geometry_dirty = true;
                         accumulation_dirty = true;
+                    }
+                    if play_mode.active {
+                        play_mode.sync_camera_from_player(
+                            &ecs_world,
+                            player_camera_obj_id,
+                            &mut camera,
+                        );
                     }
 
                     uniforms.view_inv = camera.view_matrix().inverse().to_cols_array_2d();
@@ -906,6 +1013,29 @@ pub async fn run() {
                                         ui.strong("Prism");
                                         ui.separator();
                                         let _ = ui.button("New Cube Scene");
+                                        if ui
+                                            .add_enabled(!play_mode.active, egui::Button::new("Play"))
+                                            .clicked()
+                                        {
+                                            show_editor_ui_before_play = show_editor_ui;
+                                            play_mode.start(
+                                                &ecs_world,
+                                                &mut main_db,
+                                                player_obj_id,
+                                                player_camera_obj_id,
+                                                &camera,
+                                            );
+                                            show_editor_ui = false;
+                                            window.set_cursor_visible(false);
+                                            let _ = window
+                                                .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                                                .or_else(|_| {
+                                                    window.set_cursor_grab(
+                                                        winit::window::CursorGrabMode::Confined,
+                                                    )
+                                                });
+                                            accumulation_dirty = true;
+                                        }
                                         if ui.button("Stress 1M Cubes").clicked() {
                                             stress_test_requested = true;
                                         }
@@ -1296,6 +1426,28 @@ pub async fn run() {
                                         ),
                                     )
                                 }
+                                GizmoTargetKind::Camera => {
+                                    let transform = selected_object_id
+                                        .and_then(|id| ecs_world.borrow().global_transforms.get(&id).cloned());
+                                    GizmoTransform::from_scale_rotation_translation(
+                                        transform_gizmo::math::DVec3::new(
+                                            transform.as_ref().map(|t| t.scale.x).unwrap_or(1.0) as f64,
+                                            transform.as_ref().map(|t| t.scale.y).unwrap_or(1.0) as f64,
+                                            transform.as_ref().map(|t| t.scale.z).unwrap_or(1.0) as f64,
+                                        ),
+                                        transform_gizmo::math::DQuat::from_xyzw(
+                                            transform.as_ref().map(|t| t.rotation.x).unwrap_or(0.0) as f64,
+                                            transform.as_ref().map(|t| t.rotation.y).unwrap_or(0.0) as f64,
+                                            transform.as_ref().map(|t| t.rotation.z).unwrap_or(0.0) as f64,
+                                            transform.as_ref().map(|t| t.rotation.w).unwrap_or(1.0) as f64,
+                                        ),
+                                        transform_gizmo::math::DVec3::new(
+                                            transform.as_ref().map(|t| t.translation.x).unwrap_or(camera.pos.x) as f64,
+                                            transform.as_ref().map(|t| t.translation.y).unwrap_or(camera.pos.y) as f64,
+                                            transform.as_ref().map(|t| t.translation.z).unwrap_or(camera.pos.z) as f64,
+                                        ),
+                                    )
+                                }
                             };
 
                             if has_selection {
@@ -1346,6 +1498,13 @@ pub async fn run() {
                                             }
                                             GizmoTargetKind::WineSpotlight => {
                                                 let cur = spot_empty_position;
+                                                translation = cur + (translation - cur) * 3.0;
+                                            }
+                                            GizmoTargetKind::Camera => {
+                                                let cur = selected_object_id
+                                                    .and_then(|id| ecs_world.borrow().global_transforms.get(&id).cloned())
+                                                    .map(|t| t.translation)
+                                                    .unwrap_or(camera.pos);
                                                 translation = cur + (translation - cur) * 3.0;
                                             }
                                         }
@@ -1508,6 +1667,33 @@ pub async fn run() {
                                             (new_t.scale.z as f32).clamp(0.1, 8.0),
                                         );
                                     }
+                                    GizmoTargetKind::Camera => {
+                                        if let Some(id) = selected_object_id {
+                                            let rotation = glam::Quat::from_array([
+                                                new_t.rotation.v.x as f32,
+                                                new_t.rotation.v.y as f32,
+                                                new_t.rotation.v.z as f32,
+                                                new_t.rotation.s as f32,
+                                            ]);
+                                            let scale = glam::Vec3::new(
+                                                (new_t.scale.x as f32).clamp(0.1, 8.0),
+                                                (new_t.scale.y as f32).clamp(0.1, 8.0),
+                                                (new_t.scale.z as f32).clamp(0.1, 8.0),
+                                            );
+                                            let mut world = ecs_world.borrow_mut();
+                                            let transform = world.transforms.entry(id).or_default();
+                                            transform.translation = translation;
+                                            transform.rotation = rotation;
+                                            transform.scale = scale;
+                                            world.update_global_transforms_and_visibility();
+                                            drop(world);
+                                            if let Some(obj) = main_db.objects.get_mut(&id) {
+                                                obj.transform.location = translation;
+                                                obj.transform.rotation = rotation;
+                                                obj.transform.scale = scale;
+                                            }
+                                        }
+                                    }
                                     }
                                     accumulation_dirty = true;
                                 }
@@ -1616,6 +1802,23 @@ pub async fn run() {
                                         best = Some((GizmoTargetKind::WineSpotlight, spot_obj_id));
                                     }
                                 }
+                                if let Some(camera_transform) = ecs_world
+                                    .borrow()
+                                    .global_transforms
+                                    .get(&player_camera_obj_id)
+                                    .cloned()
+                                {
+                                    if let Some(t) = intersect_sphere(
+                                        ro,
+                                        rd,
+                                        camera_transform.translation,
+                                        0.85,
+                                    ) {
+                                        if t < best_t {
+                                            best = Some((GizmoTargetKind::Camera, player_camera_obj_id));
+                                        }
+                                    }
+                                }
                                 if let Some((selected, object_id)) = best {
                                     gizmo_target = selected;
                                     selected_object_id = Some(object_id);
@@ -1699,6 +1902,98 @@ pub async fn run() {
                                         painter.circle_filled(Pos2::new(s[0], s[1]), 3.0, line_color);
                                     }
                                 }
+                                if current_scene_exists {
+                                    let display = [display_size[0].max(1.0), display_size[1].max(1.0)];
+                                    let world_ref = ecs_world.borrow();
+                                    for (camera_id, _) in &world_ref.cameras {
+                                        let Some(transform) = world_ref.global_transforms.get(camera_id) else {
+                                            continue;
+                                        };
+                                        let Some(s) = world_to_screen(transform.translation, view, projection, display) else {
+                                            continue;
+                                        };
+                                        let selected = selected_object_id == Some(*camera_id);
+                                        let color = if selected {
+                                            Color32::from_rgb(86, 190, 255)
+                                        } else {
+                                            Color32::from_rgb(135, 220, 255)
+                                        };
+                                        let p = Pos2::new(s[0], s[1]);
+                                        painter.add(egui::Shape::convex_polygon(
+                                            vec![
+                                                Pos2::new(p.x, p.y - 11.0),
+                                                Pos2::new(p.x + 12.0, p.y),
+                                                Pos2::new(p.x, p.y + 11.0),
+                                                Pos2::new(p.x - 12.0, p.y),
+                                            ],
+                                            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 36),
+                                            Stroke::new(2.0, color),
+                                        ));
+                                        painter.line_segment(
+                                            [p, Pos2::new(p.x + 16.0, p.y - 10.0)],
+                                            Stroke::new(2.0, color),
+                                        );
+                                        painter.line_segment(
+                                            [p, Pos2::new(p.x + 16.0, p.y + 10.0)],
+                                            Stroke::new(2.0, color),
+                                        );
+                                    }
+                                }
+                            }
+                            if !has_selection && current_scene_exists {
+                                let painter = ctx.layer_painter(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    egui::Id::new("always_visible_scene_icons"),
+                                ));
+                                let display = [display_size[0].max(1.0), display_size[1].max(1.0)];
+                                let center_screen = world_to_screen(active_center, view, projection, display);
+                                for light in &light_instances {
+                                    let Some(s) = world_to_screen(light.position, view, projection, display) else {
+                                        continue;
+                                    };
+                                    let color = Color32::from_rgb(255, 242, 153);
+                                    if let Some(cn) = center_screen {
+                                        painter.line_segment(
+                                            [Pos2::new(s[0], s[1]), Pos2::new(cn[0], cn[1])],
+                                            Stroke::new(1.5, color),
+                                        );
+                                    }
+                                    painter.circle_stroke(
+                                        Pos2::new(s[0], s[1]),
+                                        8.0,
+                                        Stroke::new(2.0, color),
+                                    );
+                                    painter.circle_filled(Pos2::new(s[0], s[1]), 3.0, color);
+                                }
+                                let world_ref = ecs_world.borrow();
+                                for (camera_id, _) in &world_ref.cameras {
+                                    let Some(transform) = world_ref.global_transforms.get(camera_id) else {
+                                        continue;
+                                    };
+                                    let Some(s) = world_to_screen(transform.translation, view, projection, display) else {
+                                        continue;
+                                    };
+                                    let color = Color32::from_rgb(135, 220, 255);
+                                    let p = Pos2::new(s[0], s[1]);
+                                    painter.add(egui::Shape::convex_polygon(
+                                        vec![
+                                            Pos2::new(p.x, p.y - 11.0),
+                                            Pos2::new(p.x + 12.0, p.y),
+                                            Pos2::new(p.x, p.y + 11.0),
+                                            Pos2::new(p.x - 12.0, p.y),
+                                        ],
+                                        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 36),
+                                        Stroke::new(2.0, color),
+                                    ));
+                                    painter.line_segment(
+                                        [p, Pos2::new(p.x + 16.0, p.y - 10.0)],
+                                        Stroke::new(2.0, color),
+                                    );
+                                    painter.line_segment(
+                                        [p, Pos2::new(p.x + 16.0, p.y + 10.0)],
+                                        Stroke::new(2.0, color),
+                                    );
+                                }
                             }
                             }
                             uniforms.sun_intensity = sun_intensity.max(0.0);
@@ -1752,6 +2047,7 @@ pub async fn run() {
                                     GizmoTargetKind::CornellBox => 4,
                                     GizmoTargetKind::SunLamp => 0,
                                     GizmoTargetKind::WineSpotlight => 0,
+                                    GizmoTargetKind::Camera => 0,
                                 }
                             } else {
                                 0

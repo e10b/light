@@ -3,11 +3,11 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use egui_code_editor::Syntax;
 
 use crate::{
+    ecs::{ScriptEngine, World},
     editor::panels::{
         draw_outliner_panel, draw_properties_panel, CameraProjectionKind, GizmoModeKind,
         OutlinerItem, RenderModeKind,
     },
-    ecs::{ScriptEngine, World},
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     prism_file::MaterialData as PrismMaterialData,
     scene::SceneKind,
@@ -100,6 +100,7 @@ pub fn draw_editor_surface(
             GizmoTargetKind::CornellBox => Some(cornell_obj_id),
             GizmoTargetKind::SunLamp => Some(sun_obj_id),
             GizmoTargetKind::WineSpotlight => Some(spot_obj_id),
+            GizmoTargetKind::Camera => None,
         };
     }
 
@@ -134,7 +135,8 @@ pub fn draw_editor_surface(
         material_editor,
         material_runtime_overrides,
     );
-    if let (Some(obj_id), Some(intensity)) = (*selected_object_id, panel_output.selected_light_intensity)
+    if let (Some(obj_id), Some(intensity)) =
+        (*selected_object_id, panel_output.selected_light_intensity)
     {
         if let Some(light) = light_instances.iter_mut().find(|l| l.object_id == obj_id) {
             light.intensity = intensity;

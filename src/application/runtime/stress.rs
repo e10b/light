@@ -1,4 +1,7 @@
-use crate::{application::{geometry::make_cube_mesh, types::MeshObjectInstance}, scene_data::Id};
+use crate::{
+    application::{geometry::make_cube_mesh, types::MeshObjectInstance},
+    scene_data::Id,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn maybe_build_stress_scene(
@@ -62,7 +65,6 @@ pub fn maybe_build_stress_scene(
     *accumulation_dirty = true;
     *project_status = format!(
         "Stress scene armed: {} cubes (TLAS instances), {} mesh assets",
-        *stress_instance_count,
-        mesh_asset_count
+        *stress_instance_count, mesh_asset_count
     );
 }

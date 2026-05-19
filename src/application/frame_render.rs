@@ -109,8 +109,8 @@ pub fn render_frame_and_present(
     }
 
     if matches!(render_mode, RenderModeKind::Rasterized) {
-        if stress_instance_count > 0 {
-            let instances: Vec<raster_pass::RasterInstance> = mesh_instances
+        let instances: Vec<raster_pass::RasterInstance> = if stress_instance_count > 0 {
+            mesh_instances
                 .iter()
                 .map(|inst| {
                     let c = inst.center();
@@ -118,23 +118,25 @@ pub fn render_frame_and_present(
                         offset: [c.x, c.y, c.z, 0.0],
                     }
                 })
-                .collect();
-            if *raster_instance_count != instances.len() as u32 {
-                *raster_instance_count = instances.len() as u32;
-                *raster_instance_buf =
-                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("raster_instance_buf"),
-                        contents: bytemuck::cast_slice(&instances),
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    });
-            }
-        } else if *raster_instance_count != 1 {
-            *raster_instance_count = 1;
+                .collect()
+        } else {
+            mesh_instances
+                .iter()
+                .map(|inst| raster_pass::RasterInstance {
+                    offset: [
+                        inst.translation.x,
+                        inst.translation.y,
+                        inst.translation.z,
+                        0.0,
+                    ],
+                })
+                .collect()
+        };
+        if *raster_instance_count != instances.len() as u32 {
+            *raster_instance_count = instances.len() as u32;
             *raster_instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("raster_instance_buf"),
-                contents: bytemuck::cast_slice(&[raster_pass::RasterInstance {
-                    offset: [0.0, 0.0, 0.0, 0.0],
-                }]),
+                contents: bytemuck::cast_slice(&instances),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
         }

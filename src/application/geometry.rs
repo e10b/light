@@ -4,7 +4,7 @@ use crate::{
     scene_data::Id,
 };
 
-use super::types::{MAX_PHOTON_TARGETS, MeshObjectInstance};
+use super::types::{MeshObjectInstance, MAX_PHOTON_TARGETS};
 
 pub fn make_prism_mesh(center: glam::Vec3, radius: f32, height: f32) -> MeshData {
     let half_h = height * 0.5;
@@ -94,7 +94,12 @@ pub fn translate_mesh(mesh: &mut MeshData, offset: glam::Vec3) {
     }
 }
 
-pub fn orient_and_scale_mesh(mesh: &mut MeshData, pivot: glam::Vec3, rotation: glam::Quat, scale: f32) {
+pub fn orient_and_scale_mesh(
+    mesh: &mut MeshData,
+    pivot: glam::Vec3,
+    rotation: glam::Quat,
+    scale: f32,
+) {
     for vertex in &mut mesh.vertices {
         let pos = glam::Vec3::from(vertex.position);
         vertex.position = (pivot + rotation * ((pos - pivot) * scale)).to_array();
@@ -144,8 +149,8 @@ pub fn make_cube_mesh(center: glam::Vec3, half_extent: f32) -> MeshData {
         [-1.0, 1.0, 1.0],
     ];
     let indices: Vec<u32> = vec![
-        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1,
-        6, 5, 3, 0, 4, 3, 4, 7,
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 1, 2, 6, 1, 6, 5,
+        3, 0, 4, 3, 4, 7,
     ];
     let mut vertices = Vec::new();
     let mut positions4 = Vec::new();

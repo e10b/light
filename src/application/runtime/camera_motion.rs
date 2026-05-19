@@ -11,7 +11,11 @@ pub fn apply_fly_camera_motion(
     look_speed: f32,
     egui_ctx: &egui::Context,
 ) {
-    let sprint = if keys_pressed.contains("Shift") { 12.0 } else { 1.0 };
+    let sprint = if keys_pressed.contains("Shift") {
+        12.0
+    } else {
+        1.0
+    };
     let wants_keyboard = egui_ctx.wants_keyboard_input();
 
     if !wants_keyboard && keys_pressed.contains("w") {

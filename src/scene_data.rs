@@ -202,7 +202,13 @@ impl MainDatabase {
         out
     }
 
-    pub fn ensure_scene_base(&mut self, scene_id: Id, object_id: Id, visible: bool, selectable: bool) {
+    pub fn ensure_scene_base(
+        &mut self,
+        scene_id: Id,
+        object_id: Id,
+        visible: bool,
+        selectable: bool,
+    ) {
         if let Some(scene) = self.scenes.get(&scene_id) {
             if let Some(vl) = self.view_layers.get_mut(&scene.view_layer_id) {
                 if !vl.bases.iter().any(|b| b.object_id == object_id) {

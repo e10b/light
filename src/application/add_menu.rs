@@ -1,9 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    path::Path,
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc};
 
 use crate::{
     ecs::{CameraComponent, World},
@@ -76,7 +71,8 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                         None,
                         DbTransform::default(),
                     );
-                    ctx.main_db.collection_link_object(ctx.decanter_master, obj_id);
+                    ctx.main_db
+                        .collection_link_object(ctx.decanter_master, obj_id);
                     ctx.main_db.ensure_scene_base(scene_id, obj_id, true, true);
                     register_object_entity(&mut ctx.ecs_world.borrow_mut(), ctx.main_db, obj_id);
                     ctx.object_target_by_id
@@ -104,7 +100,8 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                             scale: glam::Vec3::ONE,
                         },
                     );
-                    ctx.main_db.collection_link_object(ctx.decanter_master, obj_id);
+                    ctx.main_db
+                        .collection_link_object(ctx.decanter_master, obj_id);
                     ctx.main_db.ensure_scene_base(scene_id, obj_id, true, true);
                     {
                         let mut world = ctx.ecs_world.borrow_mut();
@@ -127,18 +124,22 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                         .filter(|o| o.name.starts_with("Cube"))
                         .count()
                         + 1;
-                    let cube_center = ctx.active_center + glam::Vec3::new(count as f32 * 4.0, 0.5, 0.0);
+                    let cube_center =
+                        ctx.active_center + glam::Vec3::new(count as f32 * 4.0, 0.5, 0.0);
                     let cube_mesh = make_cube_mesh(glam::Vec3::ZERO, 1.5);
                     let mesh_id = ctx.default_cube_mesh_id;
                     if let Some(mesh_db) = ctx.main_db.meshes.get_mut(&mesh_id) {
                         mesh_db.user_count = mesh_db.user_count.saturating_add(1);
                     }
-                    let obj_id =
-                        ctx.main_db
-                            .create_object(format!("Cube {count}"), Some(mesh_id), DbTransform::default());
+                    let obj_id = ctx.main_db.create_object(
+                        format!("Cube {count}"),
+                        Some(mesh_id),
+                        DbTransform::default(),
+                    );
                     let mut inst = append_object_mesh(ctx.mesh, cube_mesh, obj_id, 0);
                     place_instance_center(&mut inst, cube_center);
-                    ctx.main_db.collection_link_object(ctx.decanter_master, obj_id);
+                    ctx.main_db
+                        .collection_link_object(ctx.decanter_master, obj_id);
                     ctx.main_db.ensure_scene_base(scene_id, obj_id, true, true);
                     register_object_entity(&mut ctx.ecs_world.borrow_mut(), ctx.main_db, obj_id);
                     ctx.object_target_by_id
@@ -164,7 +165,8 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                         .filter(|o| o.name.starts_with("Prism"))
                         .count()
                         + 1;
-                    let prism_center = ctx.active_center + glam::Vec3::new(count as f32 * 4.0, 1.0, -2.0);
+                    let prism_center =
+                        ctx.active_center + glam::Vec3::new(count as f32 * 4.0, 1.0, -2.0);
                     let prism_mesh = make_prism_mesh(glam::Vec3::ZERO, 1.25, 3.2);
                     let mesh_id = ctx
                         .main_db
@@ -176,7 +178,8 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                     );
                     let mut inst = append_object_mesh(ctx.mesh, prism_mesh, obj_id, 5);
                     place_instance_center(&mut inst, prism_center);
-                    ctx.main_db.collection_link_object(ctx.decanter_master, obj_id);
+                    ctx.main_db
+                        .collection_link_object(ctx.decanter_master, obj_id);
                     ctx.main_db.ensure_scene_base(scene_id, obj_id, true, true);
                     register_object_entity(&mut ctx.ecs_world.borrow_mut(), ctx.main_db, obj_id);
                     ctx.object_target_by_id
@@ -208,7 +211,8 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                         DbTransform::default(),
                     );
                     let pos = ctx.active_center + glam::Vec3::new(count as f32 * 3.0, 8.0, 10.0);
-                    ctx.main_db.collection_link_object(ctx.decanter_master, obj_id);
+                    ctx.main_db
+                        .collection_link_object(ctx.decanter_master, obj_id);
                     ctx.main_db.ensure_scene_base(scene_id, obj_id, true, true);
                     register_object_entity(&mut ctx.ecs_world.borrow_mut(), ctx.main_db, obj_id);
                     ctx.object_target_by_id
@@ -254,9 +258,14 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                                 DbTransform::default(),
                             );
                             let inst = append_object_mesh(ctx.mesh, new_mesh, obj_id, 1);
-                            ctx.main_db.collection_link_object(ctx.decanter_master, obj_id);
+                            ctx.main_db
+                                .collection_link_object(ctx.decanter_master, obj_id);
                             ctx.main_db.ensure_scene_base(scene_id, obj_id, true, true);
-                            register_object_entity(&mut ctx.ecs_world.borrow_mut(), ctx.main_db, obj_id);
+                            register_object_entity(
+                                &mut ctx.ecs_world.borrow_mut(),
+                                ctx.main_db,
+                                obj_id,
+                            );
                             if let Some(transform) =
                                 ctx.ecs_world.borrow_mut().transforms.get_mut(&obj_id)
                             {
@@ -301,7 +310,8 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                             );
                             translate_mesh(
                                 &mut new_mesh,
-                                ctx.wine_center - c0 + glam::Vec3::new(count as f32 * 8.0, 0.0, 0.0),
+                                ctx.wine_center - c0
+                                    + glam::Vec3::new(count as f32 * 8.0, 0.0, 0.0),
                             );
                             let mesh_id = ctx
                                 .main_db
@@ -312,9 +322,14 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                                 DbTransform::default(),
                             );
                             let inst = append_object_mesh(ctx.mesh, new_mesh, obj_id, 2);
-                            ctx.main_db.collection_link_object(ctx.decanter_master, obj_id);
+                            ctx.main_db
+                                .collection_link_object(ctx.decanter_master, obj_id);
                             ctx.main_db.ensure_scene_base(scene_id, obj_id, true, true);
-                            register_object_entity(&mut ctx.ecs_world.borrow_mut(), ctx.main_db, obj_id);
+                            register_object_entity(
+                                &mut ctx.ecs_world.borrow_mut(),
+                                ctx.main_db,
+                                obj_id,
+                            );
                             if let Some(transform) =
                                 ctx.ecs_world.borrow_mut().transforms.get_mut(&obj_id)
                             {
@@ -349,17 +364,13 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                             Ok(mut imported) => {
                                 let (c0, size0, _, _) = mesh_bounds(&imported.vertices);
                                 let fit = 8.0 / size0.max_element().max(0.001);
-                                orient_and_scale_mesh(
-                                    &mut imported,
-                                    c0,
-                                    glam::Quat::IDENTITY,
-                                    fit,
-                                );
+                                orient_and_scale_mesh(&mut imported, c0, glam::Quat::IDENTITY, fit);
                                 let (c1, _, _, _) = mesh_bounds(&imported.vertices);
                                 let offset_index = ctx.mesh_instances.len() as f32;
                                 translate_mesh(
                                     &mut imported,
-                                    ctx.active_center + glam::Vec3::new(offset_index * 4.0, 0.0, 0.0)
+                                    ctx.active_center
+                                        + glam::Vec3::new(offset_index * 4.0, 0.0, 0.0)
                                         - c1,
                                 );
                                 let stem = path
@@ -375,9 +386,14 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                                     DbTransform::default(),
                                 );
                                 let inst = append_object_mesh(ctx.mesh, imported, obj_id, 3);
-                                ctx.main_db.collection_link_object(ctx.decanter_master, obj_id);
+                                ctx.main_db
+                                    .collection_link_object(ctx.decanter_master, obj_id);
                                 ctx.main_db.ensure_scene_base(scene_id, obj_id, true, true);
-                                register_object_entity(&mut ctx.ecs_world.borrow_mut(), ctx.main_db, obj_id);
+                                register_object_entity(
+                                    &mut ctx.ecs_world.borrow_mut(),
+                                    ctx.main_db,
+                                    obj_id,
+                                );
                                 if let Some(transform) =
                                     ctx.ecs_world.borrow_mut().transforms.get_mut(&obj_id)
                                 {
@@ -400,10 +416,8 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                                 *ctx.project_status = format!("Imported: {}", path.display());
                             }
                             Err(e) => {
-                                *ctx.project_status = format!(
-                                    "Import failed ({}): {e}",
-                                    path.display()
-                                );
+                                *ctx.project_status =
+                                    format!("Import failed ({}): {e}", path.display());
                             }
                         }
                     }
@@ -418,7 +432,8 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                         .filter(|o| o.name.starts_with("Cornell Box"))
                         .count()
                         + 1;
-                    let box_center = ctx.active_center + glam::Vec3::new(count as f32 * 4.0, 1.0, -2.0);
+                    let box_center =
+                        ctx.active_center + glam::Vec3::new(count as f32 * 4.0, 1.0, -2.0);
                     let box_mesh = make_cube_mesh(glam::Vec3::ZERO, 2.0);
                     let mesh_id = ctx.cornell_mesh_id;
                     if let Some(mesh_db) = ctx.main_db.meshes.get_mut(&mesh_id) {
@@ -431,17 +446,20 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
                     );
                     let mut inst = append_object_mesh(ctx.mesh, box_mesh, obj_id, 4);
                     place_instance_center(&mut inst, box_center);
-                    ctx.main_db.collection_link_object(ctx.decanter_master, obj_id);
+                    ctx.main_db
+                        .collection_link_object(ctx.decanter_master, obj_id);
                     ctx.main_db.ensure_scene_base(scene_id, obj_id, true, true);
                     register_object_entity(&mut ctx.ecs_world.borrow_mut(), ctx.main_db, obj_id);
-                    if let Some(transform) = ctx.ecs_world.borrow_mut().transforms.get_mut(&obj_id) {
+                    if let Some(transform) = ctx.ecs_world.borrow_mut().transforms.get_mut(&obj_id)
+                    {
                         transform.translation = inst.center();
                         transform.rotation = inst.rotation;
                         transform.scale = inst.scale;
                     }
                     ctx.object_target_by_id
                         .insert(obj_id, GizmoTargetKind::Decanter);
-                    ctx.object_material_names.insert(obj_id, "Empty".to_string());
+                    ctx.object_material_names
+                        .insert(obj_id, "Empty".to_string());
                     ctx.mesh_instances.push(inst);
                     *ctx.model_idx = ctx.mesh.indices.clone();
                     *ctx.selected_object_id = Some(obj_id);
@@ -456,14 +474,16 @@ pub fn draw_add_menu(ui: &mut egui::Ui, ctx: AddMenuContext<'_>) {
             }
             SceneKind::Wine => {
                 if ui.button("Wine Glass").clicked() {
-                    ctx.main_db.collection_link_object(ctx.wine_master, ctx.wine_obj_id);
+                    ctx.main_db
+                        .collection_link_object(ctx.wine_master, ctx.wine_obj_id);
                     ctx.main_db
                         .ensure_scene_base(scene_id, ctx.wine_obj_id, true, true);
                     *ctx.suppress_scene_click = true;
                     ui.close();
                 }
                 if ui.button("Spotlight").clicked() {
-                    ctx.main_db.collection_link_object(ctx.wine_master, ctx.spot_obj_id);
+                    ctx.main_db
+                        .collection_link_object(ctx.wine_master, ctx.spot_obj_id);
                     ctx.main_db
                         .ensure_scene_base(scene_id, ctx.spot_obj_id, true, true);
                     *ctx.suppress_scene_click = true;

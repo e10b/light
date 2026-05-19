@@ -82,7 +82,9 @@ pub fn draw_project_io_buttons(ui: &mut egui::Ui, ctx: ProjectIoContext<'_>) {
                 }
                 for (_sh, scene) in &loaded.scenes {
                     let scene_name = scene.name.to_ascii_lowercase();
-                    let local_master = ctx.main_db.create_collection(format!("{}Master", scene.name));
+                    let local_master = ctx
+                        .main_db
+                        .create_collection(format!("{}Master", scene.name));
                     let local_scene = ctx.main_db.create_scene(&scene.name, local_master);
                     if scene_name.contains("decanter") || scene_name == "scene" {
                         *ctx.decanter_master = local_master;
@@ -114,9 +116,14 @@ pub fn draw_project_io_buttons(ui: &mut egui::Ui, ctx: ProjectIoContext<'_>) {
                                     None
                                 };
                                 if let Some(local_obj_id) = oid {
-                                    ctx.main_db.collection_link_object(local_master, local_obj_id);
                                     ctx.main_db
-                                        .ensure_scene_base(local_scene, local_obj_id, true, true);
+                                        .collection_link_object(local_master, local_obj_id);
+                                    ctx.main_db.ensure_scene_base(
+                                        local_scene,
+                                        local_obj_id,
+                                        true,
+                                        true,
+                                    );
                                 }
                             }
                         }

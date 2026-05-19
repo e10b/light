@@ -113,6 +113,7 @@ pub struct CameraComponent {
     pub near: f32,
     pub far: f32,
     pub active: bool,
+    pub attached_to: Option<Id>,
 }
 
 impl Default for CameraComponent {
@@ -122,8 +123,21 @@ impl Default for CameraComponent {
             near: 0.1,
             far: 1000.0,
             active: false,
+            attached_to: None,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum ColliderShape {
+    Plane { normal: Vec3, offset: f32 },
+    Capsule { radius: f32, half_height: f32 },
+    Box { half_extents: Vec3 },
+}
+
+#[derive(Clone, Debug)]
+pub struct ColliderComponent {
+    pub shape: ColliderShape,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +189,7 @@ pub struct World {
     pub meshes: HashMap<Id, MeshComponent>,
     pub cameras: HashMap<Id, CameraComponent>,
     pub physics: HashMap<Id, PhysicsComponent>,
+    pub colliders: HashMap<Id, ColliderComponent>,
     pub lights: HashMap<Id, LightComponent>,
     pub scripts: HashMap<Id, ScriptComponent>,
 }
@@ -227,6 +242,7 @@ impl World {
         self.meshes.remove(&id);
         self.cameras.remove(&id);
         self.physics.remove(&id);
+        self.colliders.remove(&id);
         self.lights.remove(&id);
         self.scripts.remove(&id);
     }
@@ -245,6 +261,10 @@ impl World {
 
     pub fn attach_physics(&mut self, id: Id, physics: PhysicsComponent) {
         self.physics.insert(id, physics);
+    }
+
+    pub fn attach_collider(&mut self, id: Id, collider: ColliderComponent) {
+        self.colliders.insert(id, collider);
     }
 
     pub fn attach_light(&mut self, id: Id, intensity: f32) {
@@ -318,6 +338,38 @@ impl World {
             }
             if let Some(transform) = self.transforms.get_mut(&id) {
                 transform.translation += physics.velocity * dt;
+            }
+        }
+    }
+
+    pub fn resolve_collisions(&mut self) {
+        let ground_y = self
+            .colliders
+            .values()
+            .find_map(|collider| match collider.shape {
+                ColliderShape::Plane { normal, offset } if normal.y > 0.5 => Some(offset),
+                _ => None,
+            })
+            .unwrap_or(-1.5);
+        let ids: Vec<Id> = self.physics.keys().copied().collect();
+        for id in ids {
+            let Some(collider) = self.colliders.get(&id) else {
+                continue;
+            };
+            let half_y = match collider.shape {
+                ColliderShape::Box { half_extents } => half_extents.y,
+                ColliderShape::Capsule { half_height, .. } => half_height,
+                ColliderShape::Plane { .. } => continue,
+            };
+            let Some(transform) = self.transforms.get_mut(&id) else {
+                continue;
+            };
+            let floor_y = ground_y + half_y;
+            if transform.translation.y < floor_y {
+                transform.translation.y = floor_y;
+                if let Some(physics) = self.physics.get_mut(&id) {
+                    physics.velocity.y = physics.velocity.y.max(0.0);
+                }
             }
         }
     }
@@ -543,6 +595,16 @@ impl UserData for LuaEntity {
                 .velocity = Vec3::new(x, y, z);
             Ok(())
         });
+        methods.add_method("velocity", |lua, this, ()| {
+            let velocity = this
+                .world
+                .borrow()
+                .physics
+                .get(&this.id)
+                .map(|p| p.velocity)
+                .unwrap_or(Vec3::ZERO);
+            LuaEntity::vec3_table(lua, velocity)
+        });
         methods.add_method("log", |_, this, message: String| {
             let name = this
                 .world
@@ -644,9 +706,8 @@ impl ScriptEngine {
         }
 
         let resolved = self.resolve_script_path(path);
-        let source = fs::read_to_string(&resolved).map_err(|err| {
-            mlua::Error::external(format!("{}: {err}", resolved.display()))
-        })?;
+        let source = fs::read_to_string(&resolved)
+            .map_err(|err| mlua::Error::external(format!("{}: {err}", resolved.display())))?;
         let table = match self.lua.load(&source).set_name(path).eval::<Value>()? {
             Value::Table(table) => table,
             Value::Nil => self.lua.create_table()?,

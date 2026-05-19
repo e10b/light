@@ -69,20 +69,43 @@ pub fn sync_accumulation_and_geometry(
                 }
             }
 
-            let (render_verts, render_indices, render_positions, render_normals, render_triangle_material_ids) =
-                if stress_instance_count > 0 {
-                    let asset_mesh = &mesh_assets[0].mesh;
-                    (
-                        asset_mesh.vertices.clone(),
-                        asset_mesh.indices.clone(),
-                        asset_mesh.positions4.clone(),
-                        asset_mesh.normals4.clone(),
-                        asset_mesh.triangle_material_ids.clone(),
-                    )
-                } else {
-                    let visible_render_ids = main_db.scene_visible_selectable_objects(decanter_scene_id);
-                    visible_render_geometry(mesh, mesh_instances, &visible_render_ids)
-                };
+            let (
+                render_verts,
+                render_indices,
+                render_positions,
+                render_normals,
+                render_triangle_material_ids,
+            ) = if stress_instance_count > 0 {
+                let asset_mesh = &mesh_assets[0].mesh;
+                (
+                    asset_mesh.vertices.clone(),
+                    asset_mesh.indices.clone(),
+                    asset_mesh.positions4.clone(),
+                    asset_mesh.normals4.clone(),
+                    asset_mesh.triangle_material_ids.clone(),
+                )
+            } else {
+                let visible_render_ids =
+                    main_db.scene_visible_selectable_objects(decanter_scene_id);
+                visible_render_geometry(mesh, mesh_instances, &visible_render_ids)
+            };
+
+            let vbuf_bytes = std::mem::size_of_val(render_verts.as_slice()) as u64;
+            let ibuf_bytes = std::mem::size_of_val(render_indices.as_slice()) as u64;
+            let pos_buf_bytes = std::mem::size_of_val(render_positions.as_slice()) as u64;
+            let nrm_buf_bytes = std::mem::size_of_val(render_normals.as_slice()) as u64;
+            let tri_mat_buf_bytes =
+                std::mem::size_of_val(render_triangle_material_ids.as_slice()) as u64;
+            let mat_buf_bytes = std::mem::size_of_val(mesh.materials.as_slice()) as u64;
+            if vbuf_bytes > vbuf.size()
+                || ibuf_bytes > ibuf.size()
+                || pos_buf_bytes > pos_buf.size()
+                || nrm_buf_bytes > nrm_buf.size()
+                || tri_mat_buf_bytes > tri_mat_buf.size()
+                || mat_buf_bytes > mat_buf.size()
+            {
+                *gpu_mesh_dirty = true;
+            }
 
             *model_idx = render_indices;
             if *gpu_mesh_dirty {
@@ -96,7 +119,9 @@ pub fn sync_accumulation_and_geometry(
                 *ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("model_ibuf"),
                     contents: bytemuck::cast_slice(model_idx),
-                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::BLAS_INPUT,
+                    usage: wgpu::BufferUsages::INDEX
+                        | wgpu::BufferUsages::BLAS_INPUT
+                        | wgpu::BufferUsages::COPY_DST,
                 });
                 *pos_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("mesh_pos_buf"),
@@ -111,12 +136,12 @@ pub fn sync_accumulation_and_geometry(
                 *idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("mesh_idx_buf"),
                     contents: bytemuck::cast_slice(model_idx),
-                    usage: wgpu::BufferUsages::STORAGE,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 });
                 *tri_mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("mesh_tri_mat_buf"),
                     contents: bytemuck::cast_slice(&render_triangle_material_ids),
-                    usage: wgpu::BufferUsages::STORAGE,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 });
                 *mat_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("mesh_materials_buf"),
@@ -170,7 +195,14 @@ pub fn sync_accumulation_and_geometry(
                     ));
                 }
                 *photon_mapper = PhotonMapper::new(
-                    device, queue, tlas, pos_buf, nrm_buf, idx_buf, tri_mat_buf, mat_buf,
+                    device,
+                    queue,
+                    tlas,
+                    pos_buf,
+                    nrm_buf,
+                    idx_buf,
+                    tri_mat_buf,
+                    mat_buf,
                 );
                 *ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("ugroup"),
@@ -210,7 +242,9 @@ pub fn sync_accumulation_and_geometry(
                         },
                         wgpu::BindGroupEntry {
                             binding: 8,
-                            resource: wgpu::BindingResource::TextureView(compute_pass.output_view()),
+                            resource: wgpu::BindingResource::TextureView(
+                                compute_pass.output_view(),
+                            ),
                         },
                         wgpu::BindGroupEntry {
                             binding: 9,
@@ -235,29 +269,37 @@ pub fn sync_accumulation_and_geometry(
                 *gpu_mesh_dirty = false;
             } else {
                 queue.write_buffer(vbuf, 0, bytemuck::cast_slice(&render_verts));
+                queue.write_buffer(ibuf, 0, bytemuck::cast_slice(model_idx));
                 queue.write_buffer(pos_buf, 0, bytemuck::cast_slice(&render_positions));
                 queue.write_buffer(nrm_buf, 0, bytemuck::cast_slice(&render_normals));
+                queue.write_buffer(idx_buf, 0, bytemuck::cast_slice(model_idx));
+                queue.write_buffer(
+                    tri_mat_buf,
+                    0,
+                    bytemuck::cast_slice(&render_triangle_material_ids),
+                );
             }
 
             let model_build = wgpu::BlasBuildEntry {
                 blas: model_blas,
-                geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
-                    size: model_blas_desc,
-                    vertex_buffer: vbuf,
-                    first_vertex: 0,
-                    vertex_stride: std::mem::size_of::<Vertex>() as u64,
-                    index_buffer: Some(ibuf),
-                    first_index: Some(0),
-                    transform_buffer: None,
-                    transform_buffer_offset: None,
-                }]),
+                geometry: wgpu::BlasGeometries::TriangleGeometries(vec![
+                    wgpu::BlasTriangleGeometry {
+                        size: model_blas_desc,
+                        vertex_buffer: vbuf,
+                        first_vertex: 0,
+                        vertex_stride: std::mem::size_of::<Vertex>() as u64,
+                        index_buffer: Some(ibuf),
+                        first_index: Some(0),
+                        transform_buffer: None,
+                        transform_buffer_offset: None,
+                    },
+                ]),
             };
             let mut accel_encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("accel_update"),
                 });
-            accel_encoder
-                .build_acceleration_structures([model_build].iter(), iter::once(&*tlas));
+            accel_encoder.build_acceleration_structures([model_build].iter(), iter::once(&*tlas));
             queue.submit(Some(accel_encoder.finish()));
             *geometry_dirty = false;
         }

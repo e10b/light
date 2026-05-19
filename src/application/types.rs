@@ -48,6 +48,7 @@ pub enum GizmoTargetKind {
     CornellBox,
     SunLamp,
     WineSpotlight,
+    Camera,
 }
 
 #[derive(Clone)]
@@ -106,6 +107,7 @@ pub fn target_label(target: GizmoTargetKind) -> &'static str {
         GizmoTargetKind::CornellBox => "Cornell Box",
         GizmoTargetKind::SunLamp => "Sun Lamp",
         GizmoTargetKind::WineSpotlight => "Spotlight",
+        GizmoTargetKind::Camera => "Camera",
     }
 }
 

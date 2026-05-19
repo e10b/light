@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use crate::scene_data::Id;
 use crate::ecs::script_path_for_entity_name;
+use crate::scene_data::Id;
 
 fn default_lua_script(entity_name: &str) -> String {
     let escaped_name = entity_name.replace('\\', "\\\\").replace('"', "\\\"");
@@ -59,7 +59,8 @@ pub fn ensure_lua_editor_document(
 
     let path = script_path.unwrap_or_else(|| script_path_for_entity_name(entity_name));
     let full_path = scripts_dir().join(&path);
-    let source = std::fs::read_to_string(&full_path).unwrap_or_else(|_| default_lua_script(entity_name));
+    let source =
+        std::fs::read_to_string(&full_path).unwrap_or_else(|_| default_lua_script(entity_name));
     *editor_entity = Some(entity_id);
     *editor_path = path;
     *editor_text = source;

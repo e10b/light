@@ -4,10 +4,10 @@ use egui::Color32;
 use egui_code_editor::{CodeEditor, ColorTheme, Syntax};
 
 use crate::{
-    scene_data::{Id, MainDatabase},
     ecs::{CameraComponent, PhysicsComponent, ScriptEngine, World},
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     prism_file::MaterialData as PrismMaterialData,
+    scene_data::{Id, MainDatabase},
     tooling::lua::{ensure_lua_editor_document, scripts_dir, write_lua_script},
 };
 
@@ -120,11 +120,7 @@ pub fn draw_properties_panel(
                             world.meshes.contains_key(&obj_id),
                             world.cameras.contains_key(&obj_id),
                             world.physics.contains_key(&obj_id),
-                            world
-                                .visibility
-                                .get(&obj_id)
-                                .copied()
-                                .unwrap_or_default()
+                            world.visibility.get(&obj_id).copied().unwrap_or_default()
                                 == crate::ecs::Visibility::Visible,
                             world
                                 .inherited_visibility
@@ -148,7 +144,11 @@ pub fn draw_properties_panel(
                         if has_mesh { ", mesh" } else { "" },
                         if has_camera { ", camera" } else { "" },
                         if has_physics { ", physics" } else { "" },
-                        if script_path.is_some() { ", script" } else { "" },
+                        if script_path.is_some() {
+                            ", script"
+                        } else {
+                            ""
+                        },
                     ));
                     let mut visible_edit = visible;
                     if ui.checkbox(&mut visible_edit, "Visible").changed() {
@@ -158,7 +158,11 @@ pub fn draw_properties_panel(
                     }
                     ui.label(format!(
                         "Inherited: {}  View: {}",
-                        if inherited_visible { "visible" } else { "hidden" },
+                        if inherited_visible {
+                            "visible"
+                        } else {
+                            "hidden"
+                        },
                         if view_visible { "visible" } else { "hidden" },
                     ));
                     ui.horizontal(|ui| {
@@ -195,7 +199,8 @@ pub fn draw_properties_panel(
                                         .borrow_mut()
                                         .attach_script(obj_id, lua_editor_path.clone());
                                     script_engine.forget(obj_id);
-                                    *lua_editor_status = format!("Attached: {}", full_path.display());
+                                    *lua_editor_status =
+                                        format!("Attached: {}", full_path.display());
                                 }
                                 Err(e) => {
                                     *lua_editor_status = format!("Attach failed: {e}");
@@ -258,10 +263,8 @@ pub fn draw_properties_panel(
                     editor.show(ui, lua_editor_text, lua_syntax);
                     ui.horizontal(|ui| {
                         if ui.button("Save + Reload").clicked() {
-                            let clean_path = lua_editor_path
-                                .trim()
-                                .trim_start_matches('/')
-                                .to_string();
+                            let clean_path =
+                                lua_editor_path.trim().trim_start_matches('/').to_string();
                             match write_lua_script(&clean_path, lua_editor_text) {
                                 Ok(_) => {
                                     *lua_editor_path = clean_path.clone();
@@ -274,8 +277,10 @@ pub fn draw_properties_panel(
                                         }
                                     }
                                     script_engine.forget(obj_id);
-                                    *lua_editor_status =
-                                        format!("Saved: {}", scripts_dir().join(&clean_path).display());
+                                    *lua_editor_status = format!(
+                                        "Saved: {}",
+                                        scripts_dir().join(&clean_path).display()
+                                    );
                                 }
                                 Err(e) => {
                                     *lua_editor_status = format!("Save failed: {e}");
@@ -378,7 +383,11 @@ pub fn draw_properties_panel(
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.separator();
                 ui.collapsing("Shader Graph", |ui| {
-                    let material_object_id = if has_selection { selected_object_id } else { None };
+                    let material_object_id = if has_selection {
+                        selected_object_id
+                    } else {
+                        None
+                    };
                     if let Some(obj_id) = material_object_id {
                         let mut mat_name = object_material_names
                             .get(&obj_id)

@@ -1,4 +1,7 @@
-use crate::{application::types::{LightObjectInstance, MAX_SUN_LIGHTS, SceneUniforms}, scene_data::{Id, MainDatabase}};
+use crate::{
+    application::types::{LightObjectInstance, SceneUniforms, MAX_SUN_LIGHTS},
+    scene_data::{Id, MainDatabase},
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn update_sun_lights(

@@ -26,7 +26,6 @@ pub fn tick_world_and_scripts(
             light_instances,
             camera,
         );
-        world_mut.integrate_physics(dt);
         world_mut.update_global_transforms_and_visibility();
     }
 
@@ -35,6 +34,8 @@ pub fn tick_world_and_scripts(
     {
         use crate::application::ecs_sync::sync_ecs_visibility_to_main;
         let mut world_mut = world.borrow_mut();
+        world_mut.integrate_physics(dt);
+        world_mut.resolve_collisions();
         world_mut.update_global_transforms_and_visibility();
         sync_ecs_visibility_to_main(&world_mut, main_db);
     }

@@ -122,6 +122,14 @@ pub fn sync_runtime_to_ecs(
         .iter()
         .find_map(|(id, camera)| camera.active.then_some(*id));
     if let Some(id) = active_camera_id {
+        if world
+            .cameras
+            .get(&id)
+            .and_then(|camera| camera.attached_to)
+            .is_some()
+        {
+            return;
+        }
         if let Some(transform) = world.transforms.get_mut(&id) {
             transform.translation = camera.pos;
         }

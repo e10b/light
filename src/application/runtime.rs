@@ -4,6 +4,7 @@ mod engine;
 mod fps;
 mod input;
 mod mouse_look;
+mod play_mode;
 mod resize;
 mod stress;
 mod sun;

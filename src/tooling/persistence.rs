@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use crate::scene_data::{Id, MainDatabase, Transform as DbTransform};
 use crate::prism_file::{
     CollectionData as PrismCollectionData, MaterialData as PrismMaterialData,
-    MeshData as PrismMeshData, ObjectData as PrismObjectData, ObjectDataLink as PrismObjectDataLink,
-    PrismDatabase, SceneData as PrismSceneData,
+    MeshData as PrismMeshData, ObjectData as PrismObjectData,
+    ObjectDataLink as PrismObjectDataLink, PrismDatabase, SceneData as PrismSceneData,
 };
+use crate::scene_data::{Id, MainDatabase, Transform as DbTransform};
 
 fn transform_to_matrix(t: &DbTransform) -> [f32; 16] {
     glam::Mat4::from_scale_rotation_translation(t.scale, t.rotation, t.location).to_cols_array()

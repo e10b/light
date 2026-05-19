@@ -16,7 +16,12 @@ pub enum RenderPath {
 }
 
 impl ComputePass {
-    pub fn new(device: &wgpu::Device, bind_group_layout: &wgpu::BindGroupLayout, width: u32, height: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("compute_output_texture"),
             size: wgpu::Extent3d {
@@ -66,14 +71,15 @@ impl ComputePass {
             immediate_size: 0,
         });
 
-        let pathtraced_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("compute_pathtraced_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &pathtraced_shader,
-            entry_point: Some("cs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let pathtraced_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("compute_pathtraced_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &pathtraced_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
         let raytraced_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("compute_raytraced_pipeline"),
             layout: Some(&pipeline_layout),
