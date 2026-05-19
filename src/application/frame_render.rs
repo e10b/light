@@ -120,17 +120,9 @@ pub fn render_frame_and_present(
                 })
                 .collect()
         } else {
-            mesh_instances
-                .iter()
-                .map(|inst| raster_pass::RasterInstance {
-                    offset: [
-                        inst.translation.x,
-                        inst.translation.y,
-                        inst.translation.z,
-                        0.0,
-                    ],
-                })
-                .collect()
+            vec![raster_pass::RasterInstance {
+                offset: [0.0, 0.0, 0.0, 0.0],
+            }]
         };
         if *raster_instance_count != instances.len() as u32 {
             *raster_instance_count = instances.len() as u32;
