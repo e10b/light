@@ -37,8 +37,14 @@ return {
 
     local new_vy = velocity.y + (gravity * dt)
     local current_pos = entity:position()
-    if current_pos.y <= -1.5 and new_vy < 0.0 then
+    local ground_y = -1.5
+    local half_height = 0.9
+    local on_ground = current_pos.y <= (ground_y + half_height + 0.01)
+    if on_ground and new_vy < 0.0 then
       new_vy = 0.0
+    end
+    if on_ground and entity:is_key_down("Space") then
+      new_vy = 9.0
     end
 
     entity:set_velocity(target_vx, new_vy, target_vz)
