@@ -1,7 +1,8 @@
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
 use crate::{
-    application::types::Camera,
+    application::ecs_sync::sync_main_db_to_instances,
+    application::types::{Camera, LightObjectInstance, MeshObjectInstance},
     ecs::{
         CameraComponent, ColliderComponent, ColliderShape, PhysicsComponent, TransformComponent,
         World,
@@ -46,7 +47,7 @@ impl PlayMode {
     pub fn start(
         &mut self,
         world: &Rc<RefCell<World>>,
-        main_db: &mut MainDatabase,
+        main_db: &MainDatabase,
         player_id: Id,
         camera_id: Id,
         camera: &Camera,
@@ -59,29 +60,22 @@ impl PlayMode {
             });
         }
         self.active = true;
-        self.yaw = camera.yaw;
-        self.pitch = camera.pitch;
-
-        let mut spawn_pos = camera.pos;
+        let (mut spawn_pos, spawn_rot) = main_db
+            .objects
+            .get(&player_id)
+            .map(|obj| (obj.transform.location, obj.transform.rotation))
+            .unwrap_or((camera.pos, glam::Quat::from_rotation_y(camera.yaw)));
         spawn_pos.y = (GROUND_Y + PLAYER_HALF_EXTENTS.y).max(spawn_pos.y);
-
-        if let Some(obj) = main_db.objects.get_mut(&player_id) {
-            obj.transform.location = spawn_pos;
-            obj.transform.rotation = glam::Quat::from_rotation_y(self.yaw);
-            obj.transform.scale = player_cube_scale();
-        }
-        if let Some(obj) = main_db.objects.get_mut(&camera_id) {
-            obj.transform.location = glam::Vec3::new(0.0, EYE_HEIGHT, 0.0);
-            obj.transform.rotation = glam::Quat::IDENTITY;
-            obj.transform.scale = glam::Vec3::ONE;
-        }
+        let forward = (spawn_rot * glam::Vec3::Z).normalize_or_zero();
+        self.yaw = forward.x.atan2(forward.z);
+        self.pitch = camera.pitch;
 
         let mut world = world.borrow_mut();
         world.transforms.insert(
             player_id,
             TransformComponent {
                 translation: spawn_pos,
-                rotation: glam::Quat::from_rotation_y(self.yaw),
+                rotation: spawn_rot,
                 scale: player_cube_scale(),
             },
         );
@@ -134,11 +128,20 @@ impl PlayMode {
         world.update_global_transforms_and_visibility();
     }
 
-    pub fn stop(&mut self, world: &Rc<RefCell<World>>, camera_id: Id, camera: &mut Camera) {
+    pub fn stop(
+        &mut self,
+        world: &Rc<RefCell<World>>,
+        main_db: &MainDatabase,
+        mesh_instances: &mut [MeshObjectInstance],
+        light_instances: &mut [LightObjectInstance],
+        camera_id: Id,
+        camera: &mut Camera,
+    ) {
         if let Some(saved) = self.saved_camera.take() {
             *camera = saved;
         }
         self.active = false;
+        sync_main_db_to_instances(main_db, mesh_instances, light_instances);
         let mut world = world.borrow_mut();
         world.clear_parent(camera_id);
         if let Some(camera_component) = world.cameras.get_mut(&camera_id) {

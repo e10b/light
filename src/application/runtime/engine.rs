@@ -159,24 +159,25 @@ pub async fn run() {
     let render_width = 1280u32;
     let render_height = 720u32;
 
-    let mut main_db = MainDatabase::new();
-    let decanter_mesh_id = main_db.create_mesh("DecanterMesh", decanter_vertex_count);
-    let wine_mesh_id = main_db.create_mesh("WineGlassMesh", wine_vertex_count);
-    let cornell_mesh_id = main_db.create_mesh(
+    let mut editor_db = MainDatabase::new();
+    let mut play_db: Option<MainDatabase> = None;
+    let decanter_mesh_id = editor_db.create_mesh("DecanterMesh", decanter_vertex_count);
+    let wine_mesh_id = editor_db.create_mesh("WineGlassMesh", wine_vertex_count);
+    let cornell_mesh_id = editor_db.create_mesh(
         "CornellBoxMesh",
         make_cube_mesh(glam::Vec3::ZERO, 2.0).vertices.len(),
     );
-    let sphere_obj_id = main_db.create_object("Cube", None, DbTransform::default());
-    let sun_obj_id = main_db.create_object("SunLamp", None, DbTransform::default());
-    let spot_obj_id = main_db.create_object("Spotlight", None, DbTransform::default());
+    let sphere_obj_id = editor_db.create_object("Cube", None, DbTransform::default());
+    let sun_obj_id = editor_db.create_object("SunLamp", None, DbTransform::default());
+    let spot_obj_id = editor_db.create_object("Spotlight", None, DbTransform::default());
     let decanter_obj_id =
-        main_db.create_object("Decanter", Some(decanter_mesh_id), DbTransform::default());
+        editor_db.create_object("Decanter", Some(decanter_mesh_id), DbTransform::default());
     let wine_obj_id =
-        main_db.create_object("WineGlass", Some(wine_mesh_id), DbTransform::default());
+        editor_db.create_object("WineGlass", Some(wine_mesh_id), DbTransform::default());
     let cornell_obj_id =
-        main_db.create_object("CornellBox", Some(cornell_mesh_id), DbTransform::default());
+        editor_db.create_object("CornellBox", Some(cornell_mesh_id), DbTransform::default());
     let player_start = glam::Vec3::new(0.0, play_ground_y() + 0.9, 5.0);
-    let player_obj_id = main_db.create_object(
+    let player_obj_id = editor_db.create_object(
         "Player",
         None,
         DbTransform {
@@ -185,7 +186,7 @@ pub async fn run() {
             scale: player_cube_scale(),
         },
     );
-    let player_camera_obj_id = main_db.create_object(
+    let player_camera_obj_id = editor_db.create_object(
         "Player Camera",
         None,
         DbTransform {
@@ -207,7 +208,7 @@ pub async fn run() {
             player_obj_id,
             player_camera_obj_id,
         ] {
-            register_object_entity(&mut world, &main_db, object_id);
+            register_object_entity(&mut world, &editor_db, object_id);
         }
         world.attach_light(sun_obj_id, 0.8);
         world.attach_light(spot_obj_id, 1.0);
@@ -254,14 +255,14 @@ pub async fn run() {
     object_material_names.insert(cornell_obj_id, "Empty".to_string());
     object_material_names.insert(player_obj_id, "White".to_string());
     let mut last_material_signature = String::new();
-    let default_cube_mesh_id = main_db.create_mesh("CubeMesh", default_cube_vertex_len);
-    if let Some(mesh_db) = main_db.meshes.get_mut(&default_cube_mesh_id) {
+    let default_cube_mesh_id = editor_db.create_mesh("CubeMesh", default_cube_vertex_len);
+    if let Some(mesh_db) = editor_db.meshes.get_mut(&default_cube_mesh_id) {
         mesh_db.user_count = 2;
     }
-    if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
+    if let Some(obj) = editor_db.objects.get_mut(&sphere_obj_id) {
         obj.mesh_id = Some(default_cube_mesh_id);
     }
-    if let Some(obj) = main_db.objects.get_mut(&player_obj_id) {
+    if let Some(obj) = editor_db.objects.get_mut(&player_obj_id) {
         obj.mesh_id = Some(default_cube_mesh_id);
     }
     ecs_world.borrow_mut().attach_mesh(player_obj_id, 0);
@@ -337,20 +338,20 @@ pub async fn run() {
     object_target_by_id.insert(player_obj_id, GizmoTargetKind::Decanter);
     object_target_by_id.insert(player_camera_obj_id, GizmoTargetKind::Camera);
 
-    let mut decanter_master = main_db.create_collection("SceneMaster");
+    let mut decanter_master = editor_db.create_collection("SceneMaster");
     let mut wine_master = Id(0);
     let mut cornell_master = Id(0);
-    let mut decanter_scene_id = main_db.create_scene("Scene", decanter_master);
+    let mut decanter_scene_id = editor_db.create_scene("Scene", decanter_master);
     let mut wine_scene_id = Id(0);
     let mut cornell_scene_id = Id(0);
-    main_db.collection_link_object(decanter_master, sphere_obj_id);
-    main_db.ensure_scene_base(decanter_scene_id, sphere_obj_id, true, true);
-    main_db.collection_link_object(decanter_master, sun_obj_id);
-    main_db.ensure_scene_base(decanter_scene_id, sun_obj_id, true, true);
-    main_db.collection_link_object(decanter_master, player_obj_id);
-    main_db.ensure_scene_base(decanter_scene_id, player_obj_id, true, true);
-    main_db.collection_link_object(decanter_master, player_camera_obj_id);
-    main_db.ensure_scene_base(decanter_scene_id, player_camera_obj_id, true, true);
+    editor_db.collection_link_object(decanter_master, sphere_obj_id);
+    editor_db.ensure_scene_base(decanter_scene_id, sphere_obj_id, true, true);
+    editor_db.collection_link_object(decanter_master, sun_obj_id);
+    editor_db.ensure_scene_base(decanter_scene_id, sun_obj_id, true, true);
+    editor_db.collection_link_object(decanter_master, player_obj_id);
+    editor_db.ensure_scene_base(decanter_scene_id, player_obj_id, true, true);
+    editor_db.collection_link_object(decanter_master, player_camera_obj_id);
+    editor_db.ensure_scene_base(decanter_scene_id, player_camera_obj_id, true, true);
     println!(
         "Scene bounds: decanter center={:?}, wine center={:?}, combined center={:?}, size={:?}",
         decanter_center, wine_center, center, size
@@ -875,10 +876,19 @@ pub async fn run() {
                     && event.physical_key
                         == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape);
                 if escape_pressed && play_mode.active {
-                    play_mode.stop(&ecs_world, player_camera_obj_id, &mut camera);
+                    play_mode.stop(
+                        &ecs_world,
+                        &editor_db,
+                        &mut mesh_instances,
+                        &mut light_instances,
+                        player_camera_obj_id,
+                        &mut camera,
+                    );
+                    play_db = None;
                     show_editor_ui = show_editor_ui_before_play;
                     window.set_cursor_visible(true);
                     let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                    geometry_dirty = true;
                     accumulation_dirty = true;
                 } else {
                     handle_keyboard_input(&event, &mut show_editor_ui, &mut keys_pressed);
@@ -951,17 +961,25 @@ pub async fn run() {
                         );
                     }
 
-                    if tick_world_and_scripts(
-                        dt,
-                        &ecs_world,
-                        &mut main_db,
-                        &mut mesh_instances,
-                        &mut light_instances,
-                        &mut camera,
-                        &mut script_engine,
-                    ) {
-                        geometry_dirty = true;
-                        accumulation_dirty = true;
+                    {
+                        let main_db = if play_mode.active {
+                            play_db.as_mut().expect("PIE db missing")
+                        } else {
+                            &mut editor_db
+                        };
+                        if tick_world_and_scripts(
+                            dt,
+                            &ecs_world,
+                            main_db,
+                            &mut mesh_instances,
+                            &mut light_instances,
+                            &mut camera,
+                            &mut script_engine,
+                            play_mode.active,
+                        ) {
+                            geometry_dirty = true;
+                            accumulation_dirty = true;
+                        }
                     }
                     if play_mode.active {
                         play_mode.sync_camera_from_player(
@@ -1002,7 +1020,14 @@ pub async fn run() {
                             ];
                             let mut photons_per_frame = 0u32;
                             let mut sphere_visible_for_photons = false;
-                            let full_output = egui_ctx.run(raw_input, |ctx| {
+                            let mut start_play_requested = false;
+                            let full_output = {
+                                let main_db = if play_mode.active {
+                                    play_db.as_mut().expect("PIE db missing")
+                                } else {
+                                    &mut editor_db
+                                };
+                                egui_ctx.run(raw_input, |ctx| {
                                 let mut suppress_scene_click = false;
                                 let current_scene_exists =
                                     decanter_scene_id.0 != 0 && main_db.scenes.contains_key(&decanter_scene_id);
@@ -1017,24 +1042,7 @@ pub async fn run() {
                                             .add_enabled(!play_mode.active, egui::Button::new("Play"))
                                             .clicked()
                                         {
-                                            show_editor_ui_before_play = show_editor_ui;
-                                            play_mode.start(
-                                                &ecs_world,
-                                                &mut main_db,
-                                                player_obj_id,
-                                                player_camera_obj_id,
-                                                &camera,
-                                            );
-                                            show_editor_ui = false;
-                                            window.set_cursor_visible(false);
-                                            let _ = window
-                                                .set_cursor_grab(winit::window::CursorGrabMode::Locked)
-                                                .or_else(|_| {
-                                                    window.set_cursor_grab(
-                                                        winit::window::CursorGrabMode::Confined,
-                                                    )
-                                                });
-                                            accumulation_dirty = true;
+                                            start_play_requested = true;
                                         }
                                         if ui.button("Stress 1M Cubes").clicked() {
                                             stress_test_requested = true;
@@ -1059,7 +1067,7 @@ pub async fn run() {
                                                 sun_intensity,
                                                 decanter_path,
                                                 wine_path,
-                                                main_db: &mut main_db,
+                                                main_db,
                                                 ecs_world: &ecs_world,
                                                 mesh: &mut mesh,
                                                 mesh_instances: &mut mesh_instances,
@@ -1081,7 +1089,7 @@ pub async fn run() {
                                         draw_project_io_buttons(
                                             ui,
                                             ProjectIoContext {
-                                                main_db: &mut main_db,
+                                                main_db,
                                                 decanter_master: &mut decanter_master,
                                                 wine_master: &mut wine_master,
                                                 cornell_master: &mut cornell_master,
@@ -1124,7 +1132,7 @@ pub async fn run() {
 
                                 draw_editor_surface(
                                     ctx,
-                                    &mut main_db,
+                                    main_db,
                                     scene_kind,
                                     &project_status,
                                     decanter_scene_id,
@@ -1188,7 +1196,7 @@ pub async fn run() {
                             let old_intensity = uniforms.sun_intensity;
                             update_sun_lights(
                                 &mut uniforms,
-                                &main_db,
+                                main_db,
                                 decanter_scene_id,
                                 current_scene_exists,
                                 active_center,
@@ -2264,43 +2272,67 @@ pub async fn run() {
                                 }
                             }
 
-                            write_runtime_back_to_database(
-                                &mut main_db,
-                                sphere_obj_id,
-                                decanter_obj_id,
-                                wine_obj_id,
-                                sun_obj_id,
-                                spot_obj_id,
-                                cornell_obj_id,
-                                &uniforms,
-                                sphere_rotation,
-                                sphere_scale,
-                                decanter_center,
-                                decanter_translation,
-                                decanter_rotation,
-                                decanter_scale,
-                                wine_center,
-                                wine_translation,
-                                wine_rotation,
-                                wine_scale,
-                                stress_instance_count,
-                                &mesh_instances,
-                                sun_empty_position,
-                                sun_empty_rotation,
-                                sun_empty_scale,
-                                &light_instances,
-                                spot_empty_position,
-                                spot_empty_rotation,
-                                spot_empty_scale,
-                                active_center,
-                                cornell_translation,
-                                cornell_rotation,
-                                cornell_scale,
-                            );
+                            if !start_play_requested {
+                                write_runtime_back_to_database(
+                                    main_db,
+                                    sphere_obj_id,
+                                    decanter_obj_id,
+                                    wine_obj_id,
+                                    sun_obj_id,
+                                    spot_obj_id,
+                                    cornell_obj_id,
+                                    &uniforms,
+                                    sphere_rotation,
+                                    sphere_scale,
+                                    decanter_center,
+                                    decanter_translation,
+                                    decanter_rotation,
+                                    decanter_scale,
+                                    wine_center,
+                                    wine_translation,
+                                    wine_rotation,
+                                    wine_scale,
+                                    stress_instance_count,
+                                    &mesh_instances,
+                                    sun_empty_position,
+                                    sun_empty_rotation,
+                                    sun_empty_scale,
+                                    &light_instances,
+                                    spot_empty_position,
+                                    spot_empty_rotation,
+                                    spot_empty_scale,
+                                    active_center,
+                                    cornell_translation,
+                                    cornell_rotation,
+                                    cornell_scale,
+                                );
+                            }
 
                             sun_changed = uniforms.light_pos != old_light
                                 || (uniforms.sun_intensity - old_intensity).abs() > f32::EPSILON;
-                            });
+                            })
+                            };
+                            if start_play_requested {
+                                play_db = Some(editor_db.clone());
+                                show_editor_ui_before_play = show_editor_ui;
+                                play_mode.start(
+                                    &ecs_world,
+                                    play_db.as_ref().expect("PIE db missing"),
+                                    player_obj_id,
+                                    player_camera_obj_id,
+                                    &camera,
+                                );
+                                show_editor_ui = false;
+                                window.set_cursor_visible(false);
+                                let _ = window
+                                    .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                                    .or_else(|_| {
+                                        window.set_cursor_grab(
+                                            winit::window::CursorGrabMode::Confined,
+                                        )
+                                    });
+                                accumulation_dirty = true;
+                            }
                             let egui::FullOutput {
                                 platform_output,
                                 textures_delta,
@@ -2310,6 +2342,12 @@ pub async fn run() {
                             } = full_output;
                             egui_state.handle_platform_output(window.as_ref(), platform_output);
                             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+
+                            let main_db = if play_mode.active {
+                                play_db.as_mut().expect("PIE db missing")
+                            } else {
+                                &mut editor_db
+                            };
 
                             sync_accumulation_and_geometry(
                                 &mut accumulation_dirty,
@@ -2325,7 +2363,7 @@ pub async fn run() {
                                 stress_instance_count,
                                 &mesh_instances,
                                 &mesh_assets,
-                                &main_db,
+                                main_db,
                                 decanter_scene_id,
                                 &mut model_idx,
                                 &mut gpu_mesh_dirty,
@@ -2359,7 +2397,7 @@ pub async fn run() {
                                 render_mode,
                                 &mut uniforms,
                                 photons_per_frame,
-                                &main_db,
+                                main_db,
                                 decanter_scene_id,
                                 &mesh_instances,
                                 stress_instance_count,

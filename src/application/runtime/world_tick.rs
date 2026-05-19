@@ -15,8 +15,9 @@ pub fn tick_world_and_scripts(
     light_instances: &mut [LightObjectInstance],
     camera: &mut Camera,
     script_engine: &mut ScriptEngine,
+    play_active: bool,
 ) -> bool {
-    {
+    if !play_active {
         use crate::application::ecs_sync::sync_runtime_to_ecs;
         let mut world_mut = world.borrow_mut();
         sync_runtime_to_ecs(
@@ -27,20 +28,32 @@ pub fn tick_world_and_scripts(
             camera,
         );
         world_mut.update_global_transforms_and_visibility();
-    }
+    } else {
+        world.borrow_mut().update_global_transforms_and_visibility();
+        script_engine.update(dt);
 
-    script_engine.update(dt);
+        {
+            let mut world_mut = world.borrow_mut();
+            world_mut.integrate_physics(dt);
+            world_mut.resolve_collisions();
+            world_mut.update_global_transforms_and_visibility();
+        }
+    }
 
     {
         use crate::application::ecs_sync::sync_ecs_visibility_to_main;
-        let mut world_mut = world.borrow_mut();
-        world_mut.integrate_physics(dt);
-        world_mut.resolve_collisions();
-        world_mut.update_global_transforms_and_visibility();
-        sync_ecs_visibility_to_main(&world_mut, main_db);
+        let world_ref = world.borrow();
+        sync_ecs_visibility_to_main(&world_ref, main_db);
     }
 
     use crate::application::ecs_sync::sync_ecs_to_runtime;
     let world_ref = world.borrow();
-    sync_ecs_to_runtime(&world_ref, main_db, mesh_instances, light_instances, camera)
+    sync_ecs_to_runtime(
+        &world_ref,
+        main_db,
+        mesh_instances,
+        light_instances,
+        camera,
+        true,
+    )
 }

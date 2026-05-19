@@ -32,14 +32,17 @@ pub fn sync_ecs_to_runtime(
     mesh_instances: &mut [MeshObjectInstance],
     light_instances: &mut [LightObjectInstance],
     camera: &mut Camera,
+    write_back_main_db: bool,
 ) -> bool {
     let mut geometry_changed = false;
 
     for (object_id, transform) in &world.global_transforms {
-        if let Some(obj) = main_db.objects.get_mut(object_id) {
-            obj.transform.location = transform.translation;
-            obj.transform.rotation = transform.rotation;
-            obj.transform.scale = transform.scale;
+        if write_back_main_db {
+            if let Some(obj) = main_db.objects.get_mut(object_id) {
+                obj.transform.location = transform.translation;
+                obj.transform.rotation = transform.rotation;
+                obj.transform.scale = transform.scale;
+            }
         }
         if let Some(inst) = mesh_instances
             .iter_mut()
@@ -132,6 +135,28 @@ pub fn sync_runtime_to_ecs(
         }
         if let Some(transform) = world.transforms.get_mut(&id) {
             transform.translation = camera.pos;
+        }
+    }
+}
+
+pub fn sync_main_db_to_instances(
+    main_db: &MainDatabase,
+    mesh_instances: &mut [MeshObjectInstance],
+    light_instances: &mut [LightObjectInstance],
+) {
+    for inst in mesh_instances {
+        if let Some(obj) = main_db.objects.get(&inst.object_id) {
+            inst.translation = obj.transform.location - inst.pivot;
+            inst.rotation = obj.transform.rotation;
+            inst.scale = obj.transform.scale;
+        }
+    }
+
+    for light in light_instances {
+        if let Some(obj) = main_db.objects.get(&light.object_id) {
+            light.position = obj.transform.location;
+            light.rotation = obj.transform.rotation;
+            light.scale = obj.transform.scale;
         }
     }
 }

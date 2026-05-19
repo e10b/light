@@ -70,7 +70,7 @@ pub struct ViewLayerDataBlock {
     pub bases: Vec<BaseData>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MainDatabase {
     next_id: u64,
     pub meshes: HashMap<Id, MeshDataBlock>,
