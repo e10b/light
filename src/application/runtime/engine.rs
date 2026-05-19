@@ -835,6 +835,7 @@ pub async fn run() {
     let mut stress_instance_count = 0usize;
     let mut project_status = String::new();
     let mut mouse_pos = [0.0f32, 0.0f32];
+    let mut mouse_delta = (0.0f64, 0.0f64);
     let mut mouse_left_down = false;
     let mut mouse_left_clicked = false;
     let mut mouse_left_dragging = false;
@@ -916,6 +917,7 @@ pub async fn run() {
                 event: winit::event::DeviceEvent::MouseMotion { delta },
                 ..
             } => {
+                mouse_delta = delta;
                 if play_mode.active {
                     play_mode.trigger_look_action(delta, mouse_speed);
                     accumulation_dirty = true;
@@ -960,6 +962,8 @@ pub async fn run() {
                         );
                     }
 
+                    script_engine.update_input(&keys_pressed, mouse_delta);
+
                     {
                         let main_db = if play_mode.active {
                             play_db.as_mut().expect("PIE db missing")
@@ -980,6 +984,7 @@ pub async fn run() {
                             accumulation_dirty = true;
                         }
                     }
+                    mouse_delta = (0.0, 0.0);
                     if play_mode.active {
                         play_mode.sync_camera_from_player(
                             &ecs_world,

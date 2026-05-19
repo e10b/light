@@ -189,7 +189,7 @@ impl PlayMode {
             1.0
         };
         let forward = glam::Vec3::new(self.yaw.sin(), 0.0, self.yaw.cos()).normalize_or_zero();
-        let right = glam::Vec3::Y.cross(forward).normalize_or_zero();
+        let right = forward.cross(glam::Vec3::Y).normalize_or_zero();
         let mut wish = glam::Vec3::ZERO;
         if keys_pressed.contains(self.input.move_forward) {
             wish += forward;

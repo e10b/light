@@ -10,7 +10,7 @@ pub fn handle_mouse_motion(
     camera: &mut Camera,
     accumulation_dirty: &mut bool,
 ) {
-    if egui_ctx.is_pointer_over_area() || !keys_pressed.contains("v") {
+    if egui_ctx.is_pointer_over_egui() || !keys_pressed.contains("v") {
         return;
     }
     let (dx, dy) = delta;

@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     rc::Rc,
@@ -442,10 +442,17 @@ impl World {
     }
 }
 
+#[derive(Default, Clone)]
+struct InputState {
+    keys_pressed: HashSet<String>,
+    mouse_delta: (f64, f64),
+}
+
 #[derive(Clone)]
 struct LuaEntity {
     id: Id,
     world: Rc<RefCell<World>>,
+    input: Rc<RefCell<InputState>>,
 }
 
 impl LuaEntity {
@@ -536,11 +543,54 @@ impl UserData for LuaEntity {
                 Ok(())
             },
         );
+        methods.add_method_mut("add_rotation", |_, this, (yaw, pitch): (f32, f32)| {
+            let mut world = this.world.borrow_mut();
+            let transform = world.transforms.entry(this.id).or_default();
+            let yaw_q = Quat::from_rotation_y(yaw);
+            let pitch_q = Quat::from_rotation_x(pitch);
+            transform.rotation = yaw_q * transform.rotation * pitch_q;
+            Ok(())
+        });
         methods.add_method_mut("rotate_y", |_, this, radians: f32| {
             let mut world = this.world.borrow_mut();
             let transform = world.transforms.entry(this.id).or_default();
             transform.rotation *= Quat::from_rotation_y(radians);
             Ok(())
+        });
+        methods.add_method("forward_vector", |lua, this, ()| {
+            let rotation = this
+                .world
+                .borrow()
+                .global_transforms
+                .get(&this.id)
+                .map(|t| t.rotation)
+                .or_else(|| this.world.borrow().transforms.get(&this.id).map(|t| t.rotation))
+                .unwrap_or(Quat::IDENTITY);
+            let forward = (rotation * Vec3::Z).normalize_or_zero();
+            LuaEntity::vec3_table(lua, forward)
+        });
+        methods.add_method("right_vector", |lua, this, ()| {
+            let rotation = this
+                .world
+                .borrow()
+                .global_transforms
+                .get(&this.id)
+                .map(|t| t.rotation)
+                .or_else(|| this.world.borrow().transforms.get(&this.id).map(|t| t.rotation))
+                .unwrap_or(Quat::IDENTITY);
+            let right = (rotation * Vec3::X).normalize_or_zero();
+            LuaEntity::vec3_table(lua, right)
+        });
+        methods.add_method("is_key_down", |_, this, key: String| {
+            let input = this.input.borrow();
+            if input.keys_pressed.contains(&key) {
+                return Ok(true);
+            }
+            Ok(input.keys_pressed.contains(&key.to_lowercase()))
+        });
+        methods.add_method("get_mouse_delta", |_, this, ()| {
+            let input = this.input.borrow();
+            Ok((input.mouse_delta.0, input.mouse_delta.1))
         });
         methods.add_method("is_visible", |_, this, ()| {
             Ok(this.world.borrow().is_visible(this.id))
@@ -629,6 +679,7 @@ pub struct ScriptEngine {
     scripts: HashMap<Id, LoadedScript>,
     world: Rc<RefCell<World>>,
     script_root: PathBuf,
+    input: Rc<RefCell<InputState>>,
 }
 
 impl ScriptEngine {
@@ -647,7 +698,14 @@ impl ScriptEngine {
             scripts: HashMap::new(),
             world,
             script_root: script_root.into(),
+            input: Rc::new(RefCell::new(InputState::default())),
         })
+    }
+
+    pub fn update_input(&mut self, keys_pressed: &HashSet<String>, mouse_delta: (f64, f64)) {
+        let mut input = self.input.borrow_mut();
+        input.keys_pressed = keys_pressed.clone();
+        input.mouse_delta = mouse_delta;
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -678,6 +736,7 @@ impl ScriptEngine {
         let entity = self.lua.create_userdata(LuaEntity {
             id,
             world: Rc::clone(&self.world),
+            input: Rc::clone(&self.input),
         })?;
 
         if !started {

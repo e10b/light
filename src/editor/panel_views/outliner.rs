@@ -14,7 +14,7 @@ pub fn draw_outliner_panel(
     let mut clicked = None;
     egui::SidePanel::left("outliner")
         .resizable(true)
-        .default_width(230.0)
+        .default_size(230.0)
         .show(ctx, |ui| {
             ui.heading("Outliner");
             ui.label("Scene");
