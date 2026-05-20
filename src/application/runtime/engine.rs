@@ -24,8 +24,9 @@ use crate::{
     scene_data::{Id, MainDatabase, Transform as DbTransform},
     tooling::lua::scripts_dir,
     tooling::materials::{
-        make_checker_material, make_empty_material, make_glass_material, make_white_material,
-        preview_from_material_data,
+        ensure_default_material_scripts, make_checker_material, make_empty_material,
+        make_glass_material, make_white_material, preview_from_material_script,
+        scripted_preview_or_graph,
     },
     window::create_window,
 };
@@ -256,6 +257,7 @@ pub async fn run() {
     }
     let mut script_engine = ScriptEngine::new(std::rc::Rc::clone(&ecs_world), scripts_dir())
         .expect("create Lua engine");
+    ensure_default_material_scripts();
     let mut material_library: std::collections::HashMap<String, PrismMaterialData> =
         std::collections::HashMap::new();
     material_library.insert("White".to_string(), make_white_material());
@@ -871,6 +873,9 @@ pub async fn run() {
     let mut lua_editor_path = String::new();
     let mut lua_editor_text = String::new();
     let mut lua_editor_status = String::new();
+    let mut material_script_name = String::new();
+    let mut material_script_text = String::new();
+    let mut material_script_status = String::new();
     let mut play_mode = PlayMode::default();
     let mut show_editor_ui_before_play = show_editor_ui;
 
@@ -1196,6 +1201,9 @@ pub async fn run() {
                                     &mut material_library,
                                     &mut material_editor,
                                     &mut material_runtime_overrides,
+                                    &mut material_script_name,
+                                    &mut material_script_text,
+                                    &mut material_script_status,
                                     &mut accumulation_dirty,
                                 );
                                 }
@@ -2117,10 +2125,22 @@ pub async fn run() {
                                 .get(&sphere_obj_id)
                                 .cloned()
                                 .unwrap_or_else(|| "White".to_string());
-                            let sphere_preview = material_runtime_overrides
-                                .get(&sphere_mat)
-                                .copied()
-                                .unwrap_or_else(|| preview_from_material_data(material_library.get(&sphere_mat)));
+                            let resolve_preview = |mat_name: &str| -> RuntimeMaterialPreview {
+                                if let Some(preview) = preview_from_material_script(mat_name) {
+                                    preview
+                                } else {
+                                    material_runtime_overrides
+                                        .get(mat_name)
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            scripted_preview_or_graph(
+                                                mat_name,
+                                                material_library.get(mat_name),
+                                            )
+                                        })
+                                }
+                            };
+                            let sphere_preview = resolve_preview(&sphere_mat);
                             uniforms.sphere_color = [
                                 sphere_preview.base_color[0],
                                 sphere_preview.base_color[1],
@@ -2142,26 +2162,17 @@ pub async fn run() {
                                 .get(&decanter_obj_id)
                                 .cloned()
                                 .unwrap_or_else(|| "White".to_string());
-                            let decanter_preview = material_runtime_overrides
-                                .get(&decanter_mat)
-                                .copied()
-                                .unwrap_or_else(|| preview_from_material_data(material_library.get(&decanter_mat)));
+                            let decanter_preview = resolve_preview(&decanter_mat);
                             let wine_mat = object_material_names
                                 .get(&wine_obj_id)
                                 .cloned()
                                 .unwrap_or_else(|| "White".to_string());
-                            let wine_preview = material_runtime_overrides
-                                .get(&wine_mat)
-                                .copied()
-                                .unwrap_or_else(|| preview_from_material_data(material_library.get(&wine_mat)));
+                            let wine_preview = resolve_preview(&wine_mat);
                             let cornell_mat = object_material_names
                                 .get(&cornell_obj_id)
                                 .cloned()
                                 .unwrap_or_else(|| "White".to_string());
-                            let cornell_preview = material_runtime_overrides
-                                .get(&cornell_mat)
-                                .copied()
-                                .unwrap_or_else(|| preview_from_material_data(material_library.get(&cornell_mat)));
+                            let cornell_preview = resolve_preview(&cornell_mat);
                             uniforms.cornell_color = [
                                 cornell_preview.base_color[0],
                                 cornell_preview.base_color[1],
@@ -2187,10 +2198,7 @@ pub async fn run() {
                                         .get(&inst.object_id)
                                         .cloned()
                                         .unwrap_or_else(|| "Glass".to_string());
-                                    let preview = material_runtime_overrides
-                                        .get(&mat)
-                                        .copied()
-                                        .unwrap_or_else(|| preview_from_material_data(material_library.get(&mat)));
+                                    let preview = resolve_preview(&mat);
                                     material_signature.push_str(&format!(
                                         "|{}:{}:{:.4}:{:.4}:{:.4}:{:.4}:{:.4}:{:.4}:{}:{:.4}:{:.4}:{:.4}:{:.4}:{:.4}:{:.4}",
                                         inst.object_id.0,
@@ -2271,10 +2279,7 @@ pub async fn run() {
                                         .get(&inst.object_id)
                                         .cloned()
                                         .unwrap_or_else(|| "Glass".to_string());
-                                    let preview = material_runtime_overrides
-                                        .get(&mat)
-                                        .copied()
-                                        .unwrap_or_else(|| preview_from_material_data(material_library.get(&mat)));
+                                    let preview = resolve_preview(&mat);
                                     let wine_style = object_target_by_id
                                         .get(&inst.object_id)
                                         .copied()
@@ -2441,12 +2446,20 @@ pub async fn run() {
                                 .get(&checkered_obj_id)
                                 .cloned()
                                 .unwrap_or_else(|| "Checker".to_string());
-                            let checker_preview = material_runtime_overrides
-                                .get(&checker_mat)
-                                .copied()
-                                .unwrap_or_else(|| {
-                                    preview_from_material_data(material_library.get(&checker_mat))
-                                });
+                            let checker_preview =
+                                if let Some(preview) = preview_from_material_script(&checker_mat) {
+                                    preview
+                                } else {
+                                    material_runtime_overrides
+                                        .get(&checker_mat)
+                                        .copied()
+                                        .unwrap_or_else(|| {
+                                            scripted_preview_or_graph(
+                                                &checker_mat,
+                                                material_library.get(&checker_mat),
+                                            )
+                                        })
+                                };
                             uniforms.checker_bsdf = [
                                 0.0,
                                 checker_preview.roughness.clamp(0.001, 1.0),

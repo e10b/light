@@ -4,7 +4,10 @@ use crate::{
     prism_file::{load_prism_database, save_prism_file, MaterialData as PrismMaterialData},
     scene_data::{Id, MainDatabase},
     tooling::{
-        materials::{make_checker_material, make_glass_material, make_white_material},
+        materials::{
+            ensure_default_material_scripts, make_checker_material, make_empty_material,
+            make_glass_material, make_white_material,
+        },
         persistence::build_prism_database_from_main,
     },
 };
@@ -54,6 +57,7 @@ pub fn draw_project_io_buttons(ui: &mut egui::Ui, ctx: ProjectIoContext<'_>) {
     if ui.button("Open").clicked() {
         match load_prism_database(std::path::Path::new("res/scenes.prism"), false) {
             Ok(loaded) => {
+                ensure_default_material_scripts();
                 ctx.main_db.collections.clear();
                 ctx.main_db.scenes.clear();
                 ctx.main_db.view_layers.clear();
@@ -71,6 +75,8 @@ pub fn draw_project_io_buttons(ui: &mut egui::Ui, ctx: ProjectIoContext<'_>) {
                     .insert("Checker".to_string(), make_checker_material());
                 ctx.material_library
                     .insert("Glass".to_string(), make_glass_material());
+                ctx.material_library
+                    .insert("Empty".to_string(), make_empty_material());
                 ctx.object_material_names
                     .insert(ctx.sphere_obj_id, "Glass".to_string());
                 ctx.object_material_names

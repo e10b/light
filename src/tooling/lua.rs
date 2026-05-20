@@ -32,6 +32,10 @@ pub fn scripts_dir() -> PathBuf {
     project_path("scripts")
 }
 
+pub fn material_scripts_dir() -> PathBuf {
+    scripts_dir().join("materials")
+}
+
 pub fn write_lua_script(path: &str, source: &str) -> std::io::Result<PathBuf> {
     let clean_path = path.trim().trim_start_matches('/').to_string();
     let full_path = scripts_dir().join(clean_path);

@@ -60,6 +60,9 @@ pub fn draw_editor_surface(
     material_library: &mut HashMap<String, PrismMaterialData>,
     material_editor: &mut MaterialGraphEditor,
     material_runtime_overrides: &mut HashMap<String, RuntimeMaterialPreview>,
+    material_script_name: &mut String,
+    material_script_text: &mut String,
+    material_script_status: &mut String,
     accumulation_dirty: &mut bool,
 ) {
     let scene_id = decanter_scene_id;
@@ -134,6 +137,9 @@ pub fn draw_editor_surface(
         material_library,
         material_editor,
         material_runtime_overrides,
+        material_script_name,
+        material_script_text,
+        material_script_status,
     );
     if let (Some(obj_id), Some(intensity)) =
         (*selected_object_id, panel_output.selected_light_intensity)

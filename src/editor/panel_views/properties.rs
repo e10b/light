@@ -8,7 +8,10 @@ use crate::{
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
     prism_file::MaterialData as PrismMaterialData,
     scene_data::{Id, MainDatabase},
-    tooling::lua::{ensure_lua_editor_document, scripts_dir, write_lua_script},
+    tooling::materials::{
+        material_from_preview, material_script_source_from_preview, preview_from_material_script,
+    },
+    tooling::lua::{ensure_lua_editor_document, material_scripts_dir, scripts_dir, write_lua_script},
 };
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -66,6 +69,9 @@ pub fn draw_properties_panel(
     material_library: &mut HashMap<String, PrismMaterialData>,
     material_editor: &mut MaterialGraphEditor,
     material_runtime_overrides: &mut HashMap<String, RuntimeMaterialPreview>,
+    material_script_name: &mut String,
+    material_script_text: &mut String,
+    material_script_status: &mut String,
 ) -> PropertiesPanelOutput {
     let mut out = PropertiesPanelOutput::default();
 
@@ -380,6 +386,98 @@ pub fn draw_properties_panel(
                     out.accumulation_dirty = true;
                 }
             });
+            ui.separator();
+            ui.collapsing("Material Script", |ui| {
+                let material_object_id = if has_selection {
+                    selected_object_id
+                } else {
+                    None
+                };
+                if let Some(obj_id) = material_object_id {
+                    let mat_name = object_material_names
+                        .get(&obj_id)
+                        .cloned()
+                        .unwrap_or_else(|| "White".to_string());
+                    if *material_script_name != mat_name {
+                        let script_path = material_scripts_dir()
+                            .join(format!("{}.lua", mat_name.to_ascii_lowercase()));
+                        *material_script_text = std::fs::read_to_string(&script_path)
+                            .unwrap_or_else(|_| {
+                                "return {\n  bsdf_connected = true,\n  base_color = {1.0, 1.0, 1.0},\n  roughness = 0.5,\n  transmission = 0.0,\n  ior = 1.0,\n}\n".to_string()
+                            });
+                        *material_script_name = mat_name.clone();
+                        material_script_status.clear();
+                    }
+                    ui.label(format!("Material: {}", mat_name));
+                    ui.horizontal(|ui| {
+                        let script_rel = format!("materials/{}.lua", mat_name.to_ascii_lowercase());
+                        ui.monospace(script_rel);
+                        if ui.button("Save Script").clicked() {
+                            let path = material_scripts_dir()
+                                .join(format!("{}.lua", mat_name.to_ascii_lowercase()));
+                            match std::fs::create_dir_all(material_scripts_dir())
+                                .and_then(|_| std::fs::write(&path, material_script_text.as_str()))
+                            {
+                                Ok(_) => {
+                                    *material_script_status = format!("Saved {}", path.display());
+                                    if let Some(preview) = preview_from_material_script(&mat_name) {
+                                        let scripted_mat =
+                                            material_from_preview(&mat_name, preview);
+                                        material_library.insert(mat_name.clone(), scripted_mat);
+                                        material_runtime_overrides.insert(mat_name.clone(), preview);
+                                        out.accumulation_dirty = true;
+                                    } else {
+                                        *material_script_status = format!(
+                                            "Saved {}, but parse failed (check Lua table fields)",
+                                            path.display()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    *material_script_status = format!("Save failed: {e}");
+                                }
+                            }
+                        }
+                        if ui.button("Reload Script").clicked() {
+                            let path = material_scripts_dir()
+                                .join(format!("{}.lua", mat_name.to_ascii_lowercase()));
+                            match std::fs::read_to_string(&path) {
+                                Ok(src) => {
+                                    *material_script_text = src;
+                                    *material_script_status =
+                                        format!("Reloaded {}", path.display());
+                                    if let Some(preview) = preview_from_material_script(&mat_name) {
+                                        let scripted_mat =
+                                            material_from_preview(&mat_name, preview);
+                                        material_library.insert(mat_name.clone(), scripted_mat);
+                                        material_runtime_overrides.insert(mat_name.clone(), preview);
+                                        out.accumulation_dirty = true;
+                                    } else {
+                                        *material_script_status = format!(
+                                            "Reloaded {}, but parse failed (check Lua table fields)",
+                                            path.display()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    *material_script_status = format!("Reload failed: {e}");
+                                }
+                            }
+                        }
+                    });
+                    CodeEditor::default()
+                        .id_source(format!("mat_script_{}", mat_name))
+                        .with_rows(10)
+                        .with_fontsize(12.0)
+                        .with_theme(ColorTheme::GRUVBOX)
+                        .show(ui, material_script_text, lua_syntax);
+                    if !material_script_status.is_empty() {
+                        ui.label(material_script_status.as_str());
+                    }
+                } else {
+                    ui.label("No object selected.");
+                }
+            });
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                 ui.separator();
                 ui.collapsing("Shader Graph", |ui| {
@@ -401,6 +499,21 @@ pub fn draw_properties_panel(
                                 }
                             });
                         object_material_names.insert(obj_id, mat_name.clone());
+                        if let Some(script_preview) = preview_from_material_script(&mat_name) {
+                            let scripted_mat = material_from_preview(&mat_name, script_preview);
+                            material_library.insert(mat_name.clone(), scripted_mat);
+                            material_runtime_overrides.insert(mat_name.clone(), script_preview);
+                        }
+                        if *material_script_name != mat_name {
+                            let script_path = material_scripts_dir()
+                                .join(format!("{}.lua", mat_name.to_ascii_lowercase()));
+                            *material_script_text = std::fs::read_to_string(&script_path)
+                                .unwrap_or_else(|_| {
+                                    "return {\n  bsdf_connected = true,\n  base_color = {1.0, 1.0, 1.0},\n  roughness = 0.5,\n  transmission = 0.0,\n  ior = 1.0,\n}\n".to_string()
+                                });
+                            *material_script_name = mat_name.clone();
+                            material_script_status.clear();
+                        }
                         if let Some(mat) = material_library.get(&mat_name) {
                             let graph_key = mat_name.clone();
                             ui.label(format!("Graph: {}", mat.name));
@@ -412,8 +525,30 @@ pub fn draw_properties_panel(
                             if let Some(mat_mut) = material_library.get_mut(&mat_name) {
                                 material_editor.commit_to_material(mat_mut);
                             }
-                            material_runtime_overrides
-                                .insert(mat_name.clone(), material_editor.runtime_preview());
+                            let live_preview = material_editor.runtime_preview();
+                            material_runtime_overrides.insert(mat_name.clone(), live_preview);
+                            let script_src =
+                                material_script_source_from_preview(&mat_name, live_preview);
+                            let script_path = material_scripts_dir()
+                                .join(format!("{}.lua", mat_name.to_ascii_lowercase()));
+                            let existing = std::fs::read_to_string(&script_path).unwrap_or_default();
+                            if existing != script_src {
+                                match std::fs::create_dir_all(material_scripts_dir())
+                                    .and_then(|_| std::fs::write(&script_path, script_src.as_str()))
+                                {
+                                    Ok(_) => {
+                                        *material_script_text = script_src;
+                                        *material_script_name = mat_name.clone();
+                                        *material_script_status =
+                                            format!("Synced from nodes: {}", script_path.display());
+                                        out.accumulation_dirty = true;
+                                    }
+                                    Err(e) => {
+                                        *material_script_status =
+                                            format!("Node->script sync failed: {e}");
+                                    }
+                                }
+                            }
                         } else {
                             ui.label("White fallback (no material graph).");
                         }
