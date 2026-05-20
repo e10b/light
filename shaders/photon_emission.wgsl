@@ -238,6 +238,13 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = 1.0 - bary.x - bary.y;
     var normal = normalize(mesh_normals[i0].xyz * w + mesh_normals[i1].xyz * bary.x + mesh_normals[i2].xyz * bary.y);
     let mat = materials[mesh_triangle_material[prim]];
+    let is_checker = mat.base_color.a < 0.0;
+    if (is_checker) {
+      if (passed_glass) {
+        write_photon(gid.x, hit_pos, -rd, lambda_nm, power);
+      }
+      break;
+    }
     let transmission = clamp(mat.params.z, 0.0, 1.0);
     if (transmission <= 0.01) {
       if (passed_glass) {
