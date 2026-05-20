@@ -228,23 +228,34 @@ fn estimate_photon_density(position: vec3<f32>, normal: vec3<f32>, radius: f32) 
 
   let base_cell = vec3<i32>(floor(position / photon_uniforms.voxel_size));
   let radius2 = radius * radius;
+  let voxel = max(photon_uniforms.voxel_size, 1e-4);
+  let cell_radius = max(i32(ceil(radius / voxel)), 1);
+  let sigma2 = max(radius2 * 0.36, 1e-6);
   var flux = vec3<f32>(0.0);
 
-  for (var oz = -1; oz <= 1; oz = oz + 1) {
-    for (var oy = -1; oy <= 1; oy = oy + 1) {
-      for (var ox = -1; ox <= 1; ox = ox + 1) {
+  for (var oz = -cell_radius; oz <= cell_radius; oz = oz + 1) {
+    for (var oy = -cell_radius; oy <= cell_radius; oy = oy + 1) {
+      for (var ox = -cell_radius; ox <= cell_radius; ox = ox + 1) {
         var node = photon_hash_heads[photon_spatial_hash(base_cell + vec3<i32>(ox, oy, oz))];
         var visited = 0u;
         loop {
-          if (node == 0u || visited >= 128u) {
+          if (node == 0u || visited >= 512u) {
             break;
           }
           let photon = photons[node - 1u];
           let delta = photon.position - position;
           let d2 = dot(delta, delta);
-          let same_side = dot(normal, photon.direction) > 0.0;
-          if (d2 <= radius2 && same_side) {
-            let kernel = 1.0 - d2 / max(radius2, 1e-5);
+          // Surface-projected kernel avoids circular 3D splats on vertical receivers.
+          let plane_dist = abs(dot(delta, normal));
+          let tangent_d2 = max(d2 - plane_dist * plane_dist, 0.0);
+          let layer_thickness = max(radius * 0.18, photon_uniforms.voxel_size * 0.6);
+          if (tangent_d2 <= radius2 && plane_dist <= layer_thickness) {
+            let tangent_kernel = exp(-tangent_d2 / (2.0 * sigma2));
+            let normal_sigma2 = max(layer_thickness * layer_thickness * 0.35, 1e-6);
+            let normal_kernel = exp(-(plane_dist * plane_dist) / (2.0 * normal_sigma2));
+            let incidence = clamp(abs(dot(normalize(normal), -normalize(photon.direction))), 0.0, 1.0);
+            let angular_kernel = max(incidence, 0.12);
+            let kernel = tangent_kernel * normal_kernel * angular_kernel;
             flux = flux + wl(photon.wavelength_nm) * photon.power * kernel;
           }
           node = photon.next;
@@ -604,11 +615,6 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
         transmission = max(transmission, 0.72);
         roughness = min(roughness, 0.012);
         ior = select(ior, 1.36, is_wine_tinted);
-      } else {
-        // Decanter path: force true dielectric behavior even when source material metadata is weak.
-        transmission = max(transmission, 0.98);
-        roughness = min(roughness, 0.003);
-        albedo = mix(albedo, vec3<f32>(1.0), 0.85);
       }
     } else if (hit_type == 4u) {
       normal = cube_normal(hit_pos, uniforms.cornell_center.xyz, vec3<f32>(uniforms.cornell_center.w));
@@ -651,6 +657,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     let spot_cos = dot(normalize(spot_to_hit), spot_axis);
     let spot_shape = smoothstep(cos(24.0 * 3.141592653589793 / 180.0), cos(8.0 * 3.141592653589793 / 180.0), spot_cos);
     let photon_indirect = estimate_photon_density(hit_pos, normal, photon_uniforms.voxel_size * 1.5);
+    let caustic_gain = select(8.0, 3.0, is_wine_scene && hit_type == 3u);
     let base = select(vec3<f32>(0.08), vec3<f32>(0.05), hit_type == 1u);
     let receives_spot_pool = is_wine_scene && hit_type == 3u;
     var direct_light = vec3<f32>(0.0);
@@ -710,12 +717,14 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       }
     }
 
-    if ((any_visible_light || receives_spot_pool) && transmission < 0.5) {
-      if (is_wine_scene && hit_type == 3u) {
-        L = L + throughput * (photon_indirect * 8.0 + albedo * direct_light * uniforms.sun_intensity) * spectral_weight;
-      } else {
-        L = L + throughput * (base + photon_indirect * albedo + albedo * direct_light) * spectral_weight;
-      }
+    if (transmission < 0.5) {
+      let caustic_color = mix(albedo, vec3<f32>(1.0), 0.65);
+      let direct_term = select(
+        vec3<f32>(0.0),
+        select(albedo * direct_light, albedo * direct_light * uniforms.sun_intensity, is_wine_scene),
+        any_visible_light || receives_spot_pool
+      );
+      L = L + throughput * (base + photon_indirect * caustic_color * caustic_gain + direct_term) * spectral_weight;
       break;
     }
 
@@ -757,17 +766,6 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       ro = hit_pos + rd * 0.002;
       if (max(max(throughput.x, throughput.y), throughput.z) < 0.01) { break; }
       continue;
-    }
-
-    // If diffuse surface is shadowed, keep only small ambient and terminate.
-    if (transmission < 0.5) {
-      let photon_indirect = estimate_photon_density(hit_pos, normal, photon_uniforms.voxel_size * 1.5);
-      if (is_wine_scene && hit_type == 3u) {
-        L = L + throughput * photon_indirect * 8.0 * spectral_weight;
-      } else {
-        L = L + throughput * ((vec3<f32>(0.04) + photon_indirect) * albedo) * spectral_weight;
-      }
-      break;
     }
 
     // Fallback (shouldn't hit with current material split)
