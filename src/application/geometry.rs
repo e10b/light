@@ -197,7 +197,9 @@ pub fn make_plane_mesh(center: glam::Vec3, half_extent: f32) -> MeshData {
         [1.0, 0.0, 1.0],
         [-1.0, 0.0, 1.0],
     ];
-    let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+    // Winding set for upward-facing front faces (+Y) so raster backface culling
+    // doesn't hide the plane when viewed from above.
+    let indices: Vec<u32> = vec![0, 2, 1, 0, 3, 2];
     let mut vertices = Vec::new();
     let mut positions4 = Vec::new();
     for c in corners {

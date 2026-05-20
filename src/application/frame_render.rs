@@ -39,6 +39,11 @@ pub fn render_frame_and_present(
     raster_instance_buf: &mut wgpu::Buffer,
     projection: glam::Mat4,
     camera: &Camera,
+    checker_scale: f32,
+    checker_color_a: [f32; 3],
+    checker_color_b: [f32; 3],
+    checker_enabled: bool,
+    checker_plane_y: f32,
     vbuf: &wgpu::Buffer,
     ibuf: &wgpu::Buffer,
     model_idx_len: usize,
@@ -148,7 +153,18 @@ pub fn render_frame_and_present(
             ])
         }
         .normalize_or_zero();
-        raster_pass.update_view_proj(queue, projection, view_matrix, camera.pos, light_dir);
+        raster_pass.update_view_proj(
+            queue,
+            projection,
+            view_matrix,
+            camera.pos,
+            light_dir,
+            checker_scale,
+            checker_color_a,
+            checker_color_b,
+            checker_enabled,
+            checker_plane_y,
+        );
         raster_pass.render_shadow_maps(
             &mut encoder,
             vbuf,

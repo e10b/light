@@ -2396,6 +2396,7 @@ pub async fn run() {
                             } else {
                                 &mut editor_db
                             };
+                            let mut raster_material_buffers_recreated = false;
 
                             sync_accumulation_and_geometry(
                                 &mut accumulation_dirty,
@@ -2430,7 +2431,26 @@ pub async fn run() {
                                 &device,
                                 &ubind,
                                 &compute_pass,
+                                &mut raster_material_buffers_recreated,
                             );
+                            if raster_material_buffers_recreated {
+                                raster_pass = raster_pass::RasterPass::new(&device, surface_format);
+                            }
+                            let checker_mat = object_material_names
+                                .get(&checkered_obj_id)
+                                .cloned()
+                                .unwrap_or_else(|| "Checker".to_string());
+                            let checker_preview = material_runtime_overrides
+                                .get(&checker_mat)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    preview_from_material_data(material_library.get(&checker_mat))
+                                });
+                            let checker_plane_y = mesh_instances
+                                .iter()
+                                .find(|inst| inst.object_id == checkered_obj_id)
+                                .map(|inst| inst.center().y)
+                                .unwrap_or(play_ground_y());
                             queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
 
                             render_frame_and_present(
@@ -2457,6 +2477,11 @@ pub async fn run() {
                                 &mut raster_instance_buf,
                                 projection,
                                 &camera,
+                                checker_preview.checker_scale,
+                                checker_preview.checker_color_a,
+                                checker_preview.checker_color_b,
+                                checker_preview.checker_enabled,
+                                checker_plane_y,
                                 &vbuf,
                                 &ibuf,
                                 model_idx.len(),

@@ -48,7 +48,9 @@ pub fn sync_accumulation_and_geometry(
     device: &wgpu::Device,
     ubind: &wgpu::BindGroupLayout,
     compute_pass: &compute_pass::ComputePass,
+    raster_material_buffers_recreated: &mut bool,
 ) {
+    *raster_material_buffers_recreated = false;
     if *accumulation_dirty || sun_changed {
         if *geometry_dirty {
             *model_verts = mesh.vertices.clone();
@@ -148,6 +150,7 @@ pub fn sync_accumulation_and_geometry(
                     contents: bytemuck::cast_slice(&mesh.materials),
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 });
+                *raster_material_buffers_recreated = true;
                 *model_blas_desc = wgpu::BlasTriangleGeometrySizeDescriptor {
                     vertex_format: wgpu::VertexFormat::Float32x3,
                     vertex_count: render_verts.len() as u32,

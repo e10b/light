@@ -22,6 +22,9 @@ struct RasterUniforms {
     light_dir: [f32; 4],
     shadow_texel_size: [f32; 4],
     camera_pos: [f32; 4],
+    checker_color_a: [f32; 4], // rgb + scale
+    checker_color_b: [f32; 4], // rgb + enabled flag
+    checker_params: [f32; 4],  // plane_y, y_band, normal_threshold, _pad
 }
 
 pub struct RasterPass {
@@ -59,6 +62,9 @@ impl RasterPass {
                 light_dir: [0.35, 0.85, 0.25, 0.0],
                 shadow_texel_size: [1.0 / SHADOW_MAP_SIZE as f32, 0.0, 0.0, 0.0],
                 camera_pos: [0.0, 0.0, 0.0, 0.0],
+                checker_color_a: [0.86, 0.86, 0.86, 1.0],
+                checker_color_b: [0.2, 0.2, 0.2, 1.0],
+                checker_params: [-1.5, 0.35, 0.65, 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -367,6 +373,11 @@ impl RasterPass {
         view: glam::Mat4,
         camera_pos: glam::Vec3,
         light_dir: glam::Vec3,
+        checker_scale: f32,
+        checker_color_a: [f32; 3],
+        checker_color_b: [f32; 3],
+        checker_enabled: bool,
+        checker_plane_y: f32,
     ) {
         let view_proj = projection * view;
         let light_dir = light_dir.normalize_or_zero();
@@ -379,6 +390,19 @@ impl RasterPass {
             light_dir: [light_dir.x, light_dir.y, light_dir.z, 0.0],
             shadow_texel_size: [1.0 / SHADOW_MAP_SIZE as f32, 0.0, 0.0, 0.0],
             camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
+            checker_color_a: [
+                checker_color_a[0],
+                checker_color_a[1],
+                checker_color_a[2],
+                checker_scale.max(0.05),
+            ],
+            checker_color_b: [
+                checker_color_b[0],
+                checker_color_b[1],
+                checker_color_b[2],
+                if checker_enabled { 1.0 } else { 0.0 },
+            ],
+            checker_params: [checker_plane_y, 0.35, 0.65, 0.0],
         };
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&data));
     }

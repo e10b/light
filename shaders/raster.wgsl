@@ -6,6 +6,9 @@ struct RasterUniforms {
   light_dir: vec4<f32>,
   shadow_texel_size: vec4<f32>,
   camera_pos: vec4<f32>,
+  checker_color_a: vec4<f32>,
+  checker_color_b: vec4<f32>,
+  checker_params: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -14,7 +17,6 @@ var<uniform> uniforms: RasterUniforms;
 var shadow_map: texture_depth_2d_array;
 @group(0) @binding(2)
 var shadow_sampler: sampler_comparison;
-
 struct VsOut {
   @builtin(position) position: vec4<f32>,
   @location(0) world_pos: vec3<f32>,
@@ -92,6 +94,12 @@ fn sky(dir: vec3<f32>) -> vec3<f32> {
   return rgb;
 }
 
+fn checker_at(world_pos: vec3<f32>, scale: f32, color_a: vec3<f32>, color_b: vec3<f32>) -> vec3<f32> {
+  let gx = i32(floor(world_pos.x / scale)) & 1;
+  let gz = i32(floor(world_pos.z / scale)) & 1;
+  return select(color_b, color_a, (gx ^ gz) == 0);
+}
+
 fn cascade_index(world_pos: vec3<f32>) -> u32 {
   let camera_dist = length(world_pos - uniforms.camera_pos.xyz);
   if (camera_dist < uniforms.cascade_splits.x) { return 0u; }
@@ -138,12 +146,10 @@ fn fs_env(in: EnvVsOut) -> EnvFsOut {
     let t = (ground_y - ro.y) / rd.y;
     if (t > 0.0) {
       let p = ro + rd * t;
-      let checker_scale = 2.0;
-      let gx = i32(floor(p.x / checker_scale)) & 1;
-      let gz = i32(floor(p.z / checker_scale)) & 1;
       let near_a = vec3<f32>(0.52, 0.52, 0.54);
       let near_b = vec3<f32>(0.29, 0.29, 0.30);
-      var ground_col = select(near_b, near_a, (gx ^ gz) == 0);
+      let checker_scale = 1.0;
+      var ground_col = checker_at(p, checker_scale, near_a, near_b);
       let shadow = shadow_factor(p, vec3<f32>(0.0, 1.0, 0.0));
       ground_col *= mix(0.36, 1.0, shadow);
       let fade = exp(-length(p.xz) * 0.03);
@@ -158,10 +164,27 @@ fn fs_env(in: EnvVsOut) -> EnvFsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-  let base = vec3<f32>(0.74, 0.8, 0.9);
-  let tint = 0.15 * sin(in.world_pos * 0.15);
+  var base = vec3<f32>(0.74, 0.8, 0.9);
+  var tint = 0.1 * sin(in.world_pos * 0.12);
   var normal = normalize(cross(dpdx(in.world_pos), dpdy(in.world_pos)));
-  normal = select(-normal, normal, dot(normal, uniforms.light_dir.xyz) >= 0.0);
+  let view_dir = normalize(uniforms.camera_pos.xyz - in.world_pos);
+  normal = select(-normal, normal, dot(normal, view_dir) >= 0.0);
+  let checker_plane_y = uniforms.checker_params.x;
+  let checker_y_band = uniforms.checker_params.y;
+  let checker_normal_thresh = uniforms.checker_params.z;
+  if (
+    uniforms.checker_color_b.w > 0.5 &&
+    normal.y > checker_normal_thresh &&
+    abs(in.world_pos.y - checker_plane_y) < checker_y_band
+  ) {
+    let checker_scale = max(uniforms.checker_color_a.w, 0.05);
+    let color_a = uniforms.checker_color_a.rgb;
+    let color_b = uniforms.checker_color_b.rgb;
+    base = checker_at(in.world_pos, checker_scale, color_a, color_b);
+    tint = vec3<f32>(0.0);
+  } else {
+    base = vec3<f32>(0.74, 0.8, 0.9);
+  }
   let nl = max(dot(normal, normalize(uniforms.light_dir.xyz)), 0.0);
   let shadow = shadow_factor(in.world_pos, normal);
   let direct = vec3<f32>(1.0, 0.95, 0.84) * nl * shadow;
