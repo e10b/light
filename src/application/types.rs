@@ -19,6 +19,7 @@ pub struct SceneUniforms {
     pub cornell_center: [f32; 4],
     pub cornell_color: [f32; 4],
     pub cornell_params: [f32; 4],
+    pub checker_bsdf: [f32; 4], // metallic, roughness, transmission, ior
     pub sun_lights: [[f32; 4]; MAX_SUN_LIGHTS],
     pub sun_intensity: f32,
     pub frame: u32,

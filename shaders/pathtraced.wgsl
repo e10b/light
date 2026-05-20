@@ -14,6 +14,7 @@ struct Uniforms {
   cornell_center: vec4<f32>,
   cornell_color: vec4<f32>,
   cornell_params: vec4<f32>,
+  checker_bsdf: vec4<f32>,
   sun_lights: array<vec4<f32>, 8>,
   sun_intensity: f32,
   frame: u32,
@@ -612,10 +613,10 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
         let checker_a = m.base_color.rgb;
         let checker_b = vec3<f32>(m.params.y, m.params.z, m.params.w);
         albedo = select(checker_a, checker_b, is_white);
-        metallic = 0.0;
-        roughness = 0.9;
-        transmission = 0.0;
-        ior = 1.0;
+        metallic = clamp(uniforms.checker_bsdf.x, 0.0, 1.0);
+        roughness = clamp(uniforms.checker_bsdf.y, 0.001, 1.0);
+        transmission = clamp(uniforms.checker_bsdf.z, 0.0, 1.0);
+        ior = max(uniforms.checker_bsdf.w, 1.0);
       } else {
         albedo = m.base_color.rgb;
         metallic = clamp(m.params.x, 0.0, 1.0);

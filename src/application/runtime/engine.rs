@@ -517,6 +517,7 @@ pub async fn run() {
         cornell_center: [0.0, 0.5, -1.0, 1.0],
         cornell_color: [1.0, 1.0, 1.0, 0.0],
         cornell_params: [0.7, 1.0, 0.0, 0.0],
+        checker_bsdf: [0.0, 0.9, 0.0, 1.0],
         sun_lights: [[0.0, 0.0, 0.0, 0.0]; MAX_SUN_LIGHTS],
         sun_intensity: 0.8,
         frame: 0,
@@ -2446,6 +2447,12 @@ pub async fn run() {
                                 .unwrap_or_else(|| {
                                     preview_from_material_data(material_library.get(&checker_mat))
                                 });
+                            uniforms.checker_bsdf = [
+                                0.0,
+                                checker_preview.roughness.clamp(0.001, 1.0),
+                                checker_preview.transmission.clamp(0.0, 1.0),
+                                checker_preview.ior.max(1.0),
+                            ];
                             let checker_plane_y = mesh_instances
                                 .iter()
                                 .find(|inst| inst.object_id == checkered_obj_id)
