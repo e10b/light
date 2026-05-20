@@ -190,6 +190,37 @@ pub fn make_cube_mesh(center: glam::Vec3, half_extent: f32) -> MeshData {
     }
 }
 
+pub fn make_plane_mesh(center: glam::Vec3, half_extent: f32) -> MeshData {
+    let corners = [
+        [-1.0, 0.0, -1.0],
+        [1.0, 0.0, -1.0],
+        [1.0, 0.0, 1.0],
+        [-1.0, 0.0, 1.0],
+    ];
+    let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+    let mut vertices = Vec::new();
+    let mut positions4 = Vec::new();
+    for c in corners {
+        let p = center + glam::Vec3::new(c[0], c[1], c[2]) * half_extent;
+        vertices.push(Vertex {
+            position: p.to_array(),
+        });
+        positions4.push([p.x, p.y, p.z, 0.0]);
+    }
+    let normals4 = vec![[0.0, 1.0, 0.0, 0.0]; 4];
+    MeshData {
+        vertices,
+        indices,
+        positions4,
+        normals4,
+        triangle_material_ids: vec![0; 2],
+        materials: vec![crate::mesh::GpuMaterial {
+            base_color: [0.5, 0.5, 0.5, -1.0],
+            params: [0.0, 0.9, 0.0, 1.0],
+        }],
+    }
+}
+
 pub fn append_object_mesh(
     combined: &mut MeshData,
     extra: MeshData,

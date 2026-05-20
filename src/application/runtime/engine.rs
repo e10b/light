@@ -24,7 +24,8 @@ use crate::{
     scene_data::{Id, MainDatabase, Transform as DbTransform},
     tooling::lua::scripts_dir,
     tooling::materials::{
-        make_empty_material, make_glass_material, make_white_material, preview_from_material_data,
+        make_checker_material, make_empty_material, make_glass_material, make_white_material,
+        preview_from_material_data,
     },
     window::create_window,
 };
@@ -35,9 +36,9 @@ use super::super::{
     editor_surface::draw_editor_surface,
     frame_render::render_frame_and_present,
     geometry::{
-        append_object_mesh, build_photon_targets, make_cube_mesh, make_prism_mesh, mesh_bounds,
-        orient_and_scale_mesh, place_instance_center, sphere_position_for, translate_mesh,
-        update_mesh_transform, visible_render_geometry,
+        append_object_mesh, build_photon_targets, make_cube_mesh, make_plane_mesh,
+        make_prism_mesh, mesh_bounds, orient_and_scale_mesh, place_instance_center,
+        sphere_position_for, translate_mesh, update_mesh_transform, visible_render_geometry,
     },
     gpu_scene::sync_accumulation_and_geometry,
     project_io::{draw_project_io_buttons, ProjectIoContext},
@@ -167,6 +168,10 @@ pub async fn run() {
         "CornellBoxMesh",
         make_cube_mesh(glam::Vec3::ZERO, 2.0).vertices.len(),
     );
+    let checkered_mesh_id = editor_db.create_mesh(
+        "CheckeredMesh",
+        make_plane_mesh(glam::Vec3::ZERO, 32.0).vertices.len(),
+    );
     let sphere_obj_id = editor_db.create_object("Cube", None, DbTransform::default());
     let sun_obj_id = editor_db.create_object("SunLamp", None, DbTransform::default());
     let spot_obj_id = editor_db.create_object("Spotlight", None, DbTransform::default());
@@ -195,6 +200,15 @@ pub async fn run() {
             scale: glam::Vec3::ONE,
         },
     );
+    let checkered_obj_id = editor_db.create_object(
+        "Checkered",
+        Some(checkered_mesh_id),
+        DbTransform {
+            location: glam::Vec3::new(0.0, play_ground_y(), 0.0),
+            rotation: glam::Quat::IDENTITY,
+            scale: glam::Vec3::ONE,
+        },
+    );
     let ecs_world = std::rc::Rc::new(std::cell::RefCell::new(World::new()));
     {
         let mut world = ecs_world.borrow_mut();
@@ -207,6 +221,7 @@ pub async fn run() {
             cornell_obj_id,
             player_obj_id,
             player_camera_obj_id,
+            checkered_obj_id,
         ] {
             register_object_entity(&mut world, &editor_db, object_id);
         }
@@ -244,6 +259,7 @@ pub async fn run() {
     let mut material_library: std::collections::HashMap<String, PrismMaterialData> =
         std::collections::HashMap::new();
     material_library.insert("White".to_string(), make_white_material());
+    material_library.insert("Checker".to_string(), make_checker_material());
     material_library.insert("Empty".to_string(), make_empty_material());
     material_library.insert("Glass".to_string(), make_glass_material());
     let mut object_material_names: std::collections::HashMap<Id, String> =
@@ -253,6 +269,7 @@ pub async fn run() {
     object_material_names.insert(wine_obj_id, "Glass".to_string());
     object_material_names.insert(cornell_obj_id, "Empty".to_string());
     object_material_names.insert(player_obj_id, "White".to_string());
+    object_material_names.insert(checkered_obj_id, "Checker".to_string());
     let mut last_material_signature = String::new();
     let default_cube_mesh_id = editor_db.create_mesh("CubeMesh", default_cube_vertex_len);
     if let Some(mesh_db) = editor_db.meshes.get_mut(&default_cube_mesh_id) {
@@ -315,6 +332,9 @@ pub async fn run() {
         translation: player_start - cube_center,
         scale: player_cube_scale(),
     };
+    let mut checkered_instance =
+        append_object_mesh(&mut mesh, make_plane_mesh(glam::Vec3::ZERO, 32.0), checkered_obj_id, 6);
+    checkered_instance.translation = glam::Vec3::new(0.0, play_ground_y(), 0.0);
 
     let mut model_verts = mesh.vertices.clone();
     let mut model_idx = mesh.indices.clone();
@@ -324,7 +344,7 @@ pub async fn run() {
         model_idx.len()
     );
 
-    let mut mesh_instances = vec![default_cube_instance, player_cube_instance];
+    let mut mesh_instances = vec![default_cube_instance, player_cube_instance, checkered_instance];
 
     let mut object_target_by_id: std::collections::HashMap<Id, GizmoTargetKind> =
         std::collections::HashMap::new();
@@ -336,6 +356,7 @@ pub async fn run() {
     object_target_by_id.insert(cornell_obj_id, GizmoTargetKind::CornellBox);
     object_target_by_id.insert(player_obj_id, GizmoTargetKind::Decanter);
     object_target_by_id.insert(player_camera_obj_id, GizmoTargetKind::Camera);
+    object_target_by_id.insert(checkered_obj_id, GizmoTargetKind::Decanter);
 
     let mut decanter_master = editor_db.create_collection("SceneMaster");
     let mut wine_master = Id(0);
@@ -351,6 +372,8 @@ pub async fn run() {
     editor_db.ensure_scene_base(decanter_scene_id, player_obj_id, true, true);
     editor_db.collection_link_object(decanter_master, player_camera_obj_id);
     editor_db.ensure_scene_base(decanter_scene_id, player_camera_obj_id, true, true);
+    editor_db.collection_link_object(decanter_master, checkered_obj_id);
+    editor_db.ensure_scene_base(decanter_scene_id, checkered_obj_id, true, true);
     println!(
         "Scene bounds: decanter center={:?}, wine center={:?}, combined center={:?}, size={:?}",
         decanter_center, wine_center, center, size
@@ -2163,7 +2186,28 @@ pub async fn run() {
                                         .get(&inst.object_id)
                                         .cloned()
                                         .unwrap_or_else(|| "Glass".to_string());
-                                    material_signature.push_str(&format!("|{}:{mat}", inst.object_id.0));
+                                    let preview = material_runtime_overrides
+                                        .get(&mat)
+                                        .copied()
+                                        .unwrap_or_else(|| preview_from_material_data(material_library.get(&mat)));
+                                    material_signature.push_str(&format!(
+                                        "|{}:{}:{:.4}:{:.4}:{:.4}:{:.4}:{:.4}:{:.4}:{}:{:.4}:{:.4}:{:.4}:{:.4}:{:.4}:{:.4}",
+                                        inst.object_id.0,
+                                        mat,
+                                        preview.base_color[0],
+                                        preview.base_color[1],
+                                        preview.base_color[2],
+                                        preview.roughness,
+                                        preview.transmission,
+                                        preview.checker_scale,
+                                        preview.checker_enabled,
+                                        preview.checker_color_a[0],
+                                        preview.checker_color_a[1],
+                                        preview.checker_color_a[2],
+                                        preview.checker_color_b[0],
+                                        preview.checker_color_b[1],
+                                        preview.checker_color_b[2],
+                                    ));
                                 }
                                 if material_signature != last_material_signature {
                                 let set_range = |materials: &mut [crate::mesh::GpuMaterial],
@@ -2189,16 +2233,16 @@ pub async fn run() {
                                                 ];
                                             } else {
                                                 m.base_color = [
-                                                    preview.base_color[0],
-                                                    preview.base_color[1],
-                                                    preview.base_color[2],
-                                                    1.0,
+                                                    if preview.checker_enabled { preview.checker_color_a[0] } else { preview.base_color[0] },
+                                                    if preview.checker_enabled { preview.checker_color_a[1] } else { preview.base_color[1] },
+                                                    if preview.checker_enabled { preview.checker_color_a[2] } else { preview.base_color[2] },
+                                                    if preview.checker_enabled { -1.0 } else { 1.0 },
                                                 ];
                                                 m.params = [
-                                                    0.0,
-                                                    preview.roughness,
-                                                    preview.transmission,
-                                                    preview.ior,
+                                                    if preview.checker_enabled { preview.checker_scale.max(0.05) } else { 0.0 },
+                                                    if preview.checker_enabled { preview.checker_color_b[0] } else { preview.roughness },
+                                                    if preview.checker_enabled { preview.checker_color_b[1] } else { preview.transmission },
+                                                    if preview.checker_enabled { preview.checker_color_b[2] } else { preview.ior },
                                                 ];
                                             }
                                         } else {

@@ -603,11 +603,26 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       normal = normalize(n0 * w + n1 * bary.x + n2 * bary.y);
       let mid = mesh_triangle_material[prim];
       let m = materials[mid];
-      albedo = m.base_color.rgb;
-      metallic = clamp(m.params.x, 0.0, 1.0);
-      roughness = clamp(m.params.y, 0.001, 1.0);
-      transmission = clamp(m.params.z, 0.0, 1.0);
-      ior = max(m.params.w, 1.0);
+      let is_checker = m.base_color.a < 0.0;
+      if (is_checker) {
+        let grid_scale = max(m.params.x, 0.05);
+        let grid_x = i32(floor(hit_pos.x / grid_scale)) & 1;
+        let grid_z = i32(floor(hit_pos.z / grid_scale)) & 1;
+        let is_white = (grid_x ^ grid_z) == 0;
+        let checker_a = m.base_color.rgb;
+        let checker_b = vec3<f32>(m.params.y, m.params.z, m.params.w);
+        albedo = select(checker_a, checker_b, is_white);
+        metallic = 0.0;
+        roughness = 0.9;
+        transmission = 0.0;
+        ior = 1.0;
+      } else {
+        albedo = m.base_color.rgb;
+        metallic = clamp(m.params.x, 0.0, 1.0);
+        roughness = clamp(m.params.y, 0.001, 1.0);
+        transmission = clamp(m.params.z, 0.0, 1.0);
+        ior = max(m.params.w, 1.0);
+      }
       if (is_wine_scene) {
         let wine_tint = vec3<f32>(0.62, 0.11, 0.16);
         let is_wine_tinted = transmission > 0.02;

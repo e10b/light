@@ -155,6 +155,10 @@ pub struct MaterialGraphEditor {
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeMaterialPreview {
     pub bsdf_connected: bool,
+    pub checker_enabled: bool,
+    pub checker_scale: f32,
+    pub checker_color_a: [f32; 3],
+    pub checker_color_b: [f32; 3],
     pub base_color: [f32; 3],
     pub roughness: f32,
     pub transmission: f32,
@@ -165,6 +169,10 @@ impl Default for RuntimeMaterialPreview {
     fn default() -> Self {
         Self {
             bsdf_connected: false,
+            checker_enabled: false,
+            checker_scale: 2.0,
+            checker_color_a: [0.2, 0.2, 0.2],
+            checker_color_b: [0.86, 0.86, 0.86],
             base_color: [1.0, 1.0, 1.0],
             roughness: 0.65,
             transmission: 0.0,
@@ -238,6 +246,40 @@ impl MaterialGraphEditor {
                         let out =
                             graph.add_output_param(nid, "Value".to_string(), SocketType::Scalar);
                         output_sockets.insert((nid, "Value".to_string()), out);
+                    }
+                    NodeType::CheckerTexture => {
+                        let color_a = graph.add_input_param(
+                            nid,
+                            "Color A".to_string(),
+                            SocketType::Vector3,
+                            SocketValue::Vector3(
+                                shader_node.properties.vec3_value.unwrap_or([0.2, 0.2, 0.2]),
+                            ),
+                            InputParamKind::ConnectionOrConstant,
+                            true,
+                        );
+                        input_sockets.insert((nid, "Color A".to_string()), color_a);
+                        let color_b = graph.add_input_param(
+                            nid,
+                            "Color B".to_string(),
+                            SocketType::Vector3,
+                            SocketValue::Vector3([0.86, 0.86, 0.86]),
+                            InputParamKind::ConnectionOrConstant,
+                            true,
+                        );
+                        input_sockets.insert((nid, "Color B".to_string()), color_b);
+                        let scale = graph.add_input_param(
+                            nid,
+                            "Scale".to_string(),
+                            SocketType::Scalar,
+                            SocketValue::Scalar(shader_node.properties.float_value.unwrap_or(2.0)),
+                            InputParamKind::ConnectionOrConstant,
+                            true,
+                        );
+                        input_sockets.insert((nid, "Scale".to_string()), scale);
+                        let out =
+                            graph.add_output_param(nid, "Color".to_string(), SocketType::Vector3);
+                        output_sockets.insert((nid, "Color".to_string()), out);
                     }
                     NodeType::PrincipledBSDF => {
                         let base = graph.add_input_param(
@@ -364,6 +406,37 @@ impl MaterialGraphEditor {
                 ("Transmission", SocketValue::Scalar(v)) => preview.transmission = *v,
                 ("IOR", SocketValue::Scalar(v)) => preview.ior = *v,
                 _ => {}
+            }
+        }
+        if let Ok(base_color_input) = node.get_input("Base Color") {
+            if let Some(base_src) = self.state.graph.connection(base_color_input) {
+                let base_source_node = self.state.graph.get_output(base_src).node;
+                if let Some(src_node) = self.state.graph.nodes.get(base_source_node) {
+                    preview.checker_enabled = matches!(src_node.user_data.node_type, NodeType::CheckerTexture);
+                    if preview.checker_enabled {
+                        if let Ok(color_a_input) = src_node.get_input("Color A") {
+                            if let Some(color_a_param) = self.state.graph.inputs.get(color_a_input) {
+                                if let SocketValue::Vector3(v) = color_a_param.value {
+                                    preview.checker_color_a = v;
+                                }
+                            }
+                        }
+                        if let Ok(color_b_input) = src_node.get_input("Color B") {
+                            if let Some(color_b_param) = self.state.graph.inputs.get(color_b_input) {
+                                if let SocketValue::Vector3(v) = color_b_param.value {
+                                    preview.checker_color_b = v;
+                                }
+                            }
+                        }
+                        if let Ok(scale_input) = src_node.get_input("Scale") {
+                            if let Some(scale_param) = self.state.graph.inputs.get(scale_input) {
+                                if let SocketValue::Scalar(v) = scale_param.value {
+                                    preview.checker_scale = v.max(0.05);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         preview.roughness = preview.roughness.clamp(0.001, 1.0);

@@ -62,6 +62,7 @@ pub struct NodeLink {
 pub enum NodeType {
     FloatInput,
     VectorMath,
+    CheckerTexture,
     PrincipledBSDF,
     MaterialOutput,
 }

@@ -4,7 +4,7 @@ use crate::{
     prism_file::{load_prism_database, save_prism_file, MaterialData as PrismMaterialData},
     scene_data::{Id, MainDatabase},
     tooling::{
-        materials::{make_glass_material, make_white_material},
+        materials::{make_checker_material, make_glass_material, make_white_material},
         persistence::build_prism_database_from_main,
     },
 };
@@ -67,6 +67,8 @@ pub fn draw_project_io_buttons(ui: &mut egui::Ui, ctx: ProjectIoContext<'_>) {
                 ctx.material_library.clear();
                 ctx.material_library
                     .insert("White".to_string(), make_white_material());
+                ctx.material_library
+                    .insert("Checker".to_string(), make_checker_material());
                 ctx.material_library
                     .insert("Glass".to_string(), make_glass_material());
                 ctx.object_material_names
