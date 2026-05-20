@@ -97,7 +97,7 @@ fn sky(dir: vec3<f32>) -> vec3<f32> {
 fn checker_at(world_pos: vec3<f32>, scale: f32, color_a: vec3<f32>, color_b: vec3<f32>) -> vec3<f32> {
   let gx = i32(floor(world_pos.x / scale)) & 1;
   let gz = i32(floor(world_pos.z / scale)) & 1;
-  return select(color_b, color_a, (gx ^ gz) == 0);
+  return select(color_a, color_b, (gx ^ gz) == 0);
 }
 
 fn cascade_index(world_pos: vec3<f32>) -> u32 {
