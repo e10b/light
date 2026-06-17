@@ -12,13 +12,13 @@ use crate::{
     blender_data::{Id, MainDatabase, Transform as DbTransform},
     compute_pass,
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
-    mesh::{MeshData, Vertex, load_gltf_mesh},
+    mesh::{load_gltf_mesh, MeshData, Vertex},
     photon_mapper::PhotonMapper,
     prism_file::{
-        CollectionData as PrismCollectionData, MaterialData as PrismMaterialData,
-        MeshData as PrismMeshData, NodeProperties, NodeType, ObjectData as PrismObjectData,
-        ObjectDataLink as PrismObjectDataLink, PrismDatabase, SceneData as PrismSceneData,
-        ShaderNode, load_prism_database, save_prism_file,
+        load_prism_database, save_prism_file, CollectionData as PrismCollectionData,
+        MaterialData as PrismMaterialData, MeshData as PrismMeshData, NodeProperties, NodeType,
+        ObjectData as PrismObjectData, ObjectDataLink as PrismObjectDataLink, PrismDatabase,
+        SceneData as PrismSceneData, ShaderNode,
     },
     quad_pass,
     scene::SceneKind,
@@ -95,6 +95,7 @@ enum PrimitiveShape {
     ParabolicMirror,
     SphericalLens,
     ImagePlane,
+    HyperbolicMirror,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -510,6 +511,7 @@ fn set_primitive_shape(
         PrimitiveShape::ParabolicMirror => 2.0,
         PrimitiveShape::SphericalLens => 3.0,
         PrimitiveShape::ImagePlane => 4.0,
+        PrimitiveShape::HyperbolicMirror => 5.0,
     };
     if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
         obj.name = match shape {
@@ -518,6 +520,7 @@ fn set_primitive_shape(
             PrimitiveShape::ParabolicMirror => "Parabolic Mirror",
             PrimitiveShape::SphericalLens => "Spherical Lens",
             PrimitiveShape::ImagePlane => "Image",
+            PrimitiveShape::HyperbolicMirror => "Hyperbolic Mirror",
         }
         .to_string();
     }
@@ -996,11 +999,12 @@ pub async fn run() {
     accel_encoder.build_acceleration_structures([model_build].iter(), iter::once(&tlas));
     queue.submit(Some(accel_encoder.finish()));
 
+    let mut camera_fov_deg = 72.0_f32;
     let projection = glam::Mat4::perspective_rh(
-        std::f32::consts::FRAC_PI_3 * 1.2,
+        camera_fov_deg.to_radians(),
         config.width as f32 / config.height as f32,
         0.1,
-        1000.0,
+        10_000.0,
     );
 
     let mut scene_kind = SceneKind::Decanter;
@@ -1440,6 +1444,8 @@ pub async fn run() {
         std::collections::HashMap::new();
     let mut optical_trace_enabled = false;
     let mut optical_trace_rays = 9u32;
+    let mut optical_trace_image_area = true;
+    let mut cassegrain_focus_offset = 0.0_f32;
 
     let _ = event_loop.run(move |event, active_loop| {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -1565,10 +1571,10 @@ pub async fn run() {
                 config.width = size.width;
                 config.height = size.height;
                 let projection = glam::Mat4::perspective_rh(
-                    std::f32::consts::FRAC_PI_3 * 1.2,
+                    camera_fov_deg.to_radians(),
                     config.width as f32 / config.height as f32,
                     0.1,
-                    1000.0,
+                    10_000.0,
                 );
                 uniforms.proj_inv = projection.inverse().to_cols_array_2d();
                 uniforms.frame = 0;
@@ -1895,15 +1901,65 @@ pub async fn run() {
                                                 let bench_y = -1.5 + sphere_radius * 0.75;
                                                 let tube_axis_rot =
                                                     glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+                                                let tube_axis = glam::Vec3::X;
+                                                let desired_fold_axis = glam::Vec3::Z;
                                                 let primary_center = glam::Vec3::new(0.0, bench_y, 0.0);
-                                                let secondary_center = glam::Vec3::new(2.55, bench_y, 0.0);
-                                                let folded_focus_distance = 1.18;
-                                                let focuser_after_focus_distance = 3.9;
+                                                let primary_radius = sphere_radius * 0.28;
+                                                let primary_focal_length = primary_radius * 10.0;
+                                                let primary_depth =
+                                                    primary_radius * primary_radius / (8.0 * primary_focal_length);
+                                                let primary_vertex =
+                                                    primary_center - tube_axis * primary_depth;
+                                                let puppy_distance = primary_focal_length * 7.0;
+                                                let puppy_center =
+                                                    primary_center + tube_axis * puppy_distance;
+                                                let object_distance =
+                                                    (puppy_center - primary_vertex).dot(tube_axis).max(
+                                                        primary_focal_length + 0.01,
+                                                    );
+                                                let primary_image_distance = 1.0
+                                                    / (1.0 / primary_focal_length
+                                                        - 1.0 / object_distance)
+                                                        .max(0.001);
+                                                let primary_image_point =
+                                                    primary_vertex + tube_axis * primary_image_distance;
+                                                let folded_focus_distance = primary_radius * 1.15;
+                                                let secondary_center =
+                                                    primary_image_point - tube_axis * folded_focus_distance;
+                                                let focuser_params = [6.0, 6.0, 0.25, 0.0];
+                                                let focuser_ior = 1.52_f32;
+                                                let focuser_power = (focuser_ior - 1.0)
+                                                    * (1.0 / focuser_params[0]
+                                                        + 1.0 / focuser_params[1]
+                                                        - ((focuser_ior - 1.0) * focuser_params[2])
+                                                            / (focuser_ior
+                                                                * focuser_params[0]
+                                                                * focuser_params[1]));
+                                                let focuser_after_focus_distance =
+                                                    (1.0 / focuser_power).clamp(1.0, 12.0);
+                                                let central_incoming =
+                                                    (primary_image_point - secondary_center).normalize();
                                                 let secondary_normal =
-                                                    glam::Vec3::new(1.0, 0.0, -1.0).normalize();
+                                                    (central_incoming - desired_fold_axis).normalize();
+                                                let folded_axis = (central_incoming
+                                                    - 2.0 * central_incoming.dot(secondary_normal)
+                                                        * secondary_normal)
+                                                    .normalize();
+                                                let folded_focus =
+                                                    secondary_center + folded_axis * folded_focus_distance;
+                                                let focuser_center =
+                                                    folded_focus + folded_axis * focuser_after_focus_distance;
+                                                let cone_radius_at_secondary =
+                                                    primary_radius * folded_focus_distance / primary_image_distance;
+                                                let secondary_half_size =
+                                                    (cone_radius_at_secondary * 1.28).clamp(0.18, 0.55);
                                                 let secondary_rot = glam::Quat::from_rotation_arc(
                                                     glam::Vec3::Z,
                                                     secondary_normal,
+                                                );
+                                                let focuser_rot = glam::Quat::from_rotation_arc(
+                                                    glam::Vec3::Z,
+                                                    folded_axis,
                                                 );
                                                 let puppy_target_rot =
                                                     glam::Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
@@ -1918,7 +1974,7 @@ pub async fn run() {
                                                     PrimitiveShape::ImagePlane,
                                                     "White",
                                                     DbTransform {
-                                                        location: glam::Vec3::new(42.0, bench_y, 0.0),
+                                                        location: puppy_center,
                                                         rotation: puppy_target_rot,
                                                         scale: glam::Vec3::new(
                                                             puppy_aspect.max(0.1) * 0.95,
@@ -1946,7 +2002,11 @@ pub async fn run() {
                                                     DbTransform {
                                                         location: primary_center,
                                                         rotation: tube_axis_rot,
-                                                        scale: glam::Vec3::new(1.0, 1.0, 0.16),
+                                                        scale: glam::Vec3::new(
+                                                            primary_radius / sphere_radius,
+                                                            primary_radius / sphere_radius,
+                                                            primary_depth / sphere_radius,
+                                                        ),
                                                     },
                                                     sphere_radius,
                                                     &mut primitive_shape,
@@ -1968,7 +2028,11 @@ pub async fn run() {
                                                     DbTransform {
                                                         location: secondary_center,
                                                         rotation: secondary_rot,
-                                                        scale: glam::Vec3::new(0.42, 0.42, 0.025),
+                                                        scale: glam::Vec3::new(
+                                                            secondary_half_size / sphere_radius,
+                                                            secondary_half_size / sphere_radius,
+                                                            0.008,
+                                                        ),
                                                     },
                                                     sphere_radius,
                                                     &mut primitive_shape,
@@ -1980,7 +2044,6 @@ pub async fn run() {
                                                 main_db.collection_link_object(master_id, secondary_id);
                                                 main_db.ensure_scene_base(scene_id, secondary_id, true, true);
 
-                                                let focuser_params = [4.0, 4.0, 0.32, 0.0];
                                                 let focuser_id = create_primitive_object(
                                                     &mut main_db,
                                                     &mut object_target_by_id,
@@ -1989,12 +2052,9 @@ pub async fn run() {
                                                     PrimitiveShape::SphericalLens,
                                                     "Glass",
                                                     DbTransform {
-                                                        location: secondary_center
-                                                            + glam::Vec3::Z
-                                                                * (folded_focus_distance
-                                                                    + focuser_after_focus_distance),
-                                                        rotation: glam::Quat::IDENTITY,
-                                                        scale: glam::Vec3::splat(0.18),
+                                                        location: focuser_center,
+                                                        rotation: focuser_rot,
+                                                        scale: glam::Vec3::splat(0.22),
                                                     },
                                                     sphere_radius,
                                                     &mut primitive_shape,
@@ -2024,13 +2084,17 @@ pub async fn run() {
                                                     tube_axis_rot.w,
                                                 ];
                                                 uniforms.sphere_extent = [
-                                                    sphere_radius,
-                                                    sphere_radius,
-                                                    sphere_radius * 0.16,
+                                                    primary_radius,
+                                                    primary_radius,
+                                                    primary_depth,
                                                     0.0,
                                                 ];
                                                 sphere_rotation = tube_axis_rot;
-                                                sphere_scale = glam::Vec3::new(1.0, 1.0, 0.16);
+                                                sphere_scale = glam::Vec3::new(
+                                                    primary_radius / sphere_radius,
+                                                    primary_radius / sphere_radius,
+                                                    primary_depth / sphere_radius,
+                                                );
                                                 gizmo_target = GizmoTargetKind::Sphere;
                                                 has_selection = true;
                                                 optical_trace_enabled = true;
@@ -2041,11 +2105,279 @@ pub async fn run() {
                                                     active_center + glam::Vec3::X * sun_lamp_distance;
                                                 sun_empty_rotation = glam::Quat::IDENTITY;
                                                 camera = Camera::look_at(
-                                                    glam::Vec3::new(18.0, bench_y + 10.0, 22.0),
-                                                    glam::Vec3::new(2.5, bench_y, 2.8),
+                                                    focuser_center + folded_axis * 8.0 + glam::Vec3::Y * 0.35,
+                                                    focuser_center - folded_axis * 0.4,
                                                 );
                                                 accumulation_dirty = true;
                                                 project_status = "Newtonian telescope demo created".to_string();
+                                            }
+                                        }
+                                        if ui.button("Cassegrain Demo").clicked() {
+                                            let (scene_id, master_id) = match scene_kind {
+                                                SceneKind::Decanter => (decanter_scene_id, decanter_master),
+                                                SceneKind::Wine => (wine_scene_id, wine_master),
+                                                SceneKind::CornellBox => (cornell_scene_id, cornell_master),
+                                            };
+                                            if scene_id.0 != 0 && master_id.0 != 0 {
+                                                cassegrain_focus_offset = 0.0;
+                                                let scene_objects = main_db.scene_objects_recursive(scene_id);
+                                                for object_id in scene_objects {
+                                                    if primitive_shape_by_id.contains_key(&object_id) {
+                                                        main_db.delete_object(object_id);
+                                                        object_target_by_id.remove(&object_id);
+                                                        primitive_shape_by_id.remove(&object_id);
+                                                        primitive_lens_params_by_id.remove(&object_id);
+                                                        object_material_names.remove(&object_id);
+                                                    } else {
+                                                        main_db.unlink_object_from_scene(scene_id, object_id);
+                                                    }
+                                                }
+
+                                                let bench_y = -1.5 + sphere_radius * 1.35;
+                                                let tube_axis = glam::Vec3::X;
+                                                let primary_center = glam::Vec3::new(0.0, bench_y, 0.0);
+                                                let primary_radius = sphere_radius * 0.38;
+                                                let primary_focal_length = primary_radius * 8.0;
+                                                let primary_depth =
+                                                    primary_radius * primary_radius / (8.0 * primary_focal_length);
+                                                let primary_vertex =
+                                                    primary_center - tube_axis * primary_depth;
+                                                let primary_rot =
+                                                    glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+                                                let puppy_object_distance = primary_focal_length * 100.0;
+                                                let primary_image_distance = 1.0
+                                                    / (1.0 / primary_focal_length
+                                                        - 1.0 / puppy_object_distance);
+                                                let target_secondary_magnification = 2.5;
+                                                let back_focus_distance = primary_radius * 1.25;
+                                                let secondary_to_prime_focus =
+                                                    (primary_image_distance + back_focus_distance)
+                                                        / (target_secondary_magnification + 1.0);
+                                                let secondary_vertex = primary_vertex
+                                                    + tube_axis
+                                                        * (primary_image_distance
+                                                            - secondary_to_prime_focus);
+                                                let rear_focus =
+                                                    primary_vertex - tube_axis * back_focus_distance;
+                                                let secondary_to_rear_focus =
+                                                    (secondary_vertex - rear_focus).length();
+                                                let prime_focus =
+                                                    primary_vertex + tube_axis * primary_image_distance;
+                                                let hyperbola_center = (prime_focus + rear_focus) * 0.5;
+                                                let hyperbola_c =
+                                                    (prime_focus - rear_focus).length() * 0.5;
+                                                let hyperbola_a =
+                                                    (secondary_vertex - hyperbola_center).length();
+                                                let hyperbola_b = (hyperbola_c * hyperbola_c
+                                                    - hyperbola_a * hyperbola_a)
+                                                    .max(0.01)
+                                                    .sqrt();
+                                                let secondary_clear_radius = (primary_radius
+                                                    * secondary_to_prime_focus
+                                                    / primary_focal_length
+                                                    * 1.18)
+                                                    .clamp(0.18, primary_radius * 0.34);
+                                                let beam_radius_at_primary_hole = secondary_clear_radius
+                                                    * back_focus_distance
+                                                    / secondary_to_rear_focus;
+                                                let primary_hole_radius = (beam_radius_at_primary_hole * 1.45)
+                                                    .clamp(primary_radius * 0.13, primary_radius * 0.28);
+                                                let secondary_sag = hyperbola_a
+                                                    * ((1.0
+                                                        + secondary_clear_radius
+                                                            * secondary_clear_radius
+                                                            / (hyperbola_b * hyperbola_b))
+                                                        .sqrt()
+                                                        - 1.0);
+                                                let secondary_center = secondary_vertex;
+                                                let secondary_rot = primary_rot;
+                                                let puppy_center =
+                                                    primary_vertex + tube_axis * puppy_object_distance;
+                                                let puppy_height = primary_radius * 2.4;
+                                                let collimator_params = [6.0, 6.0, 0.25, 0.0];
+                                                let collimator_ior = 1.52_f32;
+                                                let collimator_power = (collimator_ior - 1.0)
+                                                    * (1.0 / collimator_params[0]
+                                                        + 1.0 / collimator_params[1]
+                                                        - ((collimator_ior - 1.0)
+                                                            * collimator_params[2])
+                                                            / (collimator_ior
+                                                                * collimator_params[0]
+                                                                * collimator_params[1]));
+                                                let collimator_focal_length =
+                                                    (1.0 / collimator_power).clamp(1.0, 12.0);
+                                                let rear_view_axis = -tube_axis;
+                                                let collimator_center = rear_focus
+                                                    + rear_view_axis * collimator_focal_length;
+                                                let collimator_rot = glam::Quat::from_rotation_arc(
+                                                    glam::Vec3::Z,
+                                                    rear_view_axis,
+                                                );
+                                                let puppy_target_rot =
+                                                    glam::Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+                                                let puppy_aspect = puppy_dimensions.0 as f32
+                                                    / puppy_dimensions.1.max(1) as f32;
+
+                                                let puppy_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::ImagePlane,
+                                                    "White",
+                                                    DbTransform {
+                                                        location: puppy_center,
+                                                        rotation: puppy_target_rot,
+                                                        scale: glam::Vec3::new(
+                                                            puppy_aspect.max(0.1) * puppy_height,
+                                                            puppy_height,
+                                                            1.0,
+                                                        ),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&puppy_id) {
+                                                    obj.name = "Distant Puppy Target".to_string();
+                                                }
+                                                main_db.collection_link_object(master_id, puppy_id);
+                                                main_db.ensure_scene_base(scene_id, puppy_id, true, true);
+
+                                                let primary_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::ParabolicMirror,
+                                                    "Mirror",
+                                                    DbTransform {
+                                                        location: primary_center,
+                                                        rotation: primary_rot,
+                                                        scale: glam::Vec3::new(
+                                                            primary_radius / sphere_radius,
+                                                            primary_radius / sphere_radius,
+                                                            primary_depth / sphere_radius,
+                                                        ),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&primary_id) {
+                                                    obj.name = "Cassegrain Annular Primary".to_string();
+                                                }
+                                                primitive_lens_params_by_id.insert(
+                                                    primary_id,
+                                                    [0.0, 0.0, 0.0, primary_hole_radius],
+                                                );
+                                                main_db.collection_link_object(master_id, primary_id);
+                                                main_db.ensure_scene_base(scene_id, primary_id, true, true);
+
+                                                let secondary_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::HyperbolicMirror,
+                                                    "Mirror",
+                                                    DbTransform {
+                                                        location: secondary_center,
+                                                        rotation: secondary_rot,
+                                                        scale: glam::Vec3::new(
+                                                            secondary_clear_radius / sphere_radius,
+                                                            secondary_clear_radius / sphere_radius,
+                                                            secondary_sag.max(0.02) / sphere_radius,
+                                                        ),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&secondary_id) {
+                                                    obj.name = "Cassegrain Secondary Mirror".to_string();
+                                                }
+                                                primitive_lens_params_by_id.insert(
+                                                    secondary_id,
+                                                    [
+                                                        hyperbola_a,
+                                                        hyperbola_b,
+                                                        secondary_clear_radius,
+                                                        0.0,
+                                                    ],
+                                                );
+                                                main_db.collection_link_object(master_id, secondary_id);
+                                                main_db.ensure_scene_base(scene_id, secondary_id, true, true);
+
+                                                let collimator_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::SphericalLens,
+                                                    "Glass",
+                                                    DbTransform {
+                                                        location: collimator_center,
+                                                        rotation: collimator_rot,
+                                                        scale: glam::Vec3::splat(0.15),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&collimator_id) {
+                                                    obj.name = "Rear Collimator Lens".to_string();
+                                                }
+                                                primitive_lens_params_by_id
+                                                    .insert(collimator_id, collimator_params);
+                                                main_db.collection_link_object(master_id, collimator_id);
+                                                main_db.ensure_scene_base(scene_id, collimator_id, true, true);
+
+                                                selected_primitive_id = primary_id;
+                                                primitive_shape = PrimitiveShape::ParabolicMirror;
+                                                uniforms.sphere_params[3] = 2.0;
+                                                uniforms.sphere_pos = [
+                                                    primary_center.x,
+                                                    primary_center.y,
+                                                    primary_center.z,
+                                                    sphere_radius,
+                                                ];
+                                                uniforms.sphere_rot = [
+                                                    primary_rot.x,
+                                                    primary_rot.y,
+                                                    primary_rot.z,
+                                                    primary_rot.w,
+                                                ];
+                                                uniforms.sphere_extent = [
+                                                    primary_radius,
+                                                    primary_radius,
+                                                    primary_depth,
+                                                    0.0,
+                                                ];
+                                                sphere_rotation = primary_rot;
+                                                sphere_scale = glam::Vec3::new(
+                                                    primary_radius / sphere_radius,
+                                                    primary_radius / sphere_radius,
+                                                    primary_depth / sphere_radius,
+                                                );
+                                                gizmo_target = GizmoTargetKind::Sphere;
+                                                has_selection = true;
+                                                optical_trace_enabled = true;
+                                                optical_trace_rays = 11;
+                                                sun_intensity = 2.2;
+                                                sun_lamp_distance = sun_lamp_distance.max(80.0);
+                                                sun_empty_position =
+                                                    active_center + glam::Vec3::X * sun_lamp_distance;
+                                                sun_empty_rotation = glam::Quat::IDENTITY;
+                                                camera = Camera::look_at(
+                                                    collimator_center
+                                                        + rear_view_axis * (primary_radius * 1.5),
+                                                    collimator_center - rear_view_axis * primary_radius,
+                                                );
+                                                render_mode = RenderModeKind::Pathtraced;
+                                                accumulation_dirty = true;
+                                                project_status =
+                                                    "Cassegrain collimated-view demo created".to_string();
                                             }
                                         }
                                         ui.menu_button("Add", |ui| {
@@ -2534,7 +2866,9 @@ pub async fn run() {
                                                             || lname.contains("sphere")
                                                             || lname.contains("cube")
                                                         {
-                                                            let shape = if lname.contains("image") {
+                                                            let shape = if lname.contains("hyperbolic") {
+                                                                PrimitiveShape::HyperbolicMirror
+                                                            } else if lname.contains("image") {
                                                                 PrimitiveShape::ImagePlane
                                                             } else if lname.contains("lens") {
                                                                 PrimitiveShape::SphericalLens
@@ -2701,8 +3035,14 @@ pub async fn run() {
                                                                 PrimitiveShape::ParabolicMirror => 2.0,
                                                                 PrimitiveShape::SphericalLens => 3.0,
                                                                 PrimitiveShape::ImagePlane => 4.0,
+                                                                PrimitiveShape::HyperbolicMirror => 5.0,
                                                             };
-                                                            if shape == PrimitiveShape::SphericalLens {
+                                                            if matches!(
+                                                                shape,
+                                                                PrimitiveShape::SphericalLens
+                                                                    | PrimitiveShape::ParabolicMirror
+                                                                    | PrimitiveShape::HyperbolicMirror
+                                                            ) {
                                                                 let lens_params =
                                                                     *primitive_lens_params_by_id
                                                                         .entry(object_id)
@@ -2821,12 +3161,18 @@ pub async fn run() {
                                             && gizmo_target == GizmoTargetKind::Sphere
                                             && matches!(
                                                 primitive_shape,
-                                                PrimitiveShape::SphericalLens | PrimitiveShape::ParabolicMirror
+                                                PrimitiveShape::SphericalLens
+                                                    | PrimitiveShape::ParabolicMirror
+                                                    | PrimitiveShape::HyperbolicMirror
                                             )
                                         {
                                             ui.separator();
                                             ui.collapsing("Optical Trace", |ui| {
                                                 ui.checkbox(&mut optical_trace_enabled, "Show rays");
+                                                ui.checkbox(
+                                                    &mut optical_trace_image_area,
+                                                    "Trace image area",
+                                                );
                                                 ui.add(
                                                     egui::Slider::new(&mut optical_trace_rays, 3..=21)
                                                         .text("Rays"),
@@ -2882,6 +3228,242 @@ pub async fn run() {
                                                 }
                                             });
                                         }
+                                        if has_selection
+                                            && gizmo_target == GizmoTargetKind::Sphere
+                                            && matches!(
+                                                primitive_shape,
+                                                PrimitiveShape::ParabolicMirror
+                                                    | PrimitiveShape::HyperbolicMirror
+                                            )
+                                        {
+                                            ui.separator();
+                                            ui.collapsing("Cassegrain Optics", |ui| {
+                                                let mut optics_changed = false;
+
+                                                ui.label("Exact position");
+                                                optics_changed |= ui
+                                                    .add(
+                                                        egui::DragValue::new(&mut uniforms.sphere_pos[0])
+                                                            .speed(0.02)
+                                                            .prefix("X  "),
+                                                    )
+                                                    .changed();
+                                                optics_changed |= ui
+                                                    .add(
+                                                        egui::DragValue::new(&mut uniforms.sphere_pos[1])
+                                                            .speed(0.02)
+                                                            .prefix("Y  "),
+                                                    )
+                                                    .changed();
+                                                optics_changed |= ui
+                                                    .add(
+                                                        egui::DragValue::new(&mut uniforms.sphere_pos[2])
+                                                            .speed(0.02)
+                                                            .prefix("Z  "),
+                                                    )
+                                                    .changed();
+
+                                                match primitive_shape {
+                                                    PrimitiveShape::ParabolicMirror => {
+                                                        let mut aperture =
+                                                            sphere_radius * sphere_scale.x.max(0.01);
+                                                        let depth =
+                                                            sphere_radius * sphere_scale.z.max(0.0001);
+                                                        let mut focal_length =
+                                                            aperture * aperture / (8.0 * depth);
+                                                        let mut hole_radius =
+                                                            uniforms.lens_params[3].max(0.0);
+
+                                                        ui.separator();
+                                                        ui.label("Parabolic primary");
+                                                        optics_changed |= ui
+                                                            .add(
+                                                                egui::DragValue::new(&mut aperture)
+                                                                    .speed(0.02)
+                                                                    .range(0.1..=128.0)
+                                                                    .prefix("Aperture radius  "),
+                                                            )
+                                                            .changed();
+                                                        optics_changed |= ui
+                                                            .add(
+                                                                egui::DragValue::new(&mut focal_length)
+                                                                    .speed(0.05)
+                                                                    .range(0.25..=1024.0)
+                                                                    .prefix("Focal length  "),
+                                                            )
+                                                            .changed();
+                                                        optics_changed |= ui
+                                                            .add(
+                                                                egui::DragValue::new(&mut hole_radius)
+                                                                    .speed(0.01)
+                                                                    .range(0.0..=aperture * 0.9)
+                                                                    .prefix("Central hole radius  "),
+                                                            )
+                                                            .changed();
+
+                                                        aperture = aperture.max(0.1);
+                                                        focal_length = focal_length.max(0.25);
+                                                        hole_radius = hole_radius.clamp(0.0, aperture * 0.9);
+                                                        sphere_scale.x = aperture / sphere_radius;
+                                                        sphere_scale.y = aperture / sphere_radius;
+                                                        sphere_scale.z = aperture * aperture
+                                                            / (8.0 * focal_length * sphere_radius);
+                                                        uniforms.lens_params[3] = hole_radius;
+                                                        let primary_f_number =
+                                                            focal_length / (2.0 * aperture);
+                                                        ui.label(format!(
+                                                            "Primary: f/{:.2}",
+                                                            primary_f_number
+                                                        ));
+                                                        if let Some(target_position) =
+                                                            primitive_shape_by_id.iter().find_map(
+                                                                |(id, shape)| {
+                                                                    if *shape
+                                                                        == PrimitiveShape::ImagePlane
+                                                                    {
+                                                                        main_db.objects
+                                                                            .get(id)
+                                                                            .map(|obj| {
+                                                                                obj.transform.location
+                                                                            })
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                },
+                                                            )
+                                                        {
+                                                            let primary_axis = (sphere_rotation
+                                                                * glam::Vec3::Z)
+                                                                .normalize_or_zero();
+                                                            let primary_center = glam::Vec3::new(
+                                                                uniforms.sphere_pos[0],
+                                                                uniforms.sphere_pos[1],
+                                                                uniforms.sphere_pos[2],
+                                                            );
+                                                            let vertex = primary_center
+                                                                - primary_axis
+                                                                    * (sphere_radius
+                                                                        * sphere_scale.z);
+                                                            let object_distance = (target_position
+                                                                - vertex)
+                                                                .dot(primary_axis)
+                                                                .abs()
+                                                                .max(focal_length + 0.01);
+                                                            let finite_image_distance = 1.0
+                                                                / (1.0 / focal_length
+                                                                    - 1.0 / object_distance);
+                                                            ui.label(format!(
+                                                                "Target: {:.1} focal lengths away (focus shift {:.3})",
+                                                                object_distance / focal_length,
+                                                                finite_image_distance - focal_length
+                                                            ));
+                                                        }
+                                                        if let Some(secondary_params) =
+                                                            primitive_shape_by_id.iter().find_map(
+                                                                |(id, shape)| {
+                                                                    if *shape
+                                                                        == PrimitiveShape::HyperbolicMirror
+                                                                    {
+                                                                        primitive_lens_params_by_id
+                                                                            .get(id)
+                                                                            .copied()
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                },
+                                                            )
+                                                        {
+                                                            let a = secondary_params[0].max(0.01);
+                                                            let b = secondary_params[1].max(0.01);
+                                                            let c = (a * a + b * b).sqrt();
+                                                            let secondary_magnification =
+                                                                ((c + a) / (c - a).max(0.01))
+                                                                    .max(1.0);
+                                                            ui.label(format!(
+                                                                "Effective system: f/{:.2} ({:.2}x secondary)",
+                                                                primary_f_number
+                                                                    * secondary_magnification,
+                                                                secondary_magnification
+                                                            ));
+                                                        }
+                                                    }
+                                                    PrimitiveShape::HyperbolicMirror => {
+                                                        let mut hyperbola_a =
+                                                            uniforms.lens_params[0].max(0.01);
+                                                        let mut hyperbola_b =
+                                                            uniforms.lens_params[1].max(0.01);
+                                                        let mut clear_radius =
+                                                            uniforms.lens_params[2].max(0.05);
+
+                                                        ui.separator();
+                                                        ui.label("Hyperbolic secondary");
+                                                        optics_changed |= ui
+                                                            .add(
+                                                                egui::DragValue::new(&mut hyperbola_a)
+                                                                    .speed(0.02)
+                                                                    .range(0.01..=512.0)
+                                                                    .prefix("Hyperbola a  "),
+                                                            )
+                                                            .changed();
+                                                        optics_changed |= ui
+                                                            .add(
+                                                                egui::DragValue::new(&mut hyperbola_b)
+                                                                    .speed(0.02)
+                                                                    .range(0.01..=512.0)
+                                                                    .prefix("Hyperbola b  "),
+                                                            )
+                                                            .changed();
+                                                        optics_changed |= ui
+                                                            .add(
+                                                                egui::DragValue::new(&mut clear_radius)
+                                                                    .speed(0.01)
+                                                                    .range(0.05..=64.0)
+                                                                    .prefix("Clear radius  "),
+                                                            )
+                                                            .changed();
+
+                                                        let c = (hyperbola_a * hyperbola_a
+                                                            + hyperbola_b * hyperbola_b)
+                                                            .sqrt();
+                                                        let sag = hyperbola_a
+                                                            * ((1.0
+                                                                + clear_radius * clear_radius
+                                                                    / (hyperbola_b * hyperbola_b))
+                                                                .sqrt()
+                                                                - 1.0);
+                                                        uniforms.lens_params = [
+                                                            hyperbola_a,
+                                                            hyperbola_b,
+                                                            clear_radius,
+                                                            0.0,
+                                                        ];
+                                                        sphere_scale.x = clear_radius / sphere_radius;
+                                                        sphere_scale.y = clear_radius / sphere_radius;
+                                                        sphere_scale.z = sag.max(0.001) / sphere_radius;
+                                                        ui.label(format!(
+                                                            "Focus spacing: {:.3}   Sag: {:.3}",
+                                                            2.0 * c,
+                                                            sag
+                                                        ));
+                                                    }
+                                                    _ => {}
+                                                }
+
+                                                if optics_changed {
+                                                    primitive_lens_params_by_id.insert(
+                                                        selected_primitive_id,
+                                                        uniforms.lens_params,
+                                                    );
+                                                    uniforms.sphere_extent = [
+                                                        sphere_radius * sphere_scale.x,
+                                                        sphere_radius * sphere_scale.y,
+                                                        sphere_radius * sphere_scale.z,
+                                                        0.0,
+                                                    ];
+                                                    accumulation_dirty = true;
+                                                }
+                                            });
+                                        }
                                         ui.separator();
                                         ui.collapsing("Sun", |ui| {
                                             ui.add(egui::Slider::new(&mut sun_azimuth_deg, -180.0..=180.0).text("Azimuth"));
@@ -2899,6 +3481,78 @@ pub async fn run() {
                                                     wine_spotlight_elevation_deg,
                                                     wine_spotlight_distance,
                                                 );
+                                            }
+                                        });
+                                        ui.collapsing("Camera", |ui| {
+                                            let fov_changed = ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut camera_fov_deg,
+                                                        10.0..=120.0,
+                                                    )
+                                                    .text("Field of view")
+                                                    .suffix(" deg"),
+                                                )
+                                                .changed();
+                                            if fov_changed {
+                                                let projection = glam::Mat4::perspective_rh(
+                                                    camera_fov_deg.to_radians(),
+                                                    config.width as f32 / config.height.max(1) as f32,
+                                                    0.1,
+                                                    10_000.0,
+                                                );
+                                                uniforms.proj_inv =
+                                                    projection.inverse().to_cols_array_2d();
+                                                accumulation_dirty = true;
+                                            }
+                                            let rear_collimator_id = main_db.objects.iter().find_map(
+                                                |(id, obj)| {
+                                                    if obj.name == "Rear Collimator Lens" {
+                                                        Some(*id)
+                                                    } else {
+                                                        None
+                                                    }
+                                                },
+                                            );
+                                            if let Some(collimator_id) = rear_collimator_id {
+                                                ui.separator();
+                                                let previous_focus = cassegrain_focus_offset;
+                                                let mut focus_changed = ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut cassegrain_focus_offset,
+                                                            -2.0..=2.0,
+                                                        )
+                                                        .text("Cassegrain focus")
+                                                        .suffix(" units"),
+                                                    )
+                                                    .changed();
+                                                if ui.button("Reset focus").clicked() {
+                                                    cassegrain_focus_offset = 0.0;
+                                                    focus_changed = true;
+                                                }
+                                                if focus_changed {
+                                                    let focus_delta =
+                                                        cassegrain_focus_offset - previous_focus;
+                                                    if let Some(obj) =
+                                                        main_db.objects.get_mut(&collimator_id)
+                                                    {
+                                                        let focus_axis = (obj.transform.rotation
+                                                            * glam::Vec3::Z)
+                                                            .normalize_or_zero();
+                                                        obj.transform.location +=
+                                                            focus_axis * focus_delta;
+                                                        if selected_primitive_id == collimator_id {
+                                                            uniforms.sphere_pos[0] =
+                                                                obj.transform.location.x;
+                                                            uniforms.sphere_pos[1] =
+                                                                obj.transform.location.y;
+                                                            uniforms.sphere_pos[2] =
+                                                                obj.transform.location.z;
+                                                        }
+                                                    }
+                                                    accumulation_dirty = true;
+                                                }
                                             }
                                         });
                                         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -3052,10 +3706,10 @@ pub async fn run() {
 
                             let view = camera.view_matrix();
                             let projection = glam::Mat4::perspective_rh(
-                                std::f32::consts::FRAC_PI_3 * 1.2,
+                                camera_fov_deg.to_radians(),
                                 config.width as f32 / config.height as f32,
                                 0.1,
-                                1000.0,
+                                10_000.0,
                             );
                             let pixels_per_point = ctx.pixels_per_point().max(1.0);
                             let screen_rect = ctx.input(|i| i.screen_rect());
@@ -3479,6 +4133,14 @@ pub async fn run() {
                                                 .max(uniforms.sphere_extent[1])
                                                 .max(uniforms.sphere_extent[2]),
                                         ),
+                                        PrimitiveShape::HyperbolicMirror => intersect_sphere(
+                                            ro,
+                                            rd,
+                                            sphere_center,
+                                            uniforms.sphere_extent[0]
+                                                .max(uniforms.sphere_extent[1])
+                                                .max(uniforms.sphere_extent[2]),
+                                        ),
                                         PrimitiveShape::ImagePlane => intersect_cube(
                                             ro,
                                             rd,
@@ -3654,6 +4316,7 @@ pub async fn run() {
                                     && matches!(
                                         primitive_shape,
                                         PrimitiveShape::SphericalLens | PrimitiveShape::ParabolicMirror
+                                            | PrimitiveShape::HyperbolicMirror
                                     )
                                 {
                                     let display = [display_size[0].max(1.0), display_size[1].max(1.0)];
@@ -3704,28 +4367,36 @@ pub async fn run() {
                                             } else {
                                                 120.0
                                             };
-                                            let image_source = main_db
-                                                .scene_visible_selectable_objects(match scene_kind {
-                                                    SceneKind::Decanter => decanter_scene_id,
-                                                    SceneKind::Wine => wine_scene_id,
-                                                    SceneKind::CornellBox => cornell_scene_id,
-                                                })
-                                                .into_iter()
-                                                .filter(|id| *id != selected_primitive_id)
-                                                .find_map(|id| {
-                                                    if primitive_shape_by_id.get(&id).copied()
-                                                        != Some(PrimitiveShape::ImagePlane)
-                                                    {
-                                                        return None;
-                                                    }
-                                                    main_db.objects.get(&id).map(|obj| {
-                                                        (
-                                                            obj.transform.location,
-                                                            obj.transform.rotation,
-                                                            obj.transform.scale,
-                                                        )
+                                            let is_newtonian_focuser = main_db
+                                                .objects
+                                                .get(&selected_primitive_id)
+                                                .is_some_and(|obj| obj.name == "Focuser Lens");
+                                            let image_source = if is_newtonian_focuser {
+                                                None
+                                            } else {
+                                                main_db
+                                                    .scene_visible_selectable_objects(match scene_kind {
+                                                        SceneKind::Decanter => decanter_scene_id,
+                                                        SceneKind::Wine => wine_scene_id,
+                                                        SceneKind::CornellBox => cornell_scene_id,
                                                     })
-                                                });
+                                                    .into_iter()
+                                                    .filter(|id| *id != selected_primitive_id)
+                                                    .find_map(|id| {
+                                                        if primitive_shape_by_id.get(&id).copied()
+                                                            != Some(PrimitiveShape::ImagePlane)
+                                                        {
+                                                            return None;
+                                                        }
+                                                        main_db.objects.get(&id).map(|obj| {
+                                                            (
+                                                                obj.transform.location,
+                                                                obj.transform.rotation,
+                                                                obj.transform.scale,
+                                                            )
+                                                        })
+                                                    })
+                                            };
                                             if let Some((image_center, image_rotation, image_scale)) = image_source {
                                                 let scene_id = match scene_kind {
                                                     SceneKind::Decanter => decanter_scene_id,
@@ -3883,6 +4554,38 @@ pub async fn run() {
                                                     }
                                                 }
                                             } else {
+                                                if is_newtonian_focuser {
+                                                    let focus = primitive_center - axis * focal_length;
+                                                    if let Some(fp) =
+                                                        world_to_screen(focus, view, projection, display)
+                                                    {
+                                                        painter.circle_filled(
+                                                            Pos2::new(fp[0], fp[1]),
+                                                            4.0,
+                                                            focus_color,
+                                                        );
+                                                    }
+                                                    let front_plane =
+                                                        primitive_center - axis * (thickness * 0.5);
+                                                    let back_plane =
+                                                        primitive_center + axis * (thickness * 0.5);
+                                                    for i in 0..ray_count {
+                                                        let t = i as f32 / denom;
+                                                        let offset = (t * 2.0 - 1.0) * aperture;
+                                                        let front_hit = front_plane + tangent * offset;
+                                                        let back_hit = back_plane + tangent * offset;
+                                                        let start = focus;
+                                                        let out = back_hit + axis * (aperture * 3.0 + focal_length);
+                                                        draw_segment(
+                                                            start,
+                                                            front_hit,
+                                                            Color32::from_rgb(255, 170, 90),
+                                                            1.5,
+                                                        );
+                                                        draw_segment(front_hit, back_hit, incoming_color, 1.0);
+                                                        draw_segment(back_hit, out, outgoing_color, 1.5);
+                                                    }
+                                                } else {
                                                 let front_plane = primitive_center - axis * (thickness * 0.5);
                                                 let back_plane = primitive_center + axis * (thickness * 0.5);
                                                 let focus = primitive_center + axis * focal_length;
@@ -3899,6 +4602,7 @@ pub async fn run() {
                                                     draw_segment(front_hit, back_hit, incoming_color, 1.0);
                                                     draw_segment(back_hit, focus, outgoing_color, 1.6);
                                                 }
+                                                }
                                             }
                                         }
                                         PrimitiveShape::ParabolicMirror => {
@@ -3908,10 +4612,271 @@ pub async fn run() {
                                             let depth = uniforms.sphere_extent[2].max(0.1);
                                             let focal_length = (radius * radius / (8.0 * depth)).max(0.1);
                                             let vertex = primitive_center - axis * depth;
-                                            let focus = vertex + axis * focal_length;
+                                            let scene_id = match scene_kind {
+                                                SceneKind::Decanter => decanter_scene_id,
+                                                SceneKind::Wine => wine_scene_id,
+                                                SceneKind::CornellBox => cornell_scene_id,
+                                            };
+                                            let visible_ids =
+                                                main_db.scene_visible_selectable_objects(scene_id);
+                                            let focus = visible_ids
+                                                .iter()
+                                                .find_map(|id| {
+                                                    if primitive_shape_by_id.get(id).copied()
+                                                        != Some(PrimitiveShape::ImagePlane)
+                                                    {
+                                                        return None;
+                                                    }
+                                                    let obj = main_db.objects.get(id)?;
+                                                    let object_distance =
+                                                        (obj.transform.location - vertex).dot(axis);
+                                                    if object_distance <= focal_length + 0.01 {
+                                                        return None;
+                                                    }
+                                                    let image_distance = 1.0
+                                                        / (1.0 / focal_length
+                                                            - 1.0 / object_distance)
+                                                            .max(0.001);
+                                                    Some(vertex + axis * image_distance)
+                                                })
+                                                .unwrap_or(vertex + axis * focal_length);
+                                            let secondary = visible_ids.iter().find_map(|id| {
+                                                let obj = main_db.objects.get(id)?;
+                                                if obj.name.contains("Secondary Mirror") {
+                                                    Some((
+                                                        obj.transform.location,
+                                                        (obj.transform.rotation * glam::Vec3::Z)
+                                                            .normalize_or_zero(),
+                                                    ))
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                            let focuser = visible_ids.iter().find_map(|id| {
+                                                let obj = main_db.objects.get(id)?;
+                                                if obj.name == "Focuser Lens" {
+                                                    Some(obj.transform.location)
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                            let cassegrain_secondary = visible_ids.iter().find_map(|id| {
+                                                if primitive_shape_by_id.get(id).copied()
+                                                    != Some(PrimitiveShape::HyperbolicMirror)
+                                                {
+                                                    return None;
+                                                }
+                                                let obj = main_db.objects.get(id)?;
+                                                let params = primitive_lens_params_by_id.get(id).copied()?;
+                                                Some((
+                                                    obj.transform.location,
+                                                    (obj.transform.rotation * glam::Vec3::Z)
+                                                        .normalize_or_zero(),
+                                                    params,
+                                                ))
+                                            });
+                                            let rear_collimator = visible_ids.iter().find_map(|id| {
+                                                let obj = main_db.objects.get(id)?;
+                                                if obj.name != "Rear Collimator Lens" {
+                                                    return None;
+                                                }
+                                                let params = primitive_lens_params_by_id
+                                                    .get(id)
+                                                    .copied()
+                                                    .unwrap_or(uniforms.lens_params);
+                                                let mat_name = object_material_names
+                                                    .get(id)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| "Glass".to_string());
+                                                let preview = material_runtime_overrides
+                                                    .get(&mat_name)
+                                                    .copied()
+                                                    .unwrap_or_else(|| {
+                                                        preview_from_material_data(
+                                                            material_library.get(&mat_name),
+                                                        )
+                                                    });
+                                                let ior = preview.ior.max(1.01);
+                                                let power = (ior - 1.0)
+                                                    * (1.0 / params[0].max(0.25)
+                                                        + 1.0 / params[1].max(0.25)
+                                                        - ((ior - 1.0) * params[2].max(0.05))
+                                                            / (ior
+                                                                * params[0].max(0.25)
+                                                                * params[1].max(0.25)));
+                                                Some((
+                                                    obj.transform.location,
+                                                    (obj.transform.rotation * glam::Vec3::Z)
+                                                        .normalize_or_zero(),
+                                                    if power.abs() > 1e-4 {
+                                                        1.0 / power
+                                                    } else {
+                                                        120.0
+                                                    },
+                                                ))
+                                            });
+                                            let puppy_source = visible_ids.iter().find_map(|id| {
+                                                if primitive_shape_by_id.get(id).copied()
+                                                    != Some(PrimitiveShape::ImagePlane)
+                                                {
+                                                    return None;
+                                                }
+                                                let obj = main_db.objects.get(id)?;
+                                                Some((
+                                                    obj.transform.location,
+                                                    (obj.transform.rotation * glam::Vec3::Y)
+                                                        .normalize_or_zero(),
+                                                    (sphere_radius * obj.transform.scale.y).max(0.1),
+                                                ))
+                                            });
                                             if let Some(fp) = world_to_screen(focus, view, projection, display) {
                                                 painter.circle_filled(Pos2::new(fp[0], fp[1]), 4.0, focus_color);
                                             }
+                                            let cassegrain_bundle = if optical_trace_image_area {
+                                                match (
+                                                    cassegrain_secondary,
+                                                    rear_collimator,
+                                                    puppy_source,
+                                                ) {
+                                                    (Some(secondary), Some(collimator), Some(source)) => {
+                                                        Some((secondary, collimator, source))
+                                                    }
+                                                    _ => None,
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                            if let Some((
+                                                    (secondary_center, secondary_axis, hyperbola),
+                                                    (collimator_center, collimator_axis, collimator_focal),
+                                                    (source_center, _source_tangent, source_half_height),
+                                                )) = cassegrain_bundle
+                                            {
+                                                let hyperbola_a = hyperbola[0].max(0.01);
+                                                let hyperbola_b = hyperbola[1].max(0.01);
+                                                let hyperbola_c = (hyperbola_a * hyperbola_a
+                                                    + hyperbola_b * hyperbola_b)
+                                                    .sqrt();
+                                                let prime_focus = secondary_center
+                                                    + secondary_axis * (hyperbola_c - hyperbola_a);
+                                                let rear_focus = secondary_center
+                                                    - secondary_axis * (hyperbola_c + hyperbola_a);
+                                                let object_distance =
+                                                    (source_center - vertex).dot(axis).abs().max(0.1);
+                                                let primary_image_distance =
+                                                    (prime_focus - vertex).dot(axis).abs().max(0.1);
+                                                let secondary_magnification =
+                                                    ((rear_focus - secondary_center).length()
+                                                        / (prime_focus - secondary_center).length().max(0.01))
+                                                        .max(0.1);
+                                                let area_samples = [
+                                                    (-0.65_f32, Color32::from_rgb(255, 95, 90)),
+                                                    (0.0_f32, Color32::from_rgb(255, 230, 105)),
+                                                    (0.65_f32, Color32::from_rgb(90, 205, 255)),
+                                                ];
+
+                                                for (source_t, color) in area_samples {
+                                                    let source_offset = source_t * source_half_height;
+                                                    let incoming_direction = (-axis
+                                                        - tangent
+                                                            * (source_offset / object_distance))
+                                                        .normalize_or_zero();
+                                                    let prime_offset =
+                                                        -source_offset * primary_image_distance / object_distance;
+                                                    let prime_image = prime_focus + tangent * prime_offset;
+                                                    let rear_offset =
+                                                        prime_offset * secondary_magnification;
+                                                    let rear_image = rear_focus + tangent * rear_offset;
+
+                                                    for i in 0..ray_count {
+                                                        let t = i as f32 / denom;
+                                                        let offset = (t * 2.0 - 1.0) * aperture;
+                                                        let radial = offset.abs().min(radius * 0.98);
+                                                        let z = -depth
+                                                            + (radial * radial) / (4.0 * focal_length);
+                                                        let mirror_hit = primitive_center
+                                                            + axis * z
+                                                            + tangent * offset;
+                                                        let toward_prime = prime_image - mirror_hit;
+                                                        let plane_denom = toward_prime.dot(secondary_axis);
+                                                        if plane_denom.abs() < 1e-5 {
+                                                            continue;
+                                                        }
+                                                        let secondary_t = (secondary_center - mirror_hit)
+                                                            .dot(secondary_axis)
+                                                            / plane_denom;
+                                                        if secondary_t <= 0.0 || secondary_t >= 1.0 {
+                                                            continue;
+                                                        }
+                                                        let secondary_hit =
+                                                            mirror_hit + toward_prime * secondary_t;
+                                                        let after_secondary =
+                                                            (rear_image - secondary_hit).normalize_or_zero();
+                                                        let collimator_denom =
+                                                            after_secondary.dot(collimator_axis);
+                                                        if collimator_denom.abs() < 1e-5 {
+                                                            continue;
+                                                        }
+                                                        let collimator_t = (collimator_center
+                                                            - secondary_hit)
+                                                            .dot(collimator_axis)
+                                                            / collimator_denom;
+                                                        if collimator_t <= 0.0 {
+                                                            continue;
+                                                        }
+                                                        let collimator_hit = secondary_hit
+                                                            + after_secondary * collimator_t;
+                                                        let collimated_dir = (collimator_axis
+                                                            - tangent
+                                                                * (rear_offset
+                                                                    / collimator_focal.abs().max(0.1)))
+                                                            .normalize_or_zero();
+                                                        let out = collimator_hit
+                                                            + collimated_dir * (radius * 2.5);
+
+                                                        let ray_start = mirror_hit
+                                                            - incoming_direction * object_distance;
+                                                        draw_segment(
+                                                            ray_start,
+                                                            mirror_hit,
+                                                            color,
+                                                            1.0,
+                                                        );
+                                                        draw_segment(
+                                                            mirror_hit,
+                                                            secondary_hit,
+                                                            color,
+                                                            1.4,
+                                                        );
+                                                        draw_segment(
+                                                            secondary_hit,
+                                                            rear_image,
+                                                            color,
+                                                            1.6,
+                                                        );
+                                                        draw_segment(
+                                                            rear_image,
+                                                            collimator_hit,
+                                                            color,
+                                                            1.4,
+                                                        );
+                                                        draw_segment(collimator_hit, out, color, 1.6);
+                                                    }
+
+                                                    if let Some(fp) = world_to_screen(
+                                                        rear_image,
+                                                        view,
+                                                        projection,
+                                                        display,
+                                                    ) {
+                                                        painter.circle_filled(
+                                                            Pos2::new(fp[0], fp[1]),
+                                                            3.5,
+                                                            color,
+                                                        );
+                                                    }
+                                                }
+                                            } else {
                                             for i in 0..ray_count {
                                                 let t = i as f32 / denom;
                                                 let offset = (t * 2.0 - 1.0) * aperture;
@@ -3920,7 +4885,55 @@ pub async fn run() {
                                                 let mirror_hit = primitive_center + axis * z + tangent * offset;
                                                 let start = mirror_hit + axis * (aperture * 2.5 + depth);
                                                 draw_segment(start, mirror_hit, incoming_color, 1.4);
-                                                draw_segment(mirror_hit, focus, outgoing_color, 1.6);
+                                                if let (Some((secondary_center, secondary_normal)), Some(focuser_pos)) =
+                                                    (secondary, focuser)
+                                                {
+                                                    let to_focus = focus - mirror_hit;
+                                                    let secondary_denom = to_focus.dot(secondary_normal);
+                                                    let secondary_t = if secondary_denom.abs() > 1e-4 {
+                                                        (secondary_center - mirror_hit)
+                                                            .dot(secondary_normal)
+                                                            / secondary_denom
+                                                    } else {
+                                                        1.0
+                                                    }
+                                                    .clamp(0.0, 1.0);
+                                                    let secondary_hit =
+                                                        mirror_hit + to_focus * secondary_t;
+                                                    let incoming_dir = to_focus.normalize_or_zero();
+                                                    let face_n = if incoming_dir.dot(secondary_normal) > 0.0 {
+                                                        -secondary_normal
+                                                    } else {
+                                                        secondary_normal
+                                                    };
+                                                    let folded_dir = (incoming_dir
+                                                        - 2.0 * incoming_dir.dot(face_n) * face_n)
+                                                        .normalize_or_zero();
+                                                    let remaining = (focus - secondary_hit).length();
+                                                    let folded_focus =
+                                                        secondary_hit + folded_dir * remaining;
+                                                    draw_segment(
+                                                        mirror_hit,
+                                                        secondary_hit,
+                                                        outgoing_color,
+                                                        1.6,
+                                                    );
+                                                    draw_segment(
+                                                        secondary_hit,
+                                                        folded_focus,
+                                                        Color32::from_rgb(255, 170, 90),
+                                                        1.6,
+                                                    );
+                                                    draw_segment(
+                                                        folded_focus,
+                                                        focuser_pos,
+                                                        Color32::from_rgb(170, 120, 255),
+                                                        1.4,
+                                                    );
+                                                } else {
+                                                    draw_segment(mirror_hit, focus, outgoing_color, 1.6);
+                                                }
+                                            }
                                             }
                                         }
                                         _ => {}
@@ -4333,6 +5346,7 @@ pub async fn run() {
                                         PrimitiveShape::ParabolicMirror => 2.0,
                                         PrimitiveShape::SphericalLens => 3.0,
                                         PrimitiveShape::ImagePlane => 4.0,
+                                        PrimitiveShape::HyperbolicMirror => 5.0,
                                     },
                                 ];
                                 if shape == PrimitiveShape::ImagePlane {

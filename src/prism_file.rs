@@ -348,7 +348,10 @@ pub fn load_prism_file(path: &Path, compressed: bool) -> std::io::Result<Vec<Pri
     let mut index_bytes = vec![0u8; index_len as usize];
     cursor.read_exact(&mut index_bytes)?;
     let index: Vec<IndexEntry> = bincode::deserialize(&index_bytes).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("index decode: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("index decode: {e}"),
+        )
     })?;
 
     let data = cursor.into_inner();
@@ -366,7 +369,10 @@ pub fn load_prism_file(path: &Path, compressed: bool) -> std::io::Result<Vec<Pri
         }
         let block: PrismFileBlock =
             bincode::deserialize(&data[data_start..data_end]).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("block decode: {e}"))
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("block decode: {e}"),
+                )
             })?;
         blocks.push(block);
     }
@@ -393,27 +399,42 @@ pub fn load_prism_database(path: &Path, compressed: bool) -> std::io::Result<Pri
         match block.block_type.as_str() {
             "MESH" => {
                 stable_meshes = bincode::deserialize(&block.data_payload).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("MESH decode: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("MESH decode: {e}"),
+                    )
                 })?;
             }
             "MATR" => {
                 stable_materials = bincode::deserialize(&block.data_payload).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("MATR decode: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("MATR decode: {e}"),
+                    )
                 })?;
             }
             "OBJD" => {
                 stable_objects = bincode::deserialize(&block.data_payload).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("OBJD decode: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("OBJD decode: {e}"),
+                    )
                 })?;
             }
             "COLL" => {
                 stable_collections = bincode::deserialize(&block.data_payload).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("COLL decode: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("COLL decode: {e}"),
+                    )
                 })?;
             }
             "SCEN" => {
                 stable_scenes = bincode::deserialize(&block.data_payload).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("SCEN decode: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("SCEN decode: {e}"),
+                    )
                 })?;
             }
             _ => {}

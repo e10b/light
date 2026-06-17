@@ -125,6 +125,7 @@ fn quat_mul_vec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
 }
 
 fn primitive_shape_for(params: vec4<f32>) -> u32 {
+  if (params.w >= 4.5) { return 5u; }
   if (params.w >= 3.5) { return 4u; }
   if (params.w >= 2.5) { return 3u; }
   if (params.w >= 1.5) { return 2u; }
@@ -177,8 +178,9 @@ fn image_plane_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_exte
   return 1e38;
 }
 
-fn parabolic_mirror_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>) -> f32 {
+fn parabolic_mirror_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>, hole_radius: f32) -> f32 {
   let radius = max(max(half_extent.x, half_extent.y), 1e-4);
+  let hole2 = max(hole_radius, 0.0) * max(hole_radius, 0.0);
   let depth = max(half_extent.z, 1e-4);
   let focal_length = (radius * radius) / (8.0 * depth);
   let a = direction.x * direction.x + direction.y * direction.y;
@@ -191,10 +193,47 @@ fn parabolic_mirror_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half
   let sq = sqrt(disc);
   let t0 = (-b - sq) / (2.0 * a);
   let p0 = origin + direction * t0;
-  if (t0 > 0.001 && dot(p0.xy, p0.xy) <= radius * radius && p0.z >= -depth && p0.z <= depth) { best_t = t0; }
+  let r0 = dot(p0.xy, p0.xy);
+  if (t0 > 0.001 && r0 >= hole2 && r0 <= radius * radius && p0.z >= -depth && p0.z <= depth) { best_t = t0; }
   let t1 = (-b + sq) / (2.0 * a);
   let p1 = origin + direction * t1;
-  if (t1 > 0.001 && t1 < best_t && dot(p1.xy, p1.xy) <= radius * radius && p1.z >= -depth && p1.z <= depth) { best_t = t1; }
+  let r1 = dot(p1.xy, p1.xy);
+  if (t1 > 0.001 && t1 < best_t && r1 >= hole2 && r1 <= radius * radius && p1.z >= -depth && p1.z <= depth) { best_t = t1; }
+  return best_t;
+}
+
+fn hyperbolic_mirror_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>, lens: vec4<f32>) -> f32 {
+  let a = max(abs(lens.x), 1e-4);
+  let b = max(abs(lens.y), 1e-4);
+  let a2 = a * a;
+  let b2 = b * b;
+  let shifted_z = origin.z + a;
+  let qa = direction.z * direction.z / a2
+    - (direction.x * direction.x + direction.y * direction.y) / b2;
+  let qb = 2.0 * (shifted_z * direction.z / a2
+    - (origin.x * direction.x + origin.y * direction.y) / b2);
+  let qc = shifted_z * shifted_z / a2
+    - (origin.x * origin.x + origin.y * origin.y) / b2
+    - 1.0;
+  let disc = qb * qb - 4.0 * qa * qc;
+  if (disc < 0.0 || abs(qa) < 1e-7) { return 1e38; }
+  let root = sqrt(disc);
+  let t0 = (-qb - root) / (2.0 * qa);
+  let t1 = (-qb + root) / (2.0 * qa);
+  let radius = max(max(half_extent.x, half_extent.y), 1e-4);
+  let aperture2 = radius * radius;
+  let max_sag = max(half_extent.z * 1.5, 0.02);
+  var best_t = 1e38;
+  let p0 = origin + direction * t0;
+  let r0 = dot(p0.xy, p0.xy);
+  if (t0 > 0.001 && p0.z >= -0.001 && p0.z <= max_sag && r0 <= aperture2) {
+    best_t = t0;
+  }
+  let p1 = origin + direction * t1;
+  let r1 = dot(p1.xy, p1.xy);
+  if (t1 > 0.001 && t1 < best_t && p1.z >= -0.001 && p1.z <= max_sag && r1 <= aperture2) {
+    best_t = t1;
+  }
   return best_t;
 }
 
@@ -257,15 +296,25 @@ fn spherical_lens_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_e
 
 fn primitive_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> f32 {
   let shape = primitive_shape_for(params);
+  if (shape == 5u) { return hyperbolic_mirror_intersection_t(origin, direction, half_extent, lens); }
   if (shape == 4u) { return image_plane_intersection_t(origin, direction, half_extent); }
   if (shape == 3u) { return spherical_lens_intersection_t(origin, direction, half_extent, lens); }
-  if (shape == 2u) { return parabolic_mirror_intersection_t(origin, direction, half_extent); }
+  if (shape == 2u) { return parabolic_mirror_intersection_t(origin, direction, half_extent, lens.w); }
   if (shape == 1u) { return sphere_intersection_t(origin, direction, vec3<f32>(0.0), max(max(half_extent.x, half_extent.y), half_extent.z)); }
   return cube_intersection_t(origin, direction, half_extent);
 }
 
 fn primitive_normal(local_hit: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> vec3<f32> {
   let shape = primitive_shape_for(params);
+  if (shape == 5u) {
+    let a = max(abs(lens.x), 1e-4);
+    let b = max(abs(lens.y), 1e-4);
+    return normalize(vec3<f32>(
+      -local_hit.x / (b * b),
+      -local_hit.y / (b * b),
+      (local_hit.z + a) / (a * a)
+    ));
+  }
   if (shape == 4u) { return vec3<f32>(0.0, 0.0, select(-1.0, 1.0, local_hit.z >= 0.0)); }
   if (shape == 3u) {
     let base_aperture = max(max(half_extent.x, half_extent.y), 1e-4);
@@ -321,18 +370,23 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
 
       var lens_target = ro + image_forward * 30.0;
       var nearest_optic_z = 1e38;
+      var found_primary_mirror = false;
       for (var li = 0u; li < primitive_limit; li = li + 1u) {
         let lens_data = primitive_block.items[li];
         let target_shape = primitive_shape_for(lens_data.params);
         if (target_shape == 2u || target_shape == 3u) {
           let optic_z = dot(lens_data.pos.xyz - ro, image_forward);
-          if (optic_z > 0.05 && optic_z < nearest_optic_z) {
+          let is_primary_mirror = target_shape == 2u;
+          let better_primary = is_primary_mirror && !found_primary_mirror;
+          let better_distance = is_primary_mirror == found_primary_mirror && optic_z < nearest_optic_z;
+          if (optic_z > 0.05 && (better_primary || better_distance)) {
             let lens_x = quat_mul_vec(lens_data.rot, vec3<f32>(1.0, 0.0, 0.0));
             let lens_y = quat_mul_vec(lens_data.rot, vec3<f32>(0.0, 1.0, 0.0));
             let aperture_radius = max(max(lens_data.extent.x, lens_data.extent.y) * 0.82, 0.05);
             let aperture_sample = disk_sample(gid.x * 6553u + uniforms.frame * 379u + li * 17u, aperture_radius);
             lens_target = lens_data.pos.xyz + lens_x * aperture_sample.x + lens_y * aperture_sample.y;
             nearest_optic_z = optic_z;
+            found_primary_mirror = found_primary_mirror || is_primary_mirror;
           }
         }
       }
@@ -404,7 +458,7 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
       let hit_pos = ro + rd * primitive_t;
       let transmission = clamp(prim_data.color.w, 0.0, 1.0);
 
-      if (shape == 2u) {
+      if (shape == 2u || shape == 5u) {
         let face_n = select(normal, -normal, dot(rd, normal) > 0.0);
         rd = normalize(reflect(rd, face_n));
         ro = hit_pos + rd * 0.01;

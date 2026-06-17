@@ -204,7 +204,8 @@ impl MaterialGraphEditor {
                 |graph, nid| match shader_node.node_type {
                     NodeType::FloatInput => {
                         let value = shader_node.properties.float_value.unwrap_or(0.0);
-                        let out = graph.add_output_param(nid, "Value".to_string(), SocketType::Scalar);
+                        let out =
+                            graph.add_output_param(nid, "Value".to_string(), SocketType::Scalar);
                         output_sockets.insert((nid, "Value".to_string()), out);
                         let _ = graph.add_input_param(
                             nid,
@@ -234,7 +235,8 @@ impl MaterialGraphEditor {
                             true,
                         );
                         input_sockets.insert((nid, "B".to_string()), b);
-                        let out = graph.add_output_param(nid, "Value".to_string(), SocketType::Scalar);
+                        let out =
+                            graph.add_output_param(nid, "Value".to_string(), SocketType::Scalar);
                         output_sockets.insert((nid, "Value".to_string()), out);
                     }
                     NodeType::PrincipledBSDF => {
@@ -276,7 +278,8 @@ impl MaterialGraphEditor {
                             true,
                         );
                         input_sockets.insert((nid, "IOR".to_string()), ior);
-                        let out = graph.add_output_param(nid, "BSDF".to_string(), SocketType::Shader);
+                        let out =
+                            graph.add_output_param(nid, "BSDF".to_string(), SocketType::Shader);
                         output_sockets.insert((nid, "BSDF".to_string()), out);
                     }
                     NodeType::MaterialOutput => {

@@ -50,7 +50,11 @@ pub fn load_gltf_mesh(path: &Path) -> Result<MeshData, Box<dyn std::error::Error
         if looks_wine {
             base_color = [0.42, 0.015, 0.025, 0.78];
         }
-        let transmission = if looks_glass || base_color[3] < 0.99 { 1.0 } else { 0.0 };
+        let transmission = if looks_glass || base_color[3] < 0.99 {
+            1.0
+        } else {
+            0.0
+        };
         if transmission > 0.5 {
             any_likely_glass = true;
         }
@@ -137,7 +141,10 @@ pub fn load_gltf_mesh(path: &Path) -> Result<MeshData, Box<dyn std::error::Error
                     let i0 = tri[0] as usize;
                     let i1 = tri[1] as usize;
                     let i2 = tri[2] as usize;
-                    if i0 < local_positions.len() && i1 < local_positions.len() && i2 < local_positions.len() {
+                    if i0 < local_positions.len()
+                        && i1 < local_positions.len()
+                        && i2 < local_positions.len()
+                    {
                         let p0 = glam::Vec3::from(local_positions[i0]);
                         let p1 = glam::Vec3::from(local_positions[i1]);
                         let p2 = glam::Vec3::from(local_positions[i2]);
