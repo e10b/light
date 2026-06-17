@@ -988,7 +988,10 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       ior = 1.0;
     }
 
-    if (hit_type == 1u && primitive_shape() == 2u) {
+    let primitive_is_mirror = hit_type == 1u &&
+      (primitive_shape() == 2u ||
+       (uniforms.sphere_params.z >= 0.5 && transmission < 0.05 && roughness <= 0.05));
+    if (primitive_is_mirror) {
       let face_n = select(normal, -normal, dot(rd, normal) > 0.0);
       let mirror_dir = reflect(rd, normalize(face_n));
       if (roughness > 0.0) {
@@ -1315,7 +1318,10 @@ fn trace_raytraced(origin: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
     direct = albedo * light_color * nl * uniforms.sun_intensity;
   }
 
-  if (hit_type == 1u && primitive_shape() == 2u) {
+  let primitive_is_mirror_simple = hit_type == 1u &&
+    (primitive_shape_for(hit_primitive.params) == 2u ||
+     (hit_primitive.params.z >= 0.5 && transmission < 0.05 && roughness <= 0.05));
+  if (primitive_is_mirror_simple) {
     let face_n = normalize(select(normal, -normal, dot(rd, normal) > 0.0));
     let refl_dir = reflect(rd, face_n);
     let refl_col = select(sky(refl_dir) * 0.9, vec3<f32>(0.02, 0.01, 0.01), is_wine_scene);

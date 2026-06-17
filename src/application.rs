@@ -1872,6 +1872,182 @@ pub async fn run() {
                                                 project_status = "Telescope demo created".to_string();
                                             }
                                         }
+                                        if ui.button("Newtonian Demo").clicked() {
+                                            let (scene_id, master_id) = match scene_kind {
+                                                SceneKind::Decanter => (decanter_scene_id, decanter_master),
+                                                SceneKind::Wine => (wine_scene_id, wine_master),
+                                                SceneKind::CornellBox => (cornell_scene_id, cornell_master),
+                                            };
+                                            if scene_id.0 != 0 && master_id.0 != 0 {
+                                                let scene_objects = main_db.scene_objects_recursive(scene_id);
+                                                for object_id in scene_objects {
+                                                    if primitive_shape_by_id.contains_key(&object_id) {
+                                                        main_db.delete_object(object_id);
+                                                        object_target_by_id.remove(&object_id);
+                                                        primitive_shape_by_id.remove(&object_id);
+                                                        primitive_lens_params_by_id.remove(&object_id);
+                                                        object_material_names.remove(&object_id);
+                                                    } else {
+                                                        main_db.unlink_object_from_scene(scene_id, object_id);
+                                                    }
+                                                }
+
+                                                let bench_y = -1.5 + sphere_radius * 0.75;
+                                                let tube_axis_rot =
+                                                    glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+                                                let primary_center = glam::Vec3::new(0.0, bench_y, 0.0);
+                                                let secondary_center = glam::Vec3::new(2.55, bench_y, 0.0);
+                                                let folded_focus_distance = 1.18;
+                                                let focuser_after_focus_distance = 3.9;
+                                                let secondary_normal =
+                                                    glam::Vec3::new(1.0, 0.0, -1.0).normalize();
+                                                let secondary_rot = glam::Quat::from_rotation_arc(
+                                                    glam::Vec3::Z,
+                                                    secondary_normal,
+                                                );
+                                                let puppy_target_rot =
+                                                    glam::Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+                                                let puppy_aspect = puppy_dimensions.0 as f32
+                                                    / puppy_dimensions.1.max(1) as f32;
+
+                                                let puppy_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::ImagePlane,
+                                                    "White",
+                                                    DbTransform {
+                                                        location: glam::Vec3::new(42.0, bench_y, 0.0),
+                                                        rotation: puppy_target_rot,
+                                                        scale: glam::Vec3::new(
+                                                            puppy_aspect.max(0.1) * 0.95,
+                                                            0.95,
+                                                            1.0,
+                                                        ),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&puppy_id) {
+                                                    obj.name = "Distant Puppy Target".to_string();
+                                                }
+                                                main_db.collection_link_object(master_id, puppy_id);
+                                                main_db.ensure_scene_base(scene_id, puppy_id, true, true);
+
+                                                let primary_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::ParabolicMirror,
+                                                    "Mirror",
+                                                    DbTransform {
+                                                        location: primary_center,
+                                                        rotation: tube_axis_rot,
+                                                        scale: glam::Vec3::new(1.0, 1.0, 0.16),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&primary_id) {
+                                                    obj.name = "Primary Parabolic Mirror".to_string();
+                                                }
+                                                main_db.collection_link_object(master_id, primary_id);
+                                                main_db.ensure_scene_base(scene_id, primary_id, true, true);
+
+                                                let secondary_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::Cube,
+                                                    "Mirror",
+                                                    DbTransform {
+                                                        location: secondary_center,
+                                                        rotation: secondary_rot,
+                                                        scale: glam::Vec3::new(0.42, 0.42, 0.025),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&secondary_id) {
+                                                    obj.name = "45 Degree Secondary Mirror".to_string();
+                                                }
+                                                main_db.collection_link_object(master_id, secondary_id);
+                                                main_db.ensure_scene_base(scene_id, secondary_id, true, true);
+
+                                                let focuser_params = [4.0, 4.0, 0.32, 0.0];
+                                                let focuser_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::SphericalLens,
+                                                    "Glass",
+                                                    DbTransform {
+                                                        location: secondary_center
+                                                            + glam::Vec3::Z
+                                                                * (folded_focus_distance
+                                                                    + focuser_after_focus_distance),
+                                                        rotation: glam::Quat::IDENTITY,
+                                                        scale: glam::Vec3::splat(0.18),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&focuser_id) {
+                                                    obj.name = "Focuser Lens".to_string();
+                                                }
+                                                primitive_lens_params_by_id
+                                                    .insert(focuser_id, focuser_params);
+                                                main_db.collection_link_object(master_id, focuser_id);
+                                                main_db.ensure_scene_base(scene_id, focuser_id, true, true);
+
+                                                selected_primitive_id = primary_id;
+                                                primitive_shape = PrimitiveShape::ParabolicMirror;
+                                                uniforms.sphere_params[3] = 2.0;
+                                                uniforms.sphere_pos = [
+                                                    primary_center.x,
+                                                    primary_center.y,
+                                                    primary_center.z,
+                                                    sphere_radius,
+                                                ];
+                                                uniforms.sphere_rot = [
+                                                    tube_axis_rot.x,
+                                                    tube_axis_rot.y,
+                                                    tube_axis_rot.z,
+                                                    tube_axis_rot.w,
+                                                ];
+                                                uniforms.sphere_extent = [
+                                                    sphere_radius,
+                                                    sphere_radius,
+                                                    sphere_radius * 0.16,
+                                                    0.0,
+                                                ];
+                                                sphere_rotation = tube_axis_rot;
+                                                sphere_scale = glam::Vec3::new(1.0, 1.0, 0.16);
+                                                gizmo_target = GizmoTargetKind::Sphere;
+                                                has_selection = true;
+                                                optical_trace_enabled = true;
+                                                optical_trace_rays = 11;
+                                                sun_intensity = 2.2;
+                                                sun_lamp_distance = sun_lamp_distance.max(80.0);
+                                                sun_empty_position =
+                                                    active_center + glam::Vec3::X * sun_lamp_distance;
+                                                sun_empty_rotation = glam::Quat::IDENTITY;
+                                                camera = Camera::look_at(
+                                                    glam::Vec3::new(18.0, bench_y + 10.0, 22.0),
+                                                    glam::Vec3::new(2.5, bench_y, 2.8),
+                                                );
+                                                accumulation_dirty = true;
+                                                project_status = "Newtonian telescope demo created".to_string();
+                                            }
+                                        }
                                         ui.menu_button("Add", |ui| {
                                             let scene_id = match scene_kind {
                                                 SceneKind::Decanter => decanter_scene_id,

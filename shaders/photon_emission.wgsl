@@ -320,18 +320,19 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
       rd = image_forward;
 
       var lens_target = ro + image_forward * 30.0;
-      var nearest_lens_z = 1e38;
+      var nearest_optic_z = 1e38;
       for (var li = 0u; li < primitive_limit; li = li + 1u) {
         let lens_data = primitive_block.items[li];
-        if (primitive_shape_for(lens_data.params) == 3u) {
-          let lens_z = dot(lens_data.pos.xyz - ro, image_forward);
-          if (lens_z > 0.05 && lens_z < nearest_lens_z) {
+        let target_shape = primitive_shape_for(lens_data.params);
+        if (target_shape == 2u || target_shape == 3u) {
+          let optic_z = dot(lens_data.pos.xyz - ro, image_forward);
+          if (optic_z > 0.05 && optic_z < nearest_optic_z) {
             let lens_x = quat_mul_vec(lens_data.rot, vec3<f32>(1.0, 0.0, 0.0));
             let lens_y = quat_mul_vec(lens_data.rot, vec3<f32>(0.0, 1.0, 0.0));
             let aperture_radius = max(max(lens_data.extent.x, lens_data.extent.y) * 0.82, 0.05);
             let aperture_sample = disk_sample(gid.x * 6553u + uniforms.frame * 379u + li * 17u, aperture_radius);
             lens_target = lens_data.pos.xyz + lens_x * aperture_sample.x + lens_y * aperture_sample.y;
-            nearest_lens_z = lens_z;
+            nearest_optic_z = optic_z;
           }
         }
       }
@@ -408,6 +409,15 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
         rd = normalize(reflect(rd, face_n));
         ro = hit_pos + rd * 0.01;
         passed_glass = true;
+        continue;
+      }
+
+      if (prim_data.params.z >= 0.5 && transmission < 0.05 && prim_data.params.x <= 0.05) {
+        let face_n = select(normal, -normal, dot(rd, normal) > 0.0);
+        rd = normalize(reflect(rd, face_n));
+        ro = hit_pos + rd * 0.01;
+        passed_glass = true;
+        power = power * 0.94;
         continue;
       }
 
