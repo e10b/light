@@ -178,6 +178,12 @@ impl MainDatabase {
         }
     }
 
+    pub fn collection_unlink_object(&mut self, collection_id: Id, object_id: Id) {
+        if let Some(col) = self.collections.get_mut(&collection_id) {
+            col.object_ids.retain(|id| *id != object_id);
+        }
+    }
+
     pub fn collection_link_child(&mut self, parent_collection_id: Id, child_collection_id: Id) {
         if let Some(col) = self.collections.get_mut(&parent_collection_id) {
             if !col.child_collection_ids.contains(&child_collection_id) {
@@ -200,6 +206,31 @@ impl MainDatabase {
             walk(self, scene.master_collection_id, &mut out);
         }
         out
+    }
+
+    pub fn unlink_object_from_scene(&mut self, scene_id: Id, object_id: Id) {
+        if let Some(scene) = self.scenes.get(&scene_id).cloned() {
+            self.collection_unlink_object(scene.master_collection_id, object_id);
+            if let Some(vl) = self.view_layers.get_mut(&scene.view_layer_id) {
+                vl.bases.retain(|base| base.object_id != object_id);
+            }
+        }
+    }
+
+    pub fn delete_object(&mut self, object_id: Id) {
+        if let Some(obj) = self.objects.remove(&object_id) {
+            if let Some(mesh_id) = obj.mesh_id {
+                if let Some(mesh) = self.meshes.get_mut(&mesh_id) {
+                    mesh.user_count = mesh.user_count.saturating_sub(1);
+                }
+            }
+        }
+        for col in self.collections.values_mut() {
+            col.object_ids.retain(|id| *id != object_id);
+        }
+        for view_layer in self.view_layers.values_mut() {
+            view_layer.bases.retain(|base| base.object_id != object_id);
+        }
     }
 
     pub fn ensure_scene_base(&mut self, scene_id: Id, object_id: Id, visible: bool, selectable: bool) {

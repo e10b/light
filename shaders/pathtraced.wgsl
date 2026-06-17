@@ -25,7 +25,8 @@ struct Uniforms {
   decanter_enabled: u32,
   wine_enabled: u32,
   cornell_enabled: u32,
-  pad: vec2<u32>,
+  primitive_count: u32,
+  pad: u32,
 };
 
 @group(0) @binding(0)
@@ -89,6 +90,25 @@ var<uniform> photon_uniforms: PhotonMapUniforms;
 
 @group(0) @binding(12)
 var selection_mask_out: texture_storage_2d<rgba8unorm, write>;
+
+@group(0) @binding(13)
+var image_texture: texture_2d<f32>;
+
+struct PrimitiveData {
+  pos: vec4<f32>,
+  color: vec4<f32>,
+  params: vec4<f32>,
+  rot: vec4<f32>,
+  extent: vec4<f32>,
+  lens: vec4<f32>,
+};
+
+struct PrimitiveBlock {
+  items: array<PrimitiveData, 64>,
+};
+
+@group(0) @binding(14)
+var<uniform> primitive_block: PrimitiveBlock;
 
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
@@ -335,6 +355,9 @@ fn primitive_radius(half_extent: vec3<f32>) -> f32 {
 }
 
 fn primitive_shape() -> u32 {
+  if (uniforms.sphere_params.w >= 3.5) {
+    return 4u;
+  }
   if (uniforms.sphere_params.w >= 2.5) {
     return 3u;
   }
@@ -384,6 +407,35 @@ fn parabolic_mirror_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half
     }
   }
   return best_t;
+}
+
+fn image_plane_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>) -> f32 {
+  if (abs(direction.z) <= 1e-6) {
+    return 1e38;
+  }
+  let t = -origin.z / direction.z;
+  let p = origin + direction * t;
+  if (t > 0.001 && abs(p.x) <= half_extent.x && abs(p.y) <= half_extent.y) {
+    return t;
+  }
+  return 1e38;
+}
+
+fn image_plane_color(local_hit: vec3<f32>, half_extent: vec3<f32>) -> vec3<f32> {
+  let dims = textureDimensions(image_texture);
+  let uv = clamp(
+    vec2<f32>(
+      local_hit.x / max(half_extent.x * 2.0, 1e-4) + 0.5,
+      0.5 - local_hit.y / max(half_extent.y * 2.0, 1e-4)
+    ),
+    vec2<f32>(0.0),
+    vec2<f32>(1.0)
+  );
+  let xy = vec2<i32>(
+    i32(clamp(floor(uv.x * f32(dims.x)), 0.0, f32(dims.x - 1u))),
+    i32(clamp(floor(uv.y * f32(dims.y)), 0.0, f32(dims.y - 1u)))
+  );
+  return textureLoad(image_texture, xy, 0).rgb;
 }
 
 fn spherical_lens_edge_radius(front_radius: f32, back_radius: f32, half_thickness: f32, max_aperture: f32) -> f32 {
@@ -461,6 +513,9 @@ fn spherical_lens_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_e
 
 fn primitive_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32>) -> f32 {
   let shape = primitive_shape();
+  if (shape == 4u) {
+    return image_plane_intersection_t(origin - center, direction, half_extent);
+  }
   if (shape == 3u) {
     return spherical_lens_intersection_t(origin - center, direction, half_extent);
   }
@@ -475,6 +530,9 @@ fn primitive_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec
 
 fn primitive_normal(hit_pos: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32>) -> vec3<f32> {
   let shape = primitive_shape();
+  if (shape == 4u) {
+    return vec3<f32>(0.0, 0.0, select(-1.0, 1.0, hit_pos.z >= center.z));
+  }
   if (shape == 3u) {
     let local = hit_pos - center;
     let base_aperture = max(max(half_extent.x, half_extent.y), 1e-4);
@@ -511,6 +569,102 @@ fn primitive_normal(hit_pos: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32
     return normalize(hit_pos - center);
   }
   return cube_normal(hit_pos, center, half_extent);
+}
+
+fn primitive_shape_for(params: vec4<f32>) -> u32 {
+  if (params.w >= 3.5) { return 4u; }
+  if (params.w >= 2.5) { return 3u; }
+  if (params.w >= 1.5) { return 2u; }
+  if (params.w >= 0.5) { return 1u; }
+  return 0u;
+}
+
+fn spherical_lens_intersection_t_for(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>, lens: vec4<f32>) -> f32 {
+  let base_aperture = max(max(half_extent.x, half_extent.y), 1e-4);
+  let front_radius = max(abs(lens.x), 1e-4);
+  let back_radius = max(abs(lens.y), 1e-4);
+  let half_thickness = min(max(lens.z * 0.5, 0.025), min(front_radius, back_radius) * 0.95);
+  let aperture = spherical_lens_edge_radius(front_radius, back_radius, half_thickness, base_aperture);
+  let front_center = vec3<f32>(0.0, 0.0, -half_thickness + front_radius);
+  let back_center = vec3<f32>(0.0, 0.0, half_thickness - back_radius);
+  let aperture2 = aperture * aperture;
+  var best_t = 1e38;
+  let t_front = sphere_intersection_t(origin, direction, front_center, front_radius);
+  if (t_front < 1e37) {
+    let p = origin + direction * t_front;
+    let r2 = p.x * p.x + p.y * p.y;
+    if (r2 <= aperture2 && p.z >= -half_thickness && p.z <= half_thickness) { best_t = t_front; }
+  }
+  let t_back = sphere_intersection_t(origin, direction, back_center, back_radius);
+  if (t_back < best_t) {
+    let p = origin + direction * t_back;
+    let r2 = p.x * p.x + p.y * p.y;
+    if (r2 <= aperture2 && p.z >= -half_thickness && p.z <= half_thickness) { best_t = t_back; }
+  }
+  let front_edge_z = front_center.z - sqrt(max(front_radius * front_radius - aperture2, 0.0));
+  let back_edge_z = back_center.z + sqrt(max(back_radius * back_radius - aperture2, 0.0));
+  let side_min_z = min(front_edge_z, back_edge_z);
+  let side_max_z = max(front_edge_z, back_edge_z);
+  let a = direction.x * direction.x + direction.y * direction.y;
+  if (a > 1e-6 && side_max_z - side_min_z > 1e-4) {
+    let b = 2.0 * (origin.x * direction.x + origin.y * direction.y);
+    let c = origin.x * origin.x + origin.y * origin.y - aperture2;
+    let disc = b * b - 4.0 * a * c;
+    if (disc > 0.0) {
+      let sq = sqrt(disc);
+      let t0 = (-b - sq) / (2.0 * a);
+      let p0 = origin + direction * t0;
+      if (t0 > 0.001 && t0 < best_t && p0.z >= side_min_z && p0.z <= side_max_z) { best_t = t0; }
+      let t1 = (-b + sq) / (2.0 * a);
+      let p1 = origin + direction * t1;
+      if (t1 > 0.001 && t1 < best_t && p1.z >= side_min_z && p1.z <= side_max_z) { best_t = t1; }
+    }
+  }
+  return best_t;
+}
+
+fn primitive_intersection_t_for(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> f32 {
+  let shape = primitive_shape_for(params);
+  if (shape == 4u) { return image_plane_intersection_t(origin, direction, half_extent); }
+  if (shape == 3u) { return spherical_lens_intersection_t_for(origin, direction, half_extent, lens); }
+  if (shape == 2u) { return parabolic_mirror_intersection_t(origin, direction, half_extent); }
+  if (shape == 1u) { return sphere_intersection_t(origin, direction, vec3<f32>(0.0), primitive_radius(half_extent)); }
+  return cube_intersection_t(origin, direction, vec3<f32>(0.0), half_extent);
+}
+
+fn primitive_normal_for(local_hit: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> vec3<f32> {
+  let shape = primitive_shape_for(params);
+  if (shape == 4u) { return vec3<f32>(0.0, 0.0, select(-1.0, 1.0, local_hit.z >= 0.0)); }
+  if (shape == 3u) {
+    let base_aperture = max(max(half_extent.x, half_extent.y), 1e-4);
+    let front_radius = max(abs(lens.x), 1e-4);
+    let back_radius = max(abs(lens.y), 1e-4);
+    let half_thickness = min(max(lens.z * 0.5, 0.025), min(front_radius, back_radius) * 0.95);
+    let aperture = spherical_lens_edge_radius(front_radius, back_radius, half_thickness, base_aperture);
+    let front_center = vec3<f32>(0.0, 0.0, -half_thickness + front_radius);
+    let back_center = vec3<f32>(0.0, 0.0, half_thickness - back_radius);
+    let front_edge_z = front_center.z - sqrt(max(front_radius * front_radius - aperture * aperture, 0.0));
+    let back_edge_z = back_center.z + sqrt(max(back_radius * back_radius - aperture * aperture, 0.0));
+    let side_min_z = min(front_edge_z, back_edge_z);
+    let side_max_z = max(front_edge_z, back_edge_z);
+    let radial = length(local_hit.xy);
+    let front_error = abs(length(local_hit - front_center) - front_radius);
+    let back_error = abs(length(local_hit - back_center) - back_radius);
+    let side_error = abs(radial - aperture);
+    if (local_hit.z >= side_min_z && local_hit.z <= side_max_z && side_error <= min(front_error, back_error)) {
+      return normalize(vec3<f32>(local_hit.x, local_hit.y, 0.0));
+    }
+    if (front_error <= back_error) { return normalize(local_hit - front_center); }
+    return normalize(local_hit - back_center);
+  }
+  if (shape == 2u) {
+    let radius = max(max(half_extent.x, half_extent.y), 1e-4);
+    let depth = max(half_extent.z, 1e-4);
+    let focal_length = (radius * radius) / (8.0 * depth);
+    return normalize(vec3<f32>(2.0 * local_hit.x, 2.0 * local_hit.y, -4.0 * focal_length));
+  }
+  if (shape == 1u) { return normalize(local_hit); }
+  return cube_normal(local_hit, vec3<f32>(0.0), half_extent);
 }
 
 fn trace_cornell(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32> {
@@ -658,20 +812,32 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     if (bounce >= max_bounces) { break; }
     bounce = bounce + 1u;
 
-    // Scene intersections: cube, triangles (ray query), ground
-    // Cube intersection (support rotation via quaternion)
-    let sph = uniforms.sphere_pos;
-    let cube_center = sph.xyz;
-    let cube_half_extent = sph.w;
-    let q = uniforms.sphere_rot;
-    let q_inv = vec4<f32>(-q.xyz, q.w);
+    // Scene intersections: procedural primitives, triangles (ray query), ground
+    var cube_center = uniforms.sphere_pos.xyz;
+    var q = uniforms.sphere_rot;
+    var q_inv = vec4<f32>(-q.xyz, q.w);
+    var hit_primitive = primitive_block.items[0u];
+    var hit_primitive_index = 0u;
     var t_cube = 1e38;
     if (!is_wine_scene) {
-      let local_ro = quat_mul_vec(q_inv, ro - cube_center);
-      let local_rd = quat_mul_vec(q_inv, rd);
-      let cube_half_vec = uniforms.sphere_extent.xyz;
-      let t_local = primitive_intersection_t(local_ro, local_rd, vec3<f32>(0.0), cube_half_vec);
-      if (t_local < 1e37) { t_cube = t_local; }
+      let primitive_limit = min(uniforms.primitive_count, 64u);
+      for (var pi = 0u; pi < primitive_limit; pi = pi + 1u) {
+        let prim = primitive_block.items[pi];
+        let prim_center = prim.pos.xyz;
+        let prim_q = prim.rot;
+        let prim_q_inv = vec4<f32>(-prim_q.xyz, prim_q.w);
+        let local_ro = quat_mul_vec(prim_q_inv, ro - prim_center);
+        let local_rd = quat_mul_vec(prim_q_inv, rd);
+        let t_local = primitive_intersection_t_for(local_ro, local_rd, prim.extent.xyz, prim.params, prim.lens);
+        if (t_local < t_cube) {
+          t_cube = t_local;
+          cube_center = prim_center;
+          q = prim_q;
+          q_inv = prim_q_inv;
+          hit_primitive = prim;
+          hit_primitive_index = pi;
+        }
+      }
     }
 
     // Triangle / mesh intersection via ray query
@@ -735,26 +901,30 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
 
     if (hit_type == 1u) {
       // Cube: allow glass behavior via sphere_color.w toggle
-      let qh = uniforms.sphere_rot;
-      let qh_inv = vec4<f32>(-qh.xyz, qh.w);
-      let local_hit = quat_mul_vec(qh_inv, hit_pos - cube_center);
-      let local_n = primitive_normal(local_hit, vec3<f32>(0.0), uniforms.sphere_extent.xyz);
-      normal = quat_mul_vec(qh, local_n);
-      albedo = max(uniforms.sphere_color.xyz, vec3<f32>(0.001));
+      let local_hit = quat_mul_vec(q_inv, hit_pos - cube_center);
+      let local_n = primitive_normal_for(local_hit, hit_primitive.extent.xyz, hit_primitive.params, hit_primitive.lens);
+      normal = quat_mul_vec(q, local_n);
+      albedo = max(hit_primitive.color.xyz, vec3<f32>(0.001));
       metallic = 0.0;
-      roughness = uniforms.sphere_params.x;
-      transmission = clamp(uniforms.sphere_color.w, 0.0, 1.0);
-      ior = max(uniforms.sphere_params.y, 1.0);
-      if (uniforms.sphere_params.z < 0.5) {
+      roughness = hit_primitive.params.x;
+      transmission = clamp(hit_primitive.color.w, 0.0, 1.0);
+      ior = max(hit_primitive.params.y, 1.0);
+      if (hit_primitive.params.z < 0.5) {
         albedo = vec3<f32>(1.0);
         roughness = 0.65;
         transmission = 0.0;
         ior = 1.0;
       }
-      if (primitive_shape() == 2u) {
-        albedo = max(uniforms.sphere_color.xyz, vec3<f32>(0.001));
+      if (primitive_shape_for(hit_primitive.params) == 2u) {
+        albedo = max(hit_primitive.color.xyz, vec3<f32>(0.001));
         roughness = min(roughness, 0.08);
         transmission = 0.0;
+      }
+      if (primitive_shape_for(hit_primitive.params) == 4u) {
+        albedo = image_plane_color(local_hit, hit_primitive.extent.xyz);
+        roughness = 0.78;
+        transmission = 0.0;
+        ior = 1.0;
       }
     } else if (hit_type == 2u) {
       // True triangle normal/material from ray-query primitive + barycentrics.
@@ -819,7 +989,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       ior = 1.0;
     }
 
-    if (hit_type == 1u && primitive_shape() == 2u) {
+    if (hit_type == 1u && primitive_shape_for(hit_primitive.params) == 2u) {
       let face_n = select(normal, -normal, dot(rd, normal) > 0.0);
       let mirror_dir = reflect(rd, normalize(face_n));
       if (roughness > 0.0) {
@@ -860,13 +1030,18 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     let shadow_hit = rayQueryGetCommittedIntersection(&shadow_rq);
     var cube_shadow_t = 1e38;
     if (!is_wine_scene) {
-      let qsh = uniforms.sphere_rot;
-      let qsh_inv = vec4<f32>(-qsh.xyz, qsh.w);
-      let local_shadow_origin = quat_mul_vec(qsh_inv, shadow_origin - cube_center);
-      let local_to_light = quat_mul_vec(qsh_inv, to_light);
-      let cube_half_vec_sh = uniforms.sphere_extent.xyz;
-      let t_local_sh = primitive_intersection_t(local_shadow_origin, local_to_light, vec3<f32>(0.0), cube_half_vec_sh);
-      if (t_local_sh < 1e37) { cube_shadow_t = t_local_sh; }
+      let primitive_limit = min(uniforms.primitive_count, 64u);
+      for (var spi = 0u; spi < primitive_limit; spi = spi + 1u) {
+        if (hit_type == 1u && spi == hit_primitive_index) {
+          continue;
+        }
+        let prim = primitive_block.items[spi];
+        let qsh_inv = vec4<f32>(-prim.rot.xyz, prim.rot.w);
+        let local_shadow_origin = quat_mul_vec(qsh_inv, shadow_origin - prim.pos.xyz);
+        let local_to_light = quat_mul_vec(qsh_inv, to_light);
+        let t_local_sh = primitive_intersection_t_for(local_shadow_origin, local_to_light, prim.extent.xyz, prim.params, prim.lens);
+        if (t_local_sh < cube_shadow_t) { cube_shadow_t = t_local_sh; }
+      }
     }
     let visible = ((uniforms.mesh_enabled == 0u) || shadow_hit.kind == RAY_QUERY_INTERSECTION_NONE) && (cube_shadow_t >= 1e37);
     let receives_spot_pool = is_wine_scene && hit_type == 3u;

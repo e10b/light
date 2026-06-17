@@ -52,7 +52,21 @@ struct SceneUniforms {
     decanter_enabled: u32,
     wine_enabled: u32,
     cornell_enabled: u32,
-    _pad: [u32; 5],
+    primitive_count: u32,
+    _pad: [u32; 4],
+}
+
+const MAX_PRIMITIVES: usize = 64;
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuPrimitive {
+    pos: [f32; 4],
+    color: [f32; 4],
+    params: [f32; 4],
+    rot: [f32; 4],
+    extent: [f32; 4],
+    lens: [f32; 4],
 }
 
 struct Camera {
@@ -80,6 +94,7 @@ enum PrimitiveShape {
     Sphere,
     ParabolicMirror,
     SphericalLens,
+    ImagePlane,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -468,6 +483,19 @@ fn sphere_position_for(center: glam::Vec3, size: glam::Vec3, radius: f32) -> gla
     glam::Vec3::new(center.x + size.x * 0.6 + 2.0, -1.5 + radius, center.z)
 }
 
+fn primitive_spawn_transform(
+    current_pos: glam::Vec3,
+    instance_count: usize,
+    scale: glam::Vec3,
+    sphere_radius: f32,
+) -> DbTransform {
+    DbTransform {
+        location: current_pos + glam::Vec3::X * (instance_count as f32 * sphere_radius * 0.35),
+        rotation: glam::Quat::IDENTITY,
+        scale,
+    }
+}
+
 fn set_primitive_shape(
     main_db: &mut MainDatabase,
     sphere_obj_id: Id,
@@ -481,6 +509,7 @@ fn set_primitive_shape(
         PrimitiveShape::Sphere => 1.0,
         PrimitiveShape::ParabolicMirror => 2.0,
         PrimitiveShape::SphericalLens => 3.0,
+        PrimitiveShape::ImagePlane => 4.0,
     };
     if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
         obj.name = match shape {
@@ -488,8 +517,66 @@ fn set_primitive_shape(
             PrimitiveShape::Sphere => "Sphere",
             PrimitiveShape::ParabolicMirror => "Parabolic Mirror",
             PrimitiveShape::SphericalLens => "Spherical Lens",
+            PrimitiveShape::ImagePlane => "Image",
         }
         .to_string();
+    }
+}
+
+fn create_primitive_object(
+    main_db: &mut MainDatabase,
+    object_target_by_id: &mut std::collections::HashMap<Id, GizmoTargetKind>,
+    primitive_shape_by_id: &mut std::collections::HashMap<Id, PrimitiveShape>,
+    object_material_names: &mut std::collections::HashMap<Id, String>,
+    shape: PrimitiveShape,
+    material_name: &str,
+    transform: DbTransform,
+    sphere_radius: f32,
+    primitive_shape: &mut PrimitiveShape,
+    uniforms: &mut SceneUniforms,
+) -> Id {
+    let object_id = main_db.create_object("Primitive", None, transform.clone());
+    object_target_by_id.insert(object_id, GizmoTargetKind::Sphere);
+    primitive_shape_by_id.insert(object_id, shape);
+    object_material_names.insert(object_id, material_name.to_string());
+    set_primitive_shape(main_db, object_id, primitive_shape, shape, uniforms);
+    uniforms.sphere_pos = [
+        transform.location.x,
+        transform.location.y,
+        transform.location.z,
+        sphere_radius,
+    ];
+    uniforms.sphere_rot = [
+        transform.rotation.x,
+        transform.rotation.y,
+        transform.rotation.z,
+        transform.rotation.w,
+    ];
+    uniforms.sphere_extent = [
+        sphere_radius * transform.scale.x,
+        sphere_radius * transform.scale.y,
+        sphere_radius * transform.scale.z,
+        0.0,
+    ];
+    object_id
+}
+
+fn include_photon_bounds(
+    bounds_min: &mut glam::Vec3,
+    bounds_max: &mut glam::Vec3,
+    bounds_valid: &mut bool,
+    center: glam::Vec3,
+    radius: f32,
+) {
+    let radius = radius.max(0.05);
+    let extent = glam::Vec3::splat(radius);
+    if *bounds_valid {
+        *bounds_min = bounds_min.min(center - extent);
+        *bounds_max = bounds_max.max(center + extent);
+    } else {
+        *bounds_min = center - extent;
+        *bounds_max = center + extent;
+        *bounds_valid = true;
     }
 }
 
@@ -793,7 +880,12 @@ pub async fn run() {
 
     let mut object_target_by_id: std::collections::HashMap<Id, GizmoTargetKind> =
         std::collections::HashMap::new();
+    let mut primitive_shape_by_id: std::collections::HashMap<Id, PrimitiveShape> =
+        std::collections::HashMap::new();
+    let mut primitive_lens_params_by_id: std::collections::HashMap<Id, [f32; 4]> =
+        std::collections::HashMap::new();
     object_target_by_id.insert(sphere_obj_id, GizmoTargetKind::Sphere);
+    primitive_shape_by_id.insert(sphere_obj_id, PrimitiveShape::Cube);
     object_target_by_id.insert(sun_obj_id, GizmoTargetKind::SunLamp);
     object_target_by_id.insert(spot_obj_id, GizmoTargetKind::WineSpotlight);
     object_target_by_id.insert(decanter_obj_id, GizmoTargetKind::Decanter);
@@ -958,8 +1050,10 @@ pub async fn run() {
         decanter_enabled: 0,
         wine_enabled: 0,
         cornell_enabled: 0,
-        _pad: [0; 5],
+        primitive_count: 1,
+        _pad: [0; 4],
     };
+    primitive_lens_params_by_id.insert(sphere_obj_id, uniforms.lens_params);
 
     let mut sun_azimuth_deg = uniforms.light_pos[2]
         .atan2(uniforms.light_pos[0])
@@ -1009,6 +1103,48 @@ pub async fn run() {
         let zeros = vec![0u8; accum_byte_size as usize];
         queue.write_buffer(&accum_buf, 0, &zeros);
     }
+
+    let puppy_image = image::open("res/puppy.jpg")
+        .expect("failed to load res/puppy.jpg")
+        .to_rgba8();
+    let puppy_dimensions = puppy_image.dimensions();
+    let puppy_texture_size = wgpu::Extent3d {
+        width: puppy_dimensions.0.max(1),
+        height: puppy_dimensions.1.max(1),
+        depth_or_array_layers: 1,
+    };
+    let puppy_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("puppy_image_texture"),
+        size: puppy_texture_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &puppy_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &puppy_image,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * puppy_dimensions.0),
+            rows_per_image: Some(puppy_dimensions.1),
+        },
+        puppy_texture_size,
+    );
+    let puppy_texture_view = puppy_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let primitive_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("primitive_instances_buf"),
+        size: (std::mem::size_of::<GpuPrimitive>() * MAX_PRIMITIVES) as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
 
     let ubind = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("ubind"),
@@ -1141,6 +1277,26 @@ pub async fn run() {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 13,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 14,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -1160,6 +1316,7 @@ pub async fn run() {
         &idx_buf,
         &tri_mat_buf,
         &mat_buf,
+        &primitive_buffer,
     );
 
     let ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1218,6 +1375,14 @@ pub async fn run() {
                 binding: 12,
                 resource: wgpu::BindingResource::TextureView(compute_pass.selection_mask_view()),
             },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(&puppy_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: primitive_buffer.as_entire_binding(),
+            },
         ],
     });
 
@@ -1251,6 +1416,7 @@ pub async fn run() {
     let mut gizmo_target = default_target_for_scene(scene_kind);
     let mut has_selection = true;
     let mut primitive_shape = PrimitiveShape::Cube;
+    let mut selected_primitive_id = sphere_obj_id;
     let mut sphere_rotation = glam::Quat::IDENTITY;
     let mut sphere_scale = glam::Vec3::ONE;
     let mut decanter_rotation = glam::Quat::IDENTITY;
@@ -1271,6 +1437,8 @@ pub async fn run() {
     let mut material_editor = MaterialGraphEditor::new();
     let mut material_runtime_overrides: std::collections::HashMap<String, RuntimeMaterialPreview> =
         std::collections::HashMap::new();
+    let mut optical_trace_enabled = false;
+    let mut optical_trace_rays = 9u32;
 
     let _ = event_loop.run(move |event, active_loop| {
         active_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -1444,6 +1612,37 @@ pub async fn run() {
                     };
                     let wants_keyboard = egui_ctx.wants_keyboard_input();
 
+                    if !wants_keyboard && has_selection && keys_pressed.contains("x") {
+                        let scene_id = match scene_kind {
+                            SceneKind::Decanter => decanter_scene_id,
+                            SceneKind::Wine => wine_scene_id,
+                            SceneKind::CornellBox => cornell_scene_id,
+                        };
+                        let object_id = match gizmo_target {
+                            GizmoTargetKind::Sphere => Some(selected_primitive_id),
+                            GizmoTargetKind::Decanter => Some(decanter_obj_id),
+                            GizmoTargetKind::WineGlass => Some(wine_obj_id),
+                            GizmoTargetKind::CornellBox => Some(cornell_obj_id),
+                            GizmoTargetKind::SunLamp => Some(sun_obj_id),
+                            GizmoTargetKind::WineSpotlight => Some(spot_obj_id),
+                        };
+                        if let Some(object_id) = object_id {
+                            if primitive_shape_by_id.contains_key(&object_id) {
+                                main_db.delete_object(object_id);
+                                object_target_by_id.remove(&object_id);
+                                primitive_shape_by_id.remove(&object_id);
+                                primitive_lens_params_by_id.remove(&object_id);
+                                object_material_names.remove(&object_id);
+                            } else {
+                                main_db.unlink_object_from_scene(scene_id, object_id);
+                            }
+                            has_selection = false;
+                            gizmo_target = default_target_for_scene(scene_kind);
+                            accumulation_dirty = true;
+                        }
+                        keys_pressed.remove("x");
+                    }
+
                     if !wants_keyboard && keys_pressed.contains("w") {
                         camera.pos += camera.forward() * move_speed * sprint * dt;
                     }
@@ -1524,61 +1723,179 @@ pub async fn run() {
                                             match scene_kind {
                                                 SceneKind::Decanter => {
                                                     if ui.button("Cube").clicked() {
-                                                        set_primitive_shape(
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
                                                             &mut main_db,
-                                                            sphere_obj_id,
-                                                            &mut primitive_shape,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
                                                             PrimitiveShape::Cube,
+                                                            "Glass",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                glam::Vec3::ONE,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
                                                             &mut uniforms,
                                                         );
-                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
-                                                        main_db.collection_link_object(decanter_master, sphere_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        selected_primitive_id = object_id;
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = glam::Vec3::ONE;
+                                                        main_db.collection_link_object(decanter_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
                                                         gizmo_target = GizmoTargetKind::Sphere;
                                                         has_selection = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Sphere").clicked() {
-                                                        set_primitive_shape(
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
                                                             &mut main_db,
-                                                            sphere_obj_id,
-                                                            &mut primitive_shape,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
                                                             PrimitiveShape::Sphere,
+                                                            "Glass",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                glam::Vec3::ONE,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
                                                             &mut uniforms,
                                                         );
-                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
-                                                        main_db.collection_link_object(decanter_master, sphere_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        selected_primitive_id = object_id;
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = glam::Vec3::ONE;
+                                                        main_db.collection_link_object(decanter_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
                                                         gizmo_target = GizmoTargetKind::Sphere;
                                                         has_selection = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Spherical Lens").clicked() {
-                                                        set_primitive_shape(
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
                                                             &mut main_db,
-                                                            sphere_obj_id,
-                                                            &mut primitive_shape,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
                                                             PrimitiveShape::SphericalLens,
+                                                            "Glass",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                glam::Vec3::ONE,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
                                                             &mut uniforms,
                                                         );
-                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
-                                                        main_db.collection_link_object(decanter_master, sphere_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        selected_primitive_id = object_id;
+                                                        primitive_lens_params_by_id
+                                                            .insert(object_id, uniforms.lens_params);
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = glam::Vec3::ONE;
+                                                        main_db.collection_link_object(decanter_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Image").clicked() {
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let image_aspect = puppy_dimensions.0 as f32
+                                                            / puppy_dimensions.1.max(1) as f32;
+                                                        let image_scale =
+                                                            glam::Vec3::new(image_aspect.max(0.1), 1.0, 1.0);
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
+                                                            &mut main_db,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
+                                                            PrimitiveShape::ImagePlane,
+                                                            "White",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                image_scale,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
+                                                            &mut uniforms,
+                                                        );
+                                                        selected_primitive_id = object_id;
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = image_scale;
+                                                        uniforms.sphere_rot = [0.0, 0.0, 0.0, 1.0];
+                                                        uniforms.sphere_extent = [
+                                                            sphere_radius * sphere_scale.x,
+                                                            sphere_radius * sphere_scale.y,
+                                                            0.05,
+                                                            0.0,
+                                                        ];
+                                                        main_db.collection_link_object(decanter_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
                                                         gizmo_target = GizmoTargetKind::Sphere;
                                                         has_selection = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Parabolic Mirror").clicked() {
-                                                        set_primitive_shape(
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
                                                             &mut main_db,
-                                                            sphere_obj_id,
-                                                            &mut primitive_shape,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
                                                             PrimitiveShape::ParabolicMirror,
+                                                            "Mirror",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                glam::Vec3::ONE,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
                                                             &mut uniforms,
                                                         );
-                                                        object_material_names.insert(sphere_obj_id, "Mirror".to_string());
-                                                        main_db.collection_link_object(decanter_master, sphere_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        selected_primitive_id = object_id;
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = glam::Vec3::ONE;
+                                                        main_db.collection_link_object(decanter_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
                                                         gizmo_target = GizmoTargetKind::Sphere;
                                                         has_selection = true;
                                                         ui.close();
@@ -1623,61 +1940,179 @@ pub async fn run() {
                                                         ui.close();
                                                     }
                                                     if ui.button("Cube").clicked() {
-                                                        set_primitive_shape(
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
                                                             &mut main_db,
-                                                            sphere_obj_id,
-                                                            &mut primitive_shape,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
                                                             PrimitiveShape::Cube,
+                                                            "Glass",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                glam::Vec3::ONE,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
                                                             &mut uniforms,
                                                         );
-                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
-                                                        main_db.collection_link_object(cornell_master, sphere_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        selected_primitive_id = object_id;
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = glam::Vec3::ONE;
+                                                        main_db.collection_link_object(cornell_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
                                                         gizmo_target = GizmoTargetKind::Sphere;
                                                         has_selection = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Sphere").clicked() {
-                                                        set_primitive_shape(
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
                                                             &mut main_db,
-                                                            sphere_obj_id,
-                                                            &mut primitive_shape,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
                                                             PrimitiveShape::Sphere,
+                                                            "Glass",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                glam::Vec3::ONE,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
                                                             &mut uniforms,
                                                         );
-                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
-                                                        main_db.collection_link_object(cornell_master, sphere_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        selected_primitive_id = object_id;
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = glam::Vec3::ONE;
+                                                        main_db.collection_link_object(cornell_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
                                                         gizmo_target = GizmoTargetKind::Sphere;
                                                         has_selection = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Spherical Lens").clicked() {
-                                                        set_primitive_shape(
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
                                                             &mut main_db,
-                                                            sphere_obj_id,
-                                                            &mut primitive_shape,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
                                                             PrimitiveShape::SphericalLens,
+                                                            "Glass",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                glam::Vec3::ONE,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
                                                             &mut uniforms,
                                                         );
-                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
-                                                        main_db.collection_link_object(cornell_master, sphere_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        selected_primitive_id = object_id;
+                                                        primitive_lens_params_by_id
+                                                            .insert(object_id, uniforms.lens_params);
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = glam::Vec3::ONE;
+                                                        main_db.collection_link_object(cornell_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Image").clicked() {
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let image_aspect = puppy_dimensions.0 as f32
+                                                            / puppy_dimensions.1.max(1) as f32;
+                                                        let image_scale =
+                                                            glam::Vec3::new(image_aspect.max(0.1), 1.0, 1.0);
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
+                                                            &mut main_db,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
+                                                            PrimitiveShape::ImagePlane,
+                                                            "White",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                image_scale,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
+                                                            &mut uniforms,
+                                                        );
+                                                        selected_primitive_id = object_id;
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = image_scale;
+                                                        uniforms.sphere_rot = [0.0, 0.0, 0.0, 1.0];
+                                                        uniforms.sphere_extent = [
+                                                            sphere_radius * sphere_scale.x,
+                                                            sphere_radius * sphere_scale.y,
+                                                            0.05,
+                                                            0.0,
+                                                        ];
+                                                        main_db.collection_link_object(cornell_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
                                                         gizmo_target = GizmoTargetKind::Sphere;
                                                         has_selection = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Parabolic Mirror").clicked() {
-                                                        set_primitive_shape(
+                                                        let current_pos = glam::Vec3::new(
+                                                            uniforms.sphere_pos[0],
+                                                            uniforms.sphere_pos[1],
+                                                            uniforms.sphere_pos[2],
+                                                        );
+                                                        let spawn_index = primitive_shape_by_id.len();
+                                                        let object_id = create_primitive_object(
                                                             &mut main_db,
-                                                            sphere_obj_id,
-                                                            &mut primitive_shape,
+                                                            &mut object_target_by_id,
+                                                            &mut primitive_shape_by_id,
+                                                            &mut object_material_names,
                                                             PrimitiveShape::ParabolicMirror,
+                                                            "Mirror",
+                                                            primitive_spawn_transform(
+                                                                current_pos,
+                                                                spawn_index,
+                                                                glam::Vec3::ONE,
+                                                                sphere_radius,
+                                                            ),
+                                                            sphere_radius,
+                                                            &mut primitive_shape,
                                                             &mut uniforms,
                                                         );
-                                                        object_material_names.insert(sphere_obj_id, "Mirror".to_string());
-                                                        main_db.collection_link_object(cornell_master, sphere_obj_id);
-                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        selected_primitive_id = object_id;
+                                                        sphere_rotation = glam::Quat::IDENTITY;
+                                                        sphere_scale = glam::Vec3::ONE;
+                                                        main_db.collection_link_object(cornell_master, object_id);
+                                                        main_db.ensure_scene_base(scene_id, object_id, true, true);
                                                         gizmo_target = GizmoTargetKind::Sphere;
                                                         has_selection = true;
                                                         ui.close();
@@ -1737,7 +2172,8 @@ pub async fn run() {
                                                                         Some(sun_obj_id)
                                                                     } else if name.contains("cornell") {
                                                                         Some(cornell_obj_id)
-                                                                    } else if name.contains("lens")
+                                                                    } else if name.contains("image")
+                                                                        || name.contains("lens")
                                                                         || name.contains("mirror")
                                                                         || name.contains("sphere")
                                                                         || name.contains("cube")
@@ -1758,12 +2194,15 @@ pub async fn run() {
                                                         let m = glam::Mat4::from_cols_array(&obj.transform_matrix);
                                                         let (s, r, t) = m.to_scale_rotation_translation();
                                                         let lname = obj.name.to_ascii_lowercase();
-                                                        if lname.contains("lens")
+                                                        if lname.contains("image")
+                                                            || lname.contains("lens")
                                                             || lname.contains("mirror")
                                                             || lname.contains("sphere")
                                                             || lname.contains("cube")
                                                         {
-                                                            let shape = if lname.contains("lens") {
+                                                            let shape = if lname.contains("image") {
+                                                                PrimitiveShape::ImagePlane
+                                                            } else if lname.contains("lens") {
                                                                 PrimitiveShape::SphericalLens
                                                             } else if lname.contains("mirror") {
                                                                 PrimitiveShape::ParabolicMirror
@@ -1817,7 +2256,8 @@ pub async fn run() {
                                                                     Some(decanter_obj_id)
                                                                 } else if lname.contains("wine") {
                                                                     Some(wine_obj_id)
-                                                                } else if lname.contains("lens")
+                                                                } else if lname.contains("image")
+                                                                    || lname.contains("lens")
                                                                     || lname.contains("mirror")
                                                                     || lname.contains("sphere")
                                                                     || lname.contains("cube")
@@ -1887,17 +2327,108 @@ pub async fn run() {
                                             SceneKind::Wine => wine_scene_id,
                                             SceneKind::CornellBox => cornell_scene_id,
                                         };
-                                        for object_id in main_db.scene_visible_selectable_objects(scene_id) {
-                                            if let Some(target) = object_target_by_id.get(&object_id).copied() {
-                                                if !target_allowed_in_scene(scene_kind, target) {
-                                                    continue;
-                                                }
-                                                let label = main_db.objects.get(&object_id).map(|o| o.name.as_str()).unwrap_or("Object");
-                                                if ui.selectable_label(has_selection && gizmo_target == target, label).clicked() {
+                                        let scene_object_ids = main_db.scene_objects_recursive(scene_id);
+                                        let mut delete_object_id = None;
+                                        for object_id in scene_object_ids {
+                                            let Some(target) = object_target_by_id.get(&object_id).copied() else {
+                                                continue;
+                                            };
+                                            let label = main_db
+                                                .objects
+                                                .get(&object_id)
+                                                .map(|o| o.name.as_str())
+                                                .unwrap_or("Object");
+                                            let is_selectable = target_allowed_in_scene(scene_kind, target);
+                                            let is_selected = has_selection
+                                                && if target == GizmoTargetKind::Sphere {
+                                                    gizmo_target == GizmoTargetKind::Sphere
+                                                        && selected_primitive_id == object_id
+                                                } else {
+                                                    gizmo_target == target
+                                                };
+                                            ui.horizontal(|ui| {
+                                                let clicked = ui
+                                                    .add_enabled_ui(is_selectable, |ui| {
+                                                        ui.selectable_label(is_selected, label).clicked()
+                                                    })
+                                                    .inner;
+                                                if clicked {
                                                     gizmo_target = target;
                                                     has_selection = true;
+                                                    if target == GizmoTargetKind::Sphere {
+                                                        selected_primitive_id = object_id;
+                                                        if let Some(shape) =
+                                                            primitive_shape_by_id.get(&object_id).copied()
+                                                        {
+                                                            primitive_shape = shape;
+                                                            uniforms.sphere_params[3] = match shape {
+                                                                PrimitiveShape::Cube => 0.0,
+                                                                PrimitiveShape::Sphere => 1.0,
+                                                                PrimitiveShape::ParabolicMirror => 2.0,
+                                                                PrimitiveShape::SphericalLens => 3.0,
+                                                                PrimitiveShape::ImagePlane => 4.0,
+                                                            };
+                                                            if shape == PrimitiveShape::SphericalLens {
+                                                                let lens_params =
+                                                                    *primitive_lens_params_by_id
+                                                                        .entry(object_id)
+                                                                        .or_insert(uniforms.lens_params);
+                                                                uniforms.lens_params = lens_params;
+                                                            }
+                                                        }
+                                                        if let Some(obj) = main_db.objects.get(&object_id) {
+                                                            uniforms.sphere_pos = [
+                                                                obj.transform.location.x,
+                                                                obj.transform.location.y,
+                                                                obj.transform.location.z,
+                                                                sphere_radius,
+                                                            ];
+                                                            sphere_rotation = obj.transform.rotation;
+                                                            sphere_scale = obj.transform.scale;
+                                                            uniforms.sphere_rot = [
+                                                                sphere_rotation.x,
+                                                                sphere_rotation.y,
+                                                                sphere_rotation.z,
+                                                                sphere_rotation.w,
+                                                            ];
+                                                            uniforms.sphere_extent = [
+                                                                sphere_radius * sphere_scale.x,
+                                                                sphere_radius * sphere_scale.y,
+                                                                sphere_radius * sphere_scale.z,
+                                                                0.0,
+                                                            ];
+                                                        }
+                                                    }
                                                 }
+                                                if ui.small_button("X").clicked() {
+                                                    delete_object_id = Some(object_id);
+                                                }
+                                            });
+                                        }
+                                        if let Some(object_id) = delete_object_id {
+                                            let was_selected = has_selection
+                                                && if object_id == selected_primitive_id {
+                                                    gizmo_target == GizmoTargetKind::Sphere
+                                                } else {
+                                                    object_target_by_id
+                                                        .get(&object_id)
+                                                        .copied()
+                                                        .is_some_and(|target| target == gizmo_target)
+                                                };
+                                            if primitive_shape_by_id.contains_key(&object_id) {
+                                                main_db.delete_object(object_id);
+                                                object_target_by_id.remove(&object_id);
+                                                primitive_shape_by_id.remove(&object_id);
+                                                primitive_lens_params_by_id.remove(&object_id);
+                                                object_material_names.remove(&object_id);
+                                            } else {
+                                                main_db.unlink_object_from_scene(scene_id, object_id);
                                             }
+                                            if was_selected {
+                                                has_selection = false;
+                                                gizmo_target = default_target_for_scene(scene_kind);
+                                            }
+                                            accumulation_dirty = true;
                                         }
                                         if !project_status.is_empty() {
                                             ui.separator();
@@ -1938,7 +2469,7 @@ pub async fn run() {
                                             match gizmo_target {
                                                 GizmoTargetKind::Sphere => main_db
                                                     .objects
-                                                    .get(&sphere_obj_id)
+                                                    .get(&selected_primitive_id)
                                                     .map(|obj| obj.name.as_str())
                                                     .unwrap_or(target_label(gizmo_target)),
                                                 _ => target_label(gizmo_target),
@@ -1952,6 +2483,25 @@ pub async fn run() {
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Rotate, "Rotate");
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Scale, "Scale");
                                         });
+                                        if has_selection
+                                            && gizmo_target == GizmoTargetKind::Sphere
+                                            && matches!(
+                                                primitive_shape,
+                                                PrimitiveShape::SphericalLens | PrimitiveShape::ParabolicMirror
+                                            )
+                                        {
+                                            ui.separator();
+                                            ui.collapsing("Optical Trace", |ui| {
+                                                ui.checkbox(&mut optical_trace_enabled, "Show rays");
+                                                ui.add(
+                                                    egui::Slider::new(&mut optical_trace_rays, 3..=21)
+                                                        .text("Rays"),
+                                                );
+                                                if optical_trace_rays % 2 == 0 {
+                                                    optical_trace_rays += 1;
+                                                }
+                                            });
+                                        }
                                         if has_selection
                                             && gizmo_target == GizmoTargetKind::Sphere
                                             && primitive_shape == PrimitiveShape::SphericalLens
@@ -1990,6 +2540,10 @@ pub async fn run() {
                                                 uniforms.lens_params[1] = uniforms.lens_params[1].max(0.25);
                                                 uniforms.lens_params[2] = uniforms.lens_params[2].max(0.05);
                                                 if lens_changed {
+                                                    primitive_lens_params_by_id.insert(
+                                                        selected_primitive_id,
+                                                        uniforms.lens_params,
+                                                    );
                                                     accumulation_dirty = true;
                                                 }
                                             });
@@ -2018,7 +2572,7 @@ pub async fn run() {
                                             ui.collapsing("Shader Graph", |ui| {
                                                 let selected_object_id = if has_selection {
                                                     match gizmo_target {
-                                                        GizmoTargetKind::Sphere => Some(sphere_obj_id),
+                                                        GizmoTargetKind::Sphere => Some(selected_primitive_id),
                                                         GizmoTargetKind::Decanter => Some(decanter_obj_id),
                                                         GizmoTargetKind::WineGlass => Some(wine_obj_id),
                                                         GizmoTargetKind::CornellBox => Some(cornell_obj_id),
@@ -2591,6 +3145,16 @@ pub async fn run() {
                                                 .max(uniforms.sphere_extent[1])
                                                 .max(uniforms.sphere_extent[2]),
                                         ),
+                                        PrimitiveShape::ImagePlane => intersect_cube(
+                                            ro,
+                                            rd,
+                                            sphere_center,
+                                            glam::Vec3::new(
+                                                uniforms.sphere_extent[0],
+                                                uniforms.sphere_extent[1],
+                                                0.05,
+                                            ),
+                                        ),
                                     }
                                 } else {
                                     None
@@ -2750,6 +3314,104 @@ pub async fn run() {
                                         painter.circle_filled(Pos2::new(s[0], s[1]), 3.0, line_color);
                                     }
                                 }
+
+                                if optical_trace_enabled
+                                    && gizmo_target == GizmoTargetKind::Sphere
+                                    && matches!(
+                                        primitive_shape,
+                                        PrimitiveShape::SphericalLens | PrimitiveShape::ParabolicMirror
+                                    )
+                                {
+                                    let display = [display_size[0].max(1.0), display_size[1].max(1.0)];
+                                    let primitive_center = glam::Vec3::new(
+                                        uniforms.sphere_pos[0],
+                                        uniforms.sphere_pos[1],
+                                        uniforms.sphere_pos[2],
+                                    );
+                                    let axis = (sphere_rotation * glam::Vec3::Z).normalize_or_zero();
+                                    let tangent = (sphere_rotation * glam::Vec3::Y).normalize_or_zero();
+                                    let aperture = uniforms.sphere_extent[0]
+                                        .min(uniforms.sphere_extent[1])
+                                        .max(0.1)
+                                        * 0.82;
+                                    let ray_count = optical_trace_rays.max(3);
+                                    let denom = (ray_count - 1).max(1) as f32;
+                                    let incoming_color = Color32::from_rgb(255, 230, 120);
+                                    let outgoing_color = Color32::from_rgb(105, 205, 255);
+                                    let focus_color = Color32::from_rgb(255, 125, 72);
+                                    let draw_segment = |a: glam::Vec3,
+                                                        b: glam::Vec3,
+                                                        color: Color32,
+                                                        width: f32| {
+                                        if let (Some(pa), Some(pb)) = (
+                                            world_to_screen(a, view, projection, display),
+                                            world_to_screen(b, view, projection, display),
+                                        ) {
+                                            painter.line_segment(
+                                                [Pos2::new(pa[0], pa[1]), Pos2::new(pb[0], pb[1])],
+                                                Stroke::new(width, color),
+                                            );
+                                        }
+                                    };
+
+                                    match primitive_shape {
+                                        PrimitiveShape::SphericalLens => {
+                                            let r1 = uniforms.lens_params[0].max(0.25);
+                                            let r2 = uniforms.lens_params[1].max(0.25);
+                                            let thickness = uniforms.lens_params[2].max(0.05);
+                                            let ior = uniforms.sphere_params[1].max(1.01);
+                                            let power = (ior - 1.0)
+                                                * (1.0 / r1
+                                                    + 1.0 / r2
+                                                    - ((ior - 1.0) * thickness)
+                                                        / (ior * r1 * r2).max(1e-4));
+                                            let focal_length = if power.abs() > 1e-4 {
+                                                (1.0 / power).clamp(0.5, 120.0)
+                                            } else {
+                                                120.0
+                                            };
+                                            let front_plane = primitive_center - axis * (thickness * 0.5);
+                                            let back_plane = primitive_center + axis * (thickness * 0.5);
+                                            let focus = primitive_center + axis * focal_length;
+                                            if let Some(fp) = world_to_screen(focus, view, projection, display) {
+                                                painter.circle_filled(Pos2::new(fp[0], fp[1]), 4.0, focus_color);
+                                            }
+                                            for i in 0..ray_count {
+                                                let t = i as f32 / denom;
+                                                let offset = (t * 2.0 - 1.0) * aperture;
+                                                let front_hit = front_plane + tangent * offset;
+                                                let back_hit = back_plane + tangent * offset;
+                                                let start = front_hit - axis * (aperture * 2.5 + thickness);
+                                                draw_segment(start, front_hit, incoming_color, 1.4);
+                                                draw_segment(front_hit, back_hit, incoming_color, 1.0);
+                                                draw_segment(back_hit, focus, outgoing_color, 1.6);
+                                            }
+                                        }
+                                        PrimitiveShape::ParabolicMirror => {
+                                            let radius = uniforms.sphere_extent[0]
+                                                .min(uniforms.sphere_extent[1])
+                                                .max(0.1);
+                                            let depth = uniforms.sphere_extent[2].max(0.1);
+                                            let focal_length = (radius * radius / (8.0 * depth)).max(0.1);
+                                            let vertex = primitive_center - axis * depth;
+                                            let focus = vertex + axis * focal_length;
+                                            if let Some(fp) = world_to_screen(focus, view, projection, display) {
+                                                painter.circle_filled(Pos2::new(fp[0], fp[1]), 4.0, focus_color);
+                                            }
+                                            for i in 0..ray_count {
+                                                let t = i as f32 / denom;
+                                                let offset = (t * 2.0 - 1.0) * aperture;
+                                                let radial = offset.abs().min(radius * 0.98);
+                                                let z = -depth + (radial * radial) / (4.0 * focal_length);
+                                                let mirror_hit = primitive_center + axis * z + tangent * offset;
+                                                let start = mirror_hit + axis * (aperture * 2.5 + depth);
+                                                draw_segment(start, mirror_hit, incoming_color, 1.4);
+                                                draw_segment(mirror_hit, focus, outgoing_color, 1.6);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                             uniforms.sun_intensity = sun_intensity.max(0.0);
                             uniforms.scene_kind = if current_scene_exists {
@@ -2807,7 +3469,7 @@ pub async fn run() {
                             uniforms.cornell_enabled = if cornell_visible { 1 } else { 0 };
                             uniforms.mesh_enabled = if decanter_visible || wine_visible { 1 } else { 0 };
                             let sphere_mat = object_material_names
-                                .get(&sphere_obj_id)
+                                .get(&selected_primitive_id)
                                 .cloned()
                                 .unwrap_or_else(|| "White".to_string());
                             let sphere_preview = material_runtime_overrides
@@ -2934,29 +3596,7 @@ pub async fn run() {
                                 last_material_signature = material_signature;
                                 accumulation_dirty = true;
                             }
-                            if current_scene_exists {
-                                if scene_kind == SceneKind::Wine && wine_visible {
-                                    photon_emitter_center = [
-                                        uniforms.mesh_center[0],
-                                        uniforms.mesh_center[1],
-                                        uniforms.mesh_center[2],
-                                        uniforms.mesh_center[3].max(0.25),
-                                    ];
-                                    photons_per_frame = 262_144;
-                                } else if scene_kind == SceneKind::Decanter
-                                    && (decanter_visible || wine_visible)
-                                {
-                                    photon_emitter_center = [
-                                        uniforms.decanter_center[0],
-                                        uniforms.decanter_center[1],
-                                        uniforms.decanter_center[2],
-                                        uniforms.decanter_center[3].max(0.25),
-                                    ];
-                                    photons_per_frame = 262_144;
-                                }
-                            }
-
-                            if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
+                            if let Some(obj) = main_db.objects.get_mut(&selected_primitive_id) {
                                 obj.transform.location = glam::Vec3::new(
                                     uniforms.sphere_pos[0],
                                     uniforms.sphere_pos[1],
@@ -3067,6 +3707,184 @@ pub async fn run() {
                             } else {
                                 uniforms.frame = uniforms.frame.saturating_add(1);
                             }
+                            let mut primitive_instances = [GpuPrimitive {
+                                pos: [0.0; 4],
+                                color: [0.0; 4],
+                                params: [0.0; 4],
+                                rot: [0.0, 0.0, 0.0, 1.0],
+                                extent: [0.0; 4],
+                                lens: [0.0; 4],
+                            }; MAX_PRIMITIVES];
+                            let primitive_scene_id = match scene_kind {
+                                SceneKind::Decanter => decanter_scene_id,
+                                SceneKind::Wine => wine_scene_id,
+                                SceneKind::CornellBox => cornell_scene_id,
+                            };
+                            let current_scene_exists_for_photons =
+                                primitive_scene_id.0 != 0 && main_db.scenes.contains_key(&primitive_scene_id);
+                            let (decanter_visible_for_photons, wine_visible_for_photons, cornell_visible_for_photons) =
+                                if current_scene_exists_for_photons {
+                                    let visible =
+                                        main_db.scene_visible_selectable_objects(primitive_scene_id);
+                                    (
+                                        visible.contains(&decanter_obj_id),
+                                        visible.contains(&wine_obj_id),
+                                        visible.contains(&cornell_obj_id),
+                                    )
+                                } else {
+                                    (false, false, false)
+                                };
+                            let visible_primitive_ids = main_db.scene_visible_selectable_objects(primitive_scene_id);
+                            let mut photon_bounds_min = glam::Vec3::splat(f32::INFINITY);
+                            let mut photon_bounds_max = glam::Vec3::splat(f32::NEG_INFINITY);
+                            let mut photon_bounds_valid = false;
+                            if decanter_visible_for_photons {
+                                include_photon_bounds(
+                                    &mut photon_bounds_min,
+                                    &mut photon_bounds_max,
+                                    &mut photon_bounds_valid,
+                                    glam::Vec3::new(
+                                        uniforms.decanter_center[0],
+                                        uniforms.decanter_center[1],
+                                        uniforms.decanter_center[2],
+                                    ),
+                                    uniforms.decanter_center[3],
+                                );
+                            }
+                            if wine_visible_for_photons {
+                                include_photon_bounds(
+                                    &mut photon_bounds_min,
+                                    &mut photon_bounds_max,
+                                    &mut photon_bounds_valid,
+                                    glam::Vec3::new(
+                                        uniforms.mesh_center[0],
+                                        uniforms.mesh_center[1],
+                                        uniforms.mesh_center[2],
+                                    ),
+                                    uniforms.mesh_center[3],
+                                );
+                            }
+                            if cornell_visible_for_photons {
+                                include_photon_bounds(
+                                    &mut photon_bounds_min,
+                                    &mut photon_bounds_max,
+                                    &mut photon_bounds_valid,
+                                    glam::Vec3::new(
+                                        uniforms.cornell_center[0],
+                                        uniforms.cornell_center[1],
+                                        uniforms.cornell_center[2],
+                                    ),
+                                    uniforms.cornell_center[3],
+                                );
+                            }
+                            let mut primitive_count = 0usize;
+                            for object_id in visible_primitive_ids {
+                                if primitive_count >= MAX_PRIMITIVES {
+                                    break;
+                                }
+                                let Some(shape) = primitive_shape_by_id.get(&object_id).copied() else {
+                                    continue;
+                                };
+                                let Some(obj) = main_db.objects.get(&object_id) else {
+                                    continue;
+                                };
+                                let mat_name = object_material_names
+                                    .get(&object_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| "White".to_string());
+                                let preview = material_runtime_overrides
+                                    .get(&mat_name)
+                                    .copied()
+                                    .unwrap_or_else(|| preview_from_material_data(material_library.get(&mat_name)));
+                                let mut color = [
+                                    preview.base_color[0],
+                                    preview.base_color[1],
+                                    preview.base_color[2],
+                                    if preview.bsdf_connected {
+                                        preview.transmission
+                                    } else {
+                                        0.0
+                                    },
+                                ];
+                                if shape == PrimitiveShape::ImagePlane {
+                                    color[3] = 0.0;
+                                }
+                                let mut params = [
+                                    preview.roughness,
+                                    preview.ior,
+                                    if preview.bsdf_connected { 1.0 } else { 0.0 },
+                                    match shape {
+                                        PrimitiveShape::Cube => 0.0,
+                                        PrimitiveShape::Sphere => 1.0,
+                                        PrimitiveShape::ParabolicMirror => 2.0,
+                                        PrimitiveShape::SphericalLens => 3.0,
+                                        PrimitiveShape::ImagePlane => 4.0,
+                                    },
+                                ];
+                                if shape == PrimitiveShape::ImagePlane {
+                                    params[2] = 1.0;
+                                }
+                                let lens_params = primitive_lens_params_by_id
+                                    .get(&object_id)
+                                    .copied()
+                                    .unwrap_or(uniforms.lens_params);
+                                let primitive_center = obj.transform.location;
+                                let primitive_radius = sphere_radius
+                                    * obj.transform.scale.max_element().max(0.01);
+                                include_photon_bounds(
+                                    &mut photon_bounds_min,
+                                    &mut photon_bounds_max,
+                                    &mut photon_bounds_valid,
+                                    primitive_center,
+                                    primitive_radius,
+                                );
+                                primitive_instances[primitive_count] = GpuPrimitive {
+                                    pos: [
+                                        obj.transform.location.x,
+                                        obj.transform.location.y,
+                                        obj.transform.location.z,
+                                        sphere_radius,
+                                    ],
+                                    color,
+                                    params,
+                                    rot: [
+                                        obj.transform.rotation.x,
+                                        obj.transform.rotation.y,
+                                        obj.transform.rotation.z,
+                                        obj.transform.rotation.w,
+                                    ],
+                                    extent: [
+                                        sphere_radius * obj.transform.scale.x,
+                                        sphere_radius * obj.transform.scale.y,
+                                        if shape == PrimitiveShape::ImagePlane {
+                                            0.05
+                                        } else {
+                                            sphere_radius * obj.transform.scale.z
+                                        },
+                                        0.0,
+                                    ],
+                                    lens: lens_params,
+                                };
+                                primitive_count += 1;
+                            }
+                            uniforms.primitive_count = primitive_count as u32;
+                            if current_scene_exists_for_photons && photon_bounds_valid {
+                                let photon_center = (photon_bounds_min + photon_bounds_max) * 0.5;
+                                let photon_radius =
+                                    (photon_bounds_max - photon_bounds_min).length() * 0.55;
+                                photon_emitter_center = [
+                                    photon_center.x,
+                                    photon_center.y,
+                                    photon_center.z,
+                                    photon_radius.max(0.25),
+                                ];
+                                photons_per_frame = 262_144;
+                            }
+                            queue.write_buffer(
+                                &primitive_buffer,
+                                0,
+                                bytemuck::cast_slice(&primitive_instances),
+                            );
                             queue.write_buffer(&ubuf, 0, bytemuck::bytes_of(&uniforms));
 
                             let view = tex
@@ -3095,6 +3913,8 @@ pub async fn run() {
                                 uniforms.light_pos,
                                 photon_emitter_center,
                                 uniforms.frame,
+                                photons_per_frame,
+                                uniforms.primitive_count,
                             );
                             photon_mapper.emit_photons(&mut encoder, photons_per_frame);
                             photon_mapper.build_spatial_structure(&mut encoder);

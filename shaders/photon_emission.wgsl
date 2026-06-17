@@ -7,6 +7,8 @@ struct PhotonMapUniforms {
   voxel_size: f32,
   hash_table_size: u32,
   frame: u32,
+  primitive_count: u32,
+  pad: vec3<u32>,
 };
 
 struct Photon {
@@ -23,6 +25,19 @@ struct MaterialData {
   params: vec4<f32>,
 };
 
+struct PrimitiveData {
+  pos: vec4<f32>,
+  color: vec4<f32>,
+  params: vec4<f32>,
+  rot: vec4<f32>,
+  extent: vec4<f32>,
+  lens: vec4<f32>,
+};
+
+struct PrimitiveBlock {
+  items: array<PrimitiveData, 64>,
+};
+
 @group(0) @binding(0) var<uniform> uniforms: PhotonMapUniforms;
 @group(0) @binding(1) var acc_struct: acceleration_structure;
 @group(0) @binding(2) var<storage, read_write> photons: array<Photon>;
@@ -32,6 +47,7 @@ struct MaterialData {
 @group(0) @binding(6) var<storage, read> mesh_indices: array<u32>;
 @group(0) @binding(7) var<storage, read> mesh_triangle_material: array<u32>;
 @group(0) @binding(8) var<storage, read> materials: array<MaterialData>;
+@group(0) @binding(9) var<uniform> primitive_block: PrimitiveBlock;
 
 const MAX_PHOTONS: u32 = 1000000u;
 const PI: f32 = 3.141592653589793;
@@ -81,6 +97,180 @@ fn ground_plane_intersection(origin: vec3<f32>, direction: vec3<f32>) -> f32 {
   return select(1e38, t, t > 0.001);
 }
 
+fn quat_mul_vec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+  let qv = q.xyz;
+  let t = 2.0 * cross(qv, v);
+  return v + q.w * t + cross(qv, t);
+}
+
+fn primitive_shape_for(params: vec4<f32>) -> u32 {
+  if (params.w >= 3.5) { return 4u; }
+  if (params.w >= 2.5) { return 3u; }
+  if (params.w >= 1.5) { return 2u; }
+  if (params.w >= 0.5) { return 1u; }
+  return 0u;
+}
+
+fn cube_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>) -> f32 {
+  let inv = 1.0 / direction;
+  let t0 = (-half_extent - origin) * inv;
+  let t1 = (half_extent - origin) * inv;
+  let tmin = min(t0, t1);
+  let tmax = max(t0, t1);
+  let near_t = max(max(tmin.x, tmin.y), tmin.z);
+  let far_t = min(min(tmax.x, tmax.y), tmax.z);
+  if (far_t < max(near_t, 0.001)) { return 1e38; }
+  return select(far_t, near_t, near_t > 0.001);
+}
+
+fn cube_normal(local_hit: vec3<f32>, half_extent: vec3<f32>) -> vec3<f32> {
+  let p = local_hit / max(half_extent, vec3<f32>(1e-4));
+  let ax = abs(p.x);
+  let ay = abs(p.y);
+  let az = abs(p.z);
+  if (ax > ay && ax > az) { return vec3<f32>(sign(p.x), 0.0, 0.0); }
+  if (ay > az) { return vec3<f32>(0.0, sign(p.y), 0.0); }
+  return vec3<f32>(0.0, 0.0, sign(p.z));
+}
+
+fn sphere_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>, radius: f32) -> f32 {
+  let oc = origin - center;
+  let a = dot(direction, direction);
+  let b = 2.0 * dot(oc, direction);
+  let c = dot(oc, oc) - radius * radius;
+  let disc = b * b - 4.0 * a * c;
+  if (disc < 0.0) { return 1e38; }
+  let sq = sqrt(disc);
+  let t0 = (-b - sq) / (2.0 * a);
+  let t1 = (-b + sq) / (2.0 * a);
+  if (t0 > 0.001) { return t0; }
+  if (t1 > 0.001) { return t1; }
+  return 1e38;
+}
+
+fn image_plane_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>) -> f32 {
+  if (abs(direction.z) <= 1e-6) { return 1e38; }
+  let t = -origin.z / direction.z;
+  let p = origin + direction * t;
+  if (t > 0.001 && abs(p.x) <= half_extent.x && abs(p.y) <= half_extent.y) { return t; }
+  return 1e38;
+}
+
+fn parabolic_mirror_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>) -> f32 {
+  let radius = max(max(half_extent.x, half_extent.y), 1e-4);
+  let depth = max(half_extent.z, 1e-4);
+  let focal_length = (radius * radius) / (8.0 * depth);
+  let a = direction.x * direction.x + direction.y * direction.y;
+  let b = 2.0 * (origin.x * direction.x + origin.y * direction.y) - 4.0 * focal_length * direction.z;
+  let c = origin.x * origin.x + origin.y * origin.y - 4.0 * focal_length * (origin.z + depth);
+  if (abs(a) < 1e-6) { return 1e38; }
+  let disc = b * b - 4.0 * a * c;
+  if (disc <= 0.0) { return 1e38; }
+  var best_t = 1e38;
+  let sq = sqrt(disc);
+  let t0 = (-b - sq) / (2.0 * a);
+  let p0 = origin + direction * t0;
+  if (t0 > 0.001 && dot(p0.xy, p0.xy) <= radius * radius && p0.z >= -depth && p0.z <= depth) { best_t = t0; }
+  let t1 = (-b + sq) / (2.0 * a);
+  let p1 = origin + direction * t1;
+  if (t1 > 0.001 && t1 < best_t && dot(p1.xy, p1.xy) <= radius * radius && p1.z >= -depth && p1.z <= depth) { best_t = t1; }
+  return best_t;
+}
+
+fn spherical_lens_edge_radius(front_radius: f32, back_radius: f32, half_thickness: f32, max_aperture: f32) -> f32 {
+  let max_radius = min(max_aperture, min(front_radius, back_radius) * 0.999);
+  var lo = 0.0;
+  var hi = max(max_radius, 1e-4);
+  for (var i = 0; i < 18; i = i + 1) {
+    let mid = (lo + hi) * 0.5;
+    let r2 = mid * mid;
+    let front_sag = sqrt(max(front_radius * front_radius - r2, 0.0));
+    let back_sag = sqrt(max(back_radius * back_radius - r2, 0.0));
+    let gap = 2.0 * half_thickness - front_radius - back_radius + front_sag + back_sag;
+    if (gap > 0.0) { lo = mid; } else { hi = mid; }
+  }
+  return max(lo, 1e-4);
+}
+
+fn spherical_lens_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>, lens: vec4<f32>) -> f32 {
+  let base_aperture = max(max(half_extent.x, half_extent.y), 1e-4);
+  let front_radius = max(abs(lens.x), 1e-4);
+  let back_radius = max(abs(lens.y), 1e-4);
+  let half_thickness = min(max(lens.z * 0.5, 0.025), min(front_radius, back_radius) * 0.95);
+  let aperture = spherical_lens_edge_radius(front_radius, back_radius, half_thickness, base_aperture);
+  let front_center = vec3<f32>(0.0, 0.0, -half_thickness + front_radius);
+  let back_center = vec3<f32>(0.0, 0.0, half_thickness - back_radius);
+  let aperture2 = aperture * aperture;
+  var best_t = 1e38;
+  let t_front = sphere_intersection_t(origin, direction, front_center, front_radius);
+  if (t_front < 1e37) {
+    let p = origin + direction * t_front;
+    if (dot(p.xy, p.xy) <= aperture2 && p.z >= -half_thickness && p.z <= half_thickness) { best_t = t_front; }
+  }
+  let t_back = sphere_intersection_t(origin, direction, back_center, back_radius);
+  if (t_back < best_t) {
+    let p = origin + direction * t_back;
+    if (dot(p.xy, p.xy) <= aperture2 && p.z >= -half_thickness && p.z <= half_thickness) { best_t = t_back; }
+  }
+  let front_edge_z = front_center.z - sqrt(max(front_radius * front_radius - aperture2, 0.0));
+  let back_edge_z = back_center.z + sqrt(max(back_radius * back_radius - aperture2, 0.0));
+  let side_min_z = min(front_edge_z, back_edge_z);
+  let side_max_z = max(front_edge_z, back_edge_z);
+  let a = direction.x * direction.x + direction.y * direction.y;
+  if (a > 1e-6 && side_max_z - side_min_z > 1e-4) {
+    let b = 2.0 * (origin.x * direction.x + origin.y * direction.y);
+    let c = origin.x * origin.x + origin.y * origin.y - aperture2;
+    let disc = b * b - 4.0 * a * c;
+    if (disc > 0.0) {
+      let sq = sqrt(disc);
+      let t0 = (-b - sq) / (2.0 * a);
+      let p0 = origin + direction * t0;
+      if (t0 > 0.001 && t0 < best_t && p0.z >= side_min_z && p0.z <= side_max_z) { best_t = t0; }
+      let t1 = (-b + sq) / (2.0 * a);
+      let p1 = origin + direction * t1;
+      if (t1 > 0.001 && t1 < best_t && p1.z >= side_min_z && p1.z <= side_max_z) { best_t = t1; }
+    }
+  }
+  return best_t;
+}
+
+fn primitive_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> f32 {
+  let shape = primitive_shape_for(params);
+  if (shape == 4u) { return image_plane_intersection_t(origin, direction, half_extent); }
+  if (shape == 3u) { return spherical_lens_intersection_t(origin, direction, half_extent, lens); }
+  if (shape == 2u) { return parabolic_mirror_intersection_t(origin, direction, half_extent); }
+  if (shape == 1u) { return sphere_intersection_t(origin, direction, vec3<f32>(0.0), max(max(half_extent.x, half_extent.y), half_extent.z)); }
+  return cube_intersection_t(origin, direction, half_extent);
+}
+
+fn primitive_normal(local_hit: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> vec3<f32> {
+  let shape = primitive_shape_for(params);
+  if (shape == 4u) { return vec3<f32>(0.0, 0.0, select(-1.0, 1.0, local_hit.z >= 0.0)); }
+  if (shape == 3u) {
+    let base_aperture = max(max(half_extent.x, half_extent.y), 1e-4);
+    let front_radius = max(abs(lens.x), 1e-4);
+    let back_radius = max(abs(lens.y), 1e-4);
+    let half_thickness = min(max(lens.z * 0.5, 0.025), min(front_radius, back_radius) * 0.95);
+    let aperture = spherical_lens_edge_radius(front_radius, back_radius, half_thickness, base_aperture);
+    let front_center = vec3<f32>(0.0, 0.0, -half_thickness + front_radius);
+    let back_center = vec3<f32>(0.0, 0.0, half_thickness - back_radius);
+    let front_error = abs(length(local_hit - front_center) - front_radius);
+    let back_error = abs(length(local_hit - back_center) - back_radius);
+    let side_error = abs(length(local_hit.xy) - aperture);
+    if (side_error <= min(front_error, back_error)) { return normalize(vec3<f32>(local_hit.x, local_hit.y, 0.0)); }
+    if (front_error <= back_error) { return normalize(local_hit - front_center); }
+    return normalize(local_hit - back_center);
+  }
+  if (shape == 2u) {
+    let radius = max(max(half_extent.x, half_extent.y), 1e-4);
+    let depth = max(half_extent.z, 1e-4);
+    let focal_length = (radius * radius) / (8.0 * depth);
+    return normalize(vec3<f32>(2.0 * local_hit.x, 2.0 * local_hit.y, -4.0 * focal_length));
+  }
+  if (shape == 1u) { return normalize(local_hit); }
+  return cube_normal(local_hit, half_extent);
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= uniforms.photon_count) { return; }
@@ -114,9 +304,66 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tri_t = select(1e38, tri_hit.t, tri_hit.kind != RAY_QUERY_INTERSECTION_NONE);
     let ground_t = ground_plane_intersection(ro, rd);
 
-    if (ground_t < tri_t) {
+    var primitive_t = 1e38;
+    var primitive_index = 0u;
+    var primitive_local_ro = vec3<f32>(0.0);
+    var primitive_local_rd = vec3<f32>(0.0, 0.0, 1.0);
+    let primitive_limit = min(uniforms.primitive_count, 64u);
+    for (var pi = 0u; pi < primitive_limit; pi = pi + 1u) {
+      let prim_data = primitive_block.items[pi];
+      let q_inv = vec4<f32>(-prim_data.rot.xyz, prim_data.rot.w);
+      let local_ro = quat_mul_vec(q_inv, ro - prim_data.pos.xyz);
+      let local_rd = quat_mul_vec(q_inv, rd);
+      let t_local = primitive_intersection_t(local_ro, local_rd, prim_data.extent.xyz, prim_data.params, prim_data.lens);
+      if (t_local < primitive_t) {
+        primitive_t = t_local;
+        primitive_index = pi;
+        primitive_local_ro = local_ro;
+        primitive_local_rd = local_rd;
+      }
+    }
+
+    if (ground_t < tri_t && ground_t < primitive_t) {
       if (passed_glass) {
         let hit_pos = ro + rd * ground_t;
+        write_photon(gid.x, hit_pos, -rd, lambda_nm, power);
+      }
+      break;
+    }
+
+    if (primitive_t < tri_t) {
+      let prim_data = primitive_block.items[primitive_index];
+      let local_hit = primitive_local_ro + primitive_local_rd * primitive_t;
+      let shape = primitive_shape_for(prim_data.params);
+      var normal = normalize(quat_mul_vec(prim_data.rot, primitive_normal(local_hit, prim_data.extent.xyz, prim_data.params, prim_data.lens)));
+      let hit_pos = ro + rd * primitive_t;
+      let transmission = clamp(prim_data.color.w, 0.0, 1.0);
+
+      if (shape == 2u) {
+        let face_n = select(normal, -normal, dot(rd, normal) > 0.0);
+        rd = normalize(reflect(rd, face_n));
+        ro = hit_pos + rd * 0.01;
+        passed_glass = true;
+        continue;
+      }
+
+      if (shape == 3u || transmission >= 0.5) {
+        let ior = max(snell_ior_for_wavelength(lambda_nm, max(prim_data.params.y, 1.01), 0.12), 1.01);
+        let entering = dot(rd, normal) < 0.0;
+        normal = select(-normal, normal, entering);
+        let eta = select(ior, 1.0 / ior, entering);
+        var next_dir = refract(rd, normal, eta);
+        if (dot(next_dir, next_dir) < 0.0001) {
+          next_dir = reflect(rd, normal);
+        }
+        passed_glass = true;
+        power = power * 0.96;
+        rd = normalize(next_dir);
+        ro = hit_pos + rd * 0.01;
+        continue;
+      }
+
+      if (passed_glass) {
         write_photon(gid.x, hit_pos, -rd, lambda_nm, power);
       }
       break;

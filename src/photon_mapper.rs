@@ -13,6 +13,8 @@ struct PhotonMapUniforms {
     voxel_size: f32,
     hash_table_size: u32,
     frame: u32,
+    primitive_count: u32,
+    _pad: [u32; 7],
 }
 
 #[repr(C)]
@@ -48,6 +50,7 @@ impl PhotonMapper {
         mesh_idx_buf: &wgpu::Buffer,
         mesh_tri_mat_buf: &wgpu::Buffer,
         mesh_mat_buf: &wgpu::Buffer,
+        primitive_buf: &wgpu::Buffer,
     ) -> Self {
         let photon_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("photon_buffer"),
@@ -78,6 +81,8 @@ impl PhotonMapper {
             voxel_size: VOXEL_SIZE,
             hash_table_size: HASH_TABLE_SIZE,
             frame: 0,
+            primitive_count: 0,
+            _pad: [0; 7],
         };
 
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -105,6 +110,7 @@ impl PhotonMapper {
                 storage_entry(6, true),
                 storage_entry(7, true),
                 storage_entry(8, true),
+                uniform_entry(9),
             ],
         });
 
@@ -156,6 +162,10 @@ impl PhotonMapper {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: mesh_mat_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: primitive_buf.as_entire_binding(),
                 },
             ],
         });
@@ -238,7 +248,10 @@ impl PhotonMapper {
         light_pos: [f32; 4],
         emitter_center: [f32; 4],
         frame: u32,
+        photons_per_frame: u32,
+        primitive_count: u32,
     ) {
+        self.photon_count = photons_per_frame.min(MAX_PHOTONS);
         let uniforms = PhotonMapUniforms {
             light_pos,
             emitter_center,
@@ -246,6 +259,8 @@ impl PhotonMapper {
             voxel_size: VOXEL_SIZE,
             hash_table_size: HASH_TABLE_SIZE,
             frame,
+            primitive_count: primitive_count.min(64),
+            _pad: [0; 7],
         };
         queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -260,7 +275,7 @@ impl PhotonMapper {
         });
         pass.set_pipeline(&self.emission_pipeline);
         pass.set_bind_group(0, &self.emission_bind_group, &[]);
-        pass.dispatch_workgroups(photons_per_frame.div_ceil(256), 1, 1);
+        pass.dispatch_workgroups(self.photon_count.div_ceil(256), 1, 1);
         drop(pass);
     }
 

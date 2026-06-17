@@ -3211,6 +3211,7 @@ dependencies = [
  "egui_node_editor",
  "glam 0.24.2",
  "gltf",
+ "image",
  "petgraph",
  "pollster",
  "serde",
