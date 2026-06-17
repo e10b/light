@@ -66,8 +66,8 @@ struct Photon {
   wavelength_nm: f32,
   direction: vec3<f32>,
   power: f32,
+  color: vec3<f32>,
   next: u32,
-  pad3: vec3<u32>,
 };
 
 struct PhotonMapUniforms {
@@ -244,10 +244,10 @@ fn estimate_photon_density(position: vec3<f32>, normal: vec3<f32>, radius: f32) 
           let photon = photons[node - 1u];
           let delta = photon.position - position;
           let d2 = dot(delta, delta);
-          let same_side = dot(normal, photon.direction) > 0.0;
+          let same_side = abs(dot(normal, photon.direction)) > 0.0;
           if (d2 <= radius2 && same_side) {
             let kernel = 1.0 - d2 / max(radius2, 1e-5);
-            flux = flux + wl(photon.wavelength_nm) * photon.power * kernel;
+            flux = flux + photon.color * photon.power * kernel;
           }
           node = photon.next;
           visited = visited + 1u;
@@ -431,11 +431,21 @@ fn image_plane_color(local_hit: vec3<f32>, half_extent: vec3<f32>) -> vec3<f32> 
     vec2<f32>(0.0),
     vec2<f32>(1.0)
   );
-  let xy = vec2<i32>(
-    i32(clamp(floor(uv.x * f32(dims.x)), 0.0, f32(dims.x - 1u))),
-    i32(clamp(floor(uv.y * f32(dims.y)), 0.0, f32(dims.y - 1u)))
+  let texel = uv * vec2<f32>(f32(dims.x), f32(dims.y)) - vec2<f32>(0.5);
+  let base = floor(texel);
+  let frac = fract(texel);
+  let p00 = vec2<i32>(
+    i32(clamp(base.x, 0.0, f32(dims.x - 1u))),
+    i32(clamp(base.y, 0.0, f32(dims.y - 1u)))
   );
-  return textureLoad(image_texture, xy, 0).rgb;
+  let p10 = vec2<i32>(min(p00.x + 1, i32(dims.x) - 1), p00.y);
+  let p01 = vec2<i32>(p00.x, min(p00.y + 1, i32(dims.y) - 1));
+  let p11 = vec2<i32>(min(p00.x + 1, i32(dims.x) - 1), min(p00.y + 1, i32(dims.y) - 1));
+  let c00 = textureLoad(image_texture, p00, 0).rgb;
+  let c10 = textureLoad(image_texture, p10, 0).rgb;
+  let c01 = textureLoad(image_texture, p01, 0).rgb;
+  let c11 = textureLoad(image_texture, p11, 0).rgb;
+  return mix(mix(c00, c10, frac.x), mix(c01, c11, frac.x), frac.y);
 }
 
 fn spherical_lens_edge_radius(front_radius: f32, back_radius: f32, half_thickness: f32, max_aperture: f32) -> f32 {
@@ -922,9 +932,8 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       }
       if (primitive_shape_for(hit_primitive.params) == 4u) {
         albedo = image_plane_color(local_hit, hit_primitive.extent.xyz);
-        roughness = 0.78;
-        transmission = 0.0;
-        ior = 1.0;
+        L = L + throughput * albedo;
+        break;
       }
     } else if (hit_type == 2u) {
       // True triangle normal/material from ray-query primitive + barycentrics.

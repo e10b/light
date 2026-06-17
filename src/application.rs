@@ -1119,7 +1119,7 @@ pub async fn run() {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -1281,7 +1281,7 @@ pub async fn run() {
                 binding: 13,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
                 },
@@ -1317,6 +1317,7 @@ pub async fn run() {
         &tri_mat_buf,
         &mat_buf,
         &primitive_buffer,
+        &puppy_texture_view,
     );
 
     let ugroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1713,6 +1714,163 @@ pub async fn run() {
                                         ui.separator();
                                         if ui.button("New Cube Scene").clicked() {
                                             requested_scene = SceneKind::Decanter;
+                                        }
+                                        if ui.button("Telescope Demo").clicked() {
+                                            let (scene_id, master_id) = match scene_kind {
+                                                SceneKind::Decanter => (decanter_scene_id, decanter_master),
+                                                SceneKind::Wine => (wine_scene_id, wine_master),
+                                                SceneKind::CornellBox => (cornell_scene_id, cornell_master),
+                                            };
+                                            if scene_id.0 != 0 && master_id.0 != 0 {
+                                                let scene_objects = main_db.scene_objects_recursive(scene_id);
+                                                for object_id in scene_objects {
+                                                    if primitive_shape_by_id.contains_key(&object_id) {
+                                                        main_db.delete_object(object_id);
+                                                        object_target_by_id.remove(&object_id);
+                                                        primitive_shape_by_id.remove(&object_id);
+                                                        primitive_lens_params_by_id.remove(&object_id);
+                                                        object_material_names.remove(&object_id);
+                                                    } else {
+                                                        main_db.unlink_object_from_scene(scene_id, object_id);
+                                                    }
+                                                }
+
+                                                let bench_y = -1.5 + sphere_radius * 0.55;
+                                                let bench_rot = glam::Quat::from_rotation_y(
+                                                    std::f32::consts::FRAC_PI_2,
+                                                );
+                                                let image_aspect = puppy_dimensions.0 as f32
+                                                    / puppy_dimensions.1.max(1) as f32;
+                                                let image_scale = glam::Vec3::new(
+                                                    image_aspect.max(0.1) * 0.72,
+                                                    0.72,
+                                                    1.0,
+                                                );
+                                                let objective_params = [18.0, 18.0, 0.9, 0.0];
+                                                let eyepiece_params = [9.0, 9.0, 0.55, 0.0];
+
+                                                let image_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::ImagePlane,
+                                                    "White",
+                                                    DbTransform {
+                                                        location: glam::Vec3::new(-48.0, bench_y, 0.0),
+                                                        rotation: bench_rot,
+                                                        scale: image_scale,
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&image_id) {
+                                                    obj.name = "Puppy Source".to_string();
+                                                }
+                                                main_db.collection_link_object(master_id, image_id);
+                                                main_db.ensure_scene_base(scene_id, image_id, true, true);
+
+                                                let objective_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::SphericalLens,
+                                                    "Glass",
+                                                    DbTransform {
+                                                        location: glam::Vec3::new(0.0, bench_y, 0.0),
+                                                        rotation: bench_rot,
+                                                        scale: glam::Vec3::splat(0.55),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&objective_id) {
+                                                    obj.name = "Objective Lens".to_string();
+                                                }
+                                                primitive_lens_params_by_id
+                                                    .insert(objective_id, objective_params);
+                                                main_db.collection_link_object(master_id, objective_id);
+                                                main_db.ensure_scene_base(scene_id, objective_id, true, true);
+
+                                                let eyepiece_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::SphericalLens,
+                                                    "Glass",
+                                                    DbTransform {
+                                                        location: glam::Vec3::new(35.0, bench_y, 0.0),
+                                                        rotation: bench_rot,
+                                                        scale: glam::Vec3::splat(0.34),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&eyepiece_id) {
+                                                    obj.name = "Eyepiece Lens".to_string();
+                                                }
+                                                primitive_lens_params_by_id
+                                                    .insert(eyepiece_id, eyepiece_params);
+                                                main_db.collection_link_object(master_id, eyepiece_id);
+                                                main_db.ensure_scene_base(scene_id, eyepiece_id, true, true);
+
+                                                let screen_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::Cube,
+                                                    "White",
+                                                    DbTransform {
+                                                        location: glam::Vec3::new(54.0, bench_y, 0.0),
+                                                        rotation: glam::Quat::IDENTITY,
+                                                        scale: glam::Vec3::new(0.025, 0.45, 0.6),
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&screen_id) {
+                                                    obj.name = "Exit Screen".to_string();
+                                                }
+                                                main_db.collection_link_object(master_id, screen_id);
+                                                main_db.ensure_scene_base(scene_id, screen_id, true, true);
+
+                                                selected_primitive_id = objective_id;
+                                                primitive_shape = PrimitiveShape::SphericalLens;
+                                                uniforms.sphere_params[3] = 3.0;
+                                                uniforms.lens_params = objective_params;
+                                                uniforms.sphere_pos = [0.0, bench_y, 0.0, sphere_radius];
+                                                uniforms.sphere_rot = [
+                                                    bench_rot.x,
+                                                    bench_rot.y,
+                                                    bench_rot.z,
+                                                    bench_rot.w,
+                                                ];
+                                                uniforms.sphere_extent = [
+                                                    sphere_radius * 0.55,
+                                                    sphere_radius * 0.55,
+                                                    sphere_radius * 0.55,
+                                                    0.0,
+                                                ];
+                                                sphere_rotation = bench_rot;
+                                                sphere_scale = glam::Vec3::splat(0.55);
+                                                gizmo_target = GizmoTargetKind::Sphere;
+                                                has_selection = true;
+                                                optical_trace_enabled = true;
+                                                optical_trace_rays = 9;
+                                                camera = Camera::look_at(
+                                                    glam::Vec3::new(2.0, bench_y + 8.0, 58.0),
+                                                    glam::Vec3::new(3.0, bench_y, 0.0),
+                                                );
+                                                accumulation_dirty = true;
+                                                project_status = "Telescope demo created".to_string();
+                                            }
                                         }
                                         ui.menu_button("Add", |ui| {
                                             let scene_id = match scene_kind {
@@ -3370,21 +3528,201 @@ pub async fn run() {
                                             } else {
                                                 120.0
                                             };
-                                            let front_plane = primitive_center - axis * (thickness * 0.5);
-                                            let back_plane = primitive_center + axis * (thickness * 0.5);
-                                            let focus = primitive_center + axis * focal_length;
-                                            if let Some(fp) = world_to_screen(focus, view, projection, display) {
-                                                painter.circle_filled(Pos2::new(fp[0], fp[1]), 4.0, focus_color);
-                                            }
-                                            for i in 0..ray_count {
-                                                let t = i as f32 / denom;
-                                                let offset = (t * 2.0 - 1.0) * aperture;
-                                                let front_hit = front_plane + tangent * offset;
-                                                let back_hit = back_plane + tangent * offset;
-                                                let start = front_hit - axis * (aperture * 2.5 + thickness);
-                                                draw_segment(start, front_hit, incoming_color, 1.4);
-                                                draw_segment(front_hit, back_hit, incoming_color, 1.0);
-                                                draw_segment(back_hit, focus, outgoing_color, 1.6);
+                                            let image_source = main_db
+                                                .scene_visible_selectable_objects(match scene_kind {
+                                                    SceneKind::Decanter => decanter_scene_id,
+                                                    SceneKind::Wine => wine_scene_id,
+                                                    SceneKind::CornellBox => cornell_scene_id,
+                                                })
+                                                .into_iter()
+                                                .filter(|id| *id != selected_primitive_id)
+                                                .find_map(|id| {
+                                                    if primitive_shape_by_id.get(&id).copied()
+                                                        != Some(PrimitiveShape::ImagePlane)
+                                                    {
+                                                        return None;
+                                                    }
+                                                    main_db.objects.get(&id).map(|obj| {
+                                                        (
+                                                            obj.transform.location,
+                                                            obj.transform.rotation,
+                                                            obj.transform.scale,
+                                                        )
+                                                    })
+                                                });
+                                            if let Some((image_center, image_rotation, image_scale)) = image_source {
+                                                let scene_id = match scene_kind {
+                                                    SceneKind::Decanter => decanter_scene_id,
+                                                    SceneKind::Wine => wine_scene_id,
+                                                    SceneKind::CornellBox => cornell_scene_id,
+                                                };
+                                                let visible_ids =
+                                                    main_db.scene_visible_selectable_objects(scene_id);
+                                                let mut lens_sequence = Vec::new();
+                                                for object_id in visible_ids {
+                                                    if primitive_shape_by_id.get(&object_id).copied()
+                                                        != Some(PrimitiveShape::SphericalLens)
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let Some(obj) = main_db.objects.get(&object_id) else {
+                                                        continue;
+                                                    };
+                                                    let z = (obj.transform.location - image_center).dot(axis);
+                                                    if z <= 0.05 {
+                                                        continue;
+                                                    }
+                                                    let lens_params = primitive_lens_params_by_id
+                                                        .get(&object_id)
+                                                        .copied()
+                                                        .unwrap_or(uniforms.lens_params);
+                                                    let mat_name = object_material_names
+                                                        .get(&object_id)
+                                                        .cloned()
+                                                        .unwrap_or_else(|| "Glass".to_string());
+                                                    let preview = material_runtime_overrides
+                                                        .get(&mat_name)
+                                                        .copied()
+                                                        .unwrap_or_else(|| {
+                                                            preview_from_material_data(
+                                                                material_library.get(&mat_name),
+                                                            )
+                                                        });
+                                                    let ior = preview.ior.max(1.01);
+                                                    let r1 = lens_params[0].max(0.25);
+                                                    let r2 = lens_params[1].max(0.25);
+                                                    let thickness = lens_params[2].max(0.05);
+                                                    let power = (ior - 1.0)
+                                                        * (1.0 / r1
+                                                            + 1.0 / r2
+                                                            - ((ior - 1.0) * thickness)
+                                                                / (ior * r1 * r2).max(1e-4));
+                                                    let focal = if power.abs() > 1e-4 {
+                                                        (1.0 / power).clamp(0.5, 240.0)
+                                                    } else {
+                                                        240.0
+                                                    };
+                                                    let aperture = sphere_radius
+                                                        * obj.transform.scale.x.min(obj.transform.scale.y).max(0.01)
+                                                        * 0.82;
+                                                    lens_sequence.push((
+                                                        z,
+                                                        obj.transform.location,
+                                                        aperture.max(0.1),
+                                                        focal,
+                                                    ));
+                                                }
+                                                lens_sequence.sort_by(|a, b| {
+                                                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                                                });
+                                                if !lens_sequence.is_empty() {
+                                                    let image_tangent =
+                                                        (image_rotation * glam::Vec3::Y)
+                                                            .normalize_or_zero();
+                                                    let source_half_height =
+                                                        (sphere_radius * image_scale.y).max(0.1);
+                                                    let source_samples = [
+                                                        (-0.65_f32, Color32::from_rgb(255, 105, 95)),
+                                                        (0.0_f32, Color32::from_rgb(255, 238, 140)),
+                                                        (0.65_f32, Color32::from_rgb(110, 210, 255)),
+                                                    ];
+                                                    for (source_t, color) in source_samples {
+                                                        let source_offset =
+                                                            image_tangent * (source_t * source_half_height);
+                                                        let source_point = image_center + source_offset;
+                                                        for i in 0..ray_count {
+                                                            let t = i as f32 / denom;
+                                                            let first_aperture = lens_sequence[0].2;
+                                                            let first_lens_z = lens_sequence[0].0;
+                                                            let mut current_z = 0.0_f32;
+                                                            let mut current_y =
+                                                                (source_point - image_center).dot(tangent);
+                                                            let first_y = (t * 2.0 - 1.0) * first_aperture;
+                                                            let mut angle =
+                                                                (first_y - current_y) / first_lens_z.max(0.001);
+                                                            let mut prev_point = source_point;
+                                                            let mut last_point = source_point;
+                                                            for (lens_z, lens_center, lens_aperture, focal) in
+                                                                &lens_sequence
+                                                            {
+                                                                let distance = (*lens_z - current_z).max(0.001);
+                                                                let mut lens_y = current_y + angle * distance;
+                                                                lens_y = lens_y.clamp(-*lens_aperture, *lens_aperture);
+                                                                let hit = *lens_center + tangent * lens_y;
+                                                                draw_segment(prev_point, hit, color, 1.1);
+                                                                angle -= lens_y / *focal;
+                                                                current_y = lens_y;
+                                                                current_z = *lens_z;
+                                                                prev_point = hit;
+                                                                last_point = hit;
+                                                            }
+                                                            let focus_distance = if angle.abs() > 1e-4 {
+                                                                (-current_y / angle).clamp(0.5, 240.0)
+                                                            } else {
+                                                                80.0
+                                                            };
+                                                            let image_point = last_point
+                                                                + axis * focus_distance
+                                                                + tangent * (current_y + angle * focus_distance);
+                                                            draw_segment(last_point, image_point, color, 1.3);
+                                                            if i == ray_count / 2 {
+                                                                if let Some(fp) = world_to_screen(
+                                                                    image_point,
+                                                                    view,
+                                                                    projection,
+                                                                    display,
+                                                                ) {
+                                                                    painter.circle_filled(
+                                                                        Pos2::new(fp[0], fp[1]),
+                                                                        3.5,
+                                                                        color,
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    let front_plane = primitive_center - axis * (thickness * 0.5);
+                                                    let back_plane = primitive_center + axis * (thickness * 0.5);
+                                                    let focus = primitive_center + axis * focal_length;
+                                                    if let Some(fp) =
+                                                        world_to_screen(focus, view, projection, display)
+                                                    {
+                                                        painter.circle_filled(
+                                                            Pos2::new(fp[0], fp[1]),
+                                                            4.0,
+                                                            focus_color,
+                                                        );
+                                                    }
+                                                    for i in 0..ray_count {
+                                                        let t = i as f32 / denom;
+                                                        let offset = (t * 2.0 - 1.0) * aperture;
+                                                        let front_hit = front_plane + tangent * offset;
+                                                        let back_hit = back_plane + tangent * offset;
+                                                        let start =
+                                                            front_hit - axis * (aperture * 2.5 + thickness);
+                                                        draw_segment(start, front_hit, incoming_color, 1.4);
+                                                        draw_segment(front_hit, back_hit, incoming_color, 1.0);
+                                                        draw_segment(back_hit, focus, outgoing_color, 1.6);
+                                                    }
+                                                }
+                                            } else {
+                                                let front_plane = primitive_center - axis * (thickness * 0.5);
+                                                let back_plane = primitive_center + axis * (thickness * 0.5);
+                                                let focus = primitive_center + axis * focal_length;
+                                                if let Some(fp) = world_to_screen(focus, view, projection, display) {
+                                                    painter.circle_filled(Pos2::new(fp[0], fp[1]), 4.0, focus_color);
+                                                }
+                                                for i in 0..ray_count {
+                                                    let t = i as f32 / denom;
+                                                    let offset = (t * 2.0 - 1.0) * aperture;
+                                                    let front_hit = front_plane + tangent * offset;
+                                                    let back_hit = back_plane + tangent * offset;
+                                                    let start = front_hit - axis * (aperture * 2.5 + thickness);
+                                                    draw_segment(start, front_hit, incoming_color, 1.4);
+                                                    draw_segment(front_hit, back_hit, incoming_color, 1.0);
+                                                    draw_segment(back_hit, focus, outgoing_color, 1.6);
+                                                }
                                             }
                                         }
                                         PrimitiveShape::ParabolicMirror => {

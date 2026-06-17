@@ -24,8 +24,8 @@ pub struct Photon {
     wavelength_nm: f32,
     direction: [f32; 3],
     power: f32,
+    color: [f32; 3],
     next: u32,
-    _pad3: [u32; 3],
 }
 
 pub struct PhotonMapper {
@@ -51,6 +51,7 @@ impl PhotonMapper {
         mesh_tri_mat_buf: &wgpu::Buffer,
         mesh_mat_buf: &wgpu::Buffer,
         primitive_buf: &wgpu::Buffer,
+        image_texture_view: &wgpu::TextureView,
     ) -> Self {
         let photon_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("photon_buffer"),
@@ -111,6 +112,16 @@ impl PhotonMapper {
                 storage_entry(7, true),
                 storage_entry(8, true),
                 uniform_entry(9),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -166,6 +177,10 @@ impl PhotonMapper {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: primitive_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(image_texture_view),
                 },
             ],
         });

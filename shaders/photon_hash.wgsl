@@ -12,8 +12,8 @@ struct Photon {
   wavelength_nm: f32,
   direction: vec3<f32>,
   power: f32,
+  color: vec3<f32>,
   next: u32,
-  pad3: vec3<u32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: PhotonMapUniforms;

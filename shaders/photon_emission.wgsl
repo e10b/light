@@ -16,8 +16,8 @@ struct Photon {
   wavelength_nm: f32,
   direction: vec3<f32>,
   power: f32,
+  color: vec3<f32>,
   next: u32,
-  pad3: vec3<u32>,
 };
 
 struct MaterialData {
@@ -48,6 +48,7 @@ struct PrimitiveBlock {
 @group(0) @binding(7) var<storage, read> mesh_triangle_material: array<u32>;
 @group(0) @binding(8) var<storage, read> materials: array<MaterialData>;
 @group(0) @binding(9) var<uniform> primitive_block: PrimitiveBlock;
+@group(0) @binding(10) var image_texture: texture_2d<f32>;
 
 const MAX_PHOTONS: u32 = 1000000u;
 const PI: f32 = 3.141592653589793;
@@ -83,11 +84,31 @@ fn snell_ior_for_wavelength(lambda_nm: f32, base_ior: f32, dispersion: f32) -> f
   return base_ior + dispersion * (-x + 0.2 * x * x);
 }
 
-fn write_photon(slot: u32, position: vec3<f32>, direction: vec3<f32>, wavelength_nm: f32, power: f32) {
+fn sample_image_texture(uv: vec2<f32>) -> vec3<f32> {
+  let dims = textureDimensions(image_texture);
+  let texel = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * vec2<f32>(f32(dims.x), f32(dims.y)) - vec2<f32>(0.5);
+  let base = floor(texel);
+  let frac = fract(texel);
+  let p00 = vec2<i32>(
+    i32(clamp(base.x, 0.0, f32(dims.x - 1u))),
+    i32(clamp(base.y, 0.0, f32(dims.y - 1u)))
+  );
+  let p10 = vec2<i32>(min(p00.x + 1, i32(dims.x) - 1), p00.y);
+  let p01 = vec2<i32>(p00.x, min(p00.y + 1, i32(dims.y) - 1));
+  let p11 = vec2<i32>(min(p00.x + 1, i32(dims.x) - 1), min(p00.y + 1, i32(dims.y) - 1));
+  let c00 = textureLoad(image_texture, p00, 0).rgb;
+  let c10 = textureLoad(image_texture, p10, 0).rgb;
+  let c01 = textureLoad(image_texture, p01, 0).rgb;
+  let c11 = textureLoad(image_texture, p11, 0).rgb;
+  return mix(mix(c00, c10, frac.x), mix(c01, c11, frac.x), frac.y);
+}
+
+fn write_photon(slot: u32, position: vec3<f32>, direction: vec3<f32>, wavelength_nm: f32, power: f32, color: vec3<f32>) {
   photons[slot].position = position;
   photons[slot].wavelength_nm = wavelength_nm;
   photons[slot].direction = direction;
   photons[slot].power = power;
+  photons[slot].color = color;
   photons[slot].next = 0u;
 }
 
@@ -279,22 +300,65 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
   let radius = max(uniforms.emitter_center.w, 1.0);
   let disk = disk_sample(gid.x * 9781u + uniforms.frame * 6271u, radius);
 
-  let is_spotlight = uniforms.light_pos.w < 0.0;
-  let sun_to_scene = -normalize(uniforms.light_pos.xyz);
-  let spot_position = uniforms.light_pos.xyz;
-  let spot_axis = normalize(center - spot_position);
-  let light_axis = select(sun_to_scene, spot_axis, is_spotlight);
-  let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light_axis.y) < 0.95);
-  let tangent = normalize(cross(up, light_axis));
-  let bitangent = cross(light_axis, tangent);
-  let aperture = disk * select(1.0, 0.08, is_spotlight);
+  var ro = vec3<f32>(0.0);
+  var rd = vec3<f32>(0.0, 0.0, 1.0);
+  var photon_color = vec3<f32>(1.0);
+  var image_emitter_found = false;
+  let primitive_limit = min(uniforms.primitive_count, 64u);
+  for (var pi = 0u; pi < primitive_limit; pi = pi + 1u) {
+    let prim_data = primitive_block.items[pi];
+    if (primitive_shape_for(prim_data.params) == 4u && !image_emitter_found) {
+      let image_x = quat_mul_vec(prim_data.rot, vec3<f32>(1.0, 0.0, 0.0));
+      let image_y = quat_mul_vec(prim_data.rot, vec3<f32>(0.0, 1.0, 0.0));
+      let image_forward = normalize(quat_mul_vec(prim_data.rot, vec3<f32>(0.0, 0.0, 1.0)));
+      let ux = rand01(gid.x * 3911u + uniforms.frame * 197u + 3u);
+      let vy = rand01(gid.x * 4721u + uniforms.frame * 251u + 5u);
+      let u = (ux * 2.0 - 1.0) * prim_data.extent.x;
+      let v = (vy * 2.0 - 1.0) * prim_data.extent.y;
+      photon_color = sample_image_texture(vec2<f32>(ux, 1.0 - vy));
+      ro = prim_data.pos.xyz + image_x * u + image_y * v + image_forward * 0.03;
+      rd = image_forward;
 
-  var ro = select(center - light_axis * 70.0 + tangent * disk.x + bitangent * disk.y, spot_position, is_spotlight);
-  var rd = normalize(select(light_axis, center + tangent * aperture.x + bitangent * aperture.y - spot_position, is_spotlight));
+      var lens_target = ro + image_forward * 30.0;
+      var nearest_lens_z = 1e38;
+      for (var li = 0u; li < primitive_limit; li = li + 1u) {
+        let lens_data = primitive_block.items[li];
+        if (primitive_shape_for(lens_data.params) == 3u) {
+          let lens_z = dot(lens_data.pos.xyz - ro, image_forward);
+          if (lens_z > 0.05 && lens_z < nearest_lens_z) {
+            let lens_x = quat_mul_vec(lens_data.rot, vec3<f32>(1.0, 0.0, 0.0));
+            let lens_y = quat_mul_vec(lens_data.rot, vec3<f32>(0.0, 1.0, 0.0));
+            let aperture_radius = max(max(lens_data.extent.x, lens_data.extent.y) * 0.82, 0.05);
+            let aperture_sample = disk_sample(gid.x * 6553u + uniforms.frame * 379u + li * 17u, aperture_radius);
+            lens_target = lens_data.pos.xyz + lens_x * aperture_sample.x + lens_y * aperture_sample.y;
+            nearest_lens_z = lens_z;
+          }
+        }
+      }
+      rd = normalize(lens_target - ro);
+      image_emitter_found = true;
+    }
+  }
+  if (!image_emitter_found) {
+    let is_spotlight = uniforms.light_pos.w < 0.0;
+    let sun_to_scene = -normalize(uniforms.light_pos.xyz);
+    let spot_position = uniforms.light_pos.xyz;
+    let spot_axis = normalize(center - spot_position);
+    let light_axis = select(sun_to_scene, spot_axis, is_spotlight);
+    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light_axis.y) < 0.95);
+    let tangent = normalize(cross(up, light_axis));
+    let bitangent = cross(light_axis, tangent);
+    let aperture = disk * select(1.0, 0.08, is_spotlight);
+    ro = select(center - light_axis * 70.0 + tangent * disk.x + bitangent * disk.y, spot_position, is_spotlight);
+    rd = normalize(select(light_axis, center + tangent * aperture.x + bitangent * aperture.y - spot_position, is_spotlight));
+  }
   let lambda_nm = 380.0 + 400.0 * rand01(gid.x * 8191u + uniforms.frame * 131u + 17u);
-  var power = 0.035;
+  if (!image_emitter_found) {
+    photon_color = wl(lambda_nm);
+  }
+  var power = select(0.035, 0.08, image_emitter_found);
   var passed_glass = false;
-  write_photon(gid.x, center, vec3<f32>(0.0, 1.0, 0.0), lambda_nm, 0.0);
+  write_photon(gid.x, center, vec3<f32>(0.0, 1.0, 0.0), lambda_nm, 0.0, photon_color);
 
   for (var bounce = 0u; bounce < 8u; bounce = bounce + 1u) {
     var rq: ray_query;
@@ -326,7 +390,7 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (ground_t < tri_t && ground_t < primitive_t) {
       if (passed_glass) {
         let hit_pos = ro + rd * ground_t;
-        write_photon(gid.x, hit_pos, -rd, lambda_nm, power);
+        write_photon(gid.x, hit_pos, -rd, lambda_nm, power, photon_color);
       }
       break;
     }
@@ -364,7 +428,7 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
 
       if (passed_glass) {
-        write_photon(gid.x, hit_pos, -rd, lambda_nm, power);
+        write_photon(gid.x, hit_pos, -rd, lambda_nm, power, photon_color);
       }
       break;
     }
