@@ -11,16 +11,15 @@ use winit::{event::*, event_loop::EventLoop};
 use crate::{
     blender_data::{Id, MainDatabase, Transform as DbTransform},
     compute_pass,
-    mesh::{load_gltf_mesh, MeshData, Vertex},
     material_editor::{MaterialGraphEditor, RuntimeMaterialPreview},
+    mesh::{MeshData, Vertex, load_gltf_mesh},
+    photon_mapper::PhotonMapper,
     prism_file::{
-        load_prism_database, save_prism_file, CollectionData as PrismCollectionData,
-        MaterialData as PrismMaterialData,
+        CollectionData as PrismCollectionData, MaterialData as PrismMaterialData,
         MeshData as PrismMeshData, NodeProperties, NodeType, ObjectData as PrismObjectData,
         ObjectDataLink as PrismObjectDataLink, PrismDatabase, SceneData as PrismSceneData,
-        ShaderNode,
+        ShaderNode, load_prism_database, save_prism_file,
     },
-    photon_mapper::PhotonMapper,
     quad_pass,
     scene::SceneKind,
     window::create_window,
@@ -37,6 +36,7 @@ struct SceneUniforms {
     sphere_params: [f32; 4],
     sphere_rot: [f32; 4],
     sphere_extent: [f32; 4],
+    lens_params: [f32; 4],
     mesh_center: [f32; 4],
     decanter_center: [f32; 4],
     cornell_center: [f32; 4],
@@ -75,6 +75,14 @@ enum RenderModeKind {
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
+enum PrimitiveShape {
+    Cube,
+    Sphere,
+    ParabolicMirror,
+    SphericalLens,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
 enum GizmoTargetKind {
     Sphere,
     Decanter,
@@ -102,14 +110,20 @@ fn target_allowed_in_scene(scene_kind: SceneKind, target: GizmoTargetKind) -> bo
                 | GizmoTargetKind::CornellBox
                 | GizmoTargetKind::SunLamp
         ),
-        SceneKind::Wine => matches!(target, GizmoTargetKind::WineGlass | GizmoTargetKind::WineSpotlight),
-        SceneKind::CornellBox => matches!(target, GizmoTargetKind::CornellBox),
+        SceneKind::Wine => matches!(
+            target,
+            GizmoTargetKind::WineGlass | GizmoTargetKind::WineSpotlight
+        ),
+        SceneKind::CornellBox => matches!(
+            target,
+            GizmoTargetKind::Sphere | GizmoTargetKind::CornellBox
+        ),
     }
 }
 
 fn target_label(target: GizmoTargetKind) -> &'static str {
     match target {
-        GizmoTargetKind::Sphere => "Cube",
+        GizmoTargetKind::Sphere => "Primitive",
         GizmoTargetKind::Decanter => "Decanter",
         GizmoTargetKind::WineGlass => "Wine Glass",
         GizmoTargetKind::CornellBox => "Cornell Box",
@@ -168,6 +182,39 @@ fn make_glass_material() -> PrismMaterialData {
                     roughness: Some(0.02),
                     transmission: Some(1.0),
                     ior: Some(1.52),
+                    bsdf_connected: Some(true),
+                },
+            });
+            let n_out = g.add_node(ShaderNode {
+                node_type: NodeType::MaterialOutput,
+                properties: NodeProperties::default(),
+            });
+            g.add_edge(
+                n_bsdf,
+                n_out,
+                crate::prism_file::NodeLink {
+                    output_socket: "BSDF".to_string(),
+                    input_socket: "Surface".to_string(),
+                },
+            );
+            g
+        },
+    }
+}
+
+fn make_mirror_material() -> PrismMaterialData {
+    PrismMaterialData {
+        name: "Mirror".to_string(),
+        graph: {
+            let mut g = petgraph::graph::DiGraph::new();
+            let n_bsdf = g.add_node(ShaderNode {
+                node_type: NodeType::PrincipledBSDF,
+                properties: NodeProperties {
+                    float_value: None,
+                    vec3_value: Some([0.93, 0.95, 0.98]),
+                    roughness: Some(0.004),
+                    transmission: Some(0.0),
+                    ior: Some(1.0),
                     bsdf_connected: Some(true),
                 },
             });
@@ -421,10 +468,42 @@ fn sphere_position_for(center: glam::Vec3, size: glam::Vec3, radius: f32) -> gla
     glam::Vec3::new(center.x + size.x * 0.6 + 2.0, -1.5 + radius, center.z)
 }
 
-fn scene_camera(scene_kind: SceneKind, center: glam::Vec3, size: glam::Vec3) -> (glam::Vec3, glam::Vec3) {
+fn set_primitive_shape(
+    main_db: &mut MainDatabase,
+    sphere_obj_id: Id,
+    primitive_shape: &mut PrimitiveShape,
+    shape: PrimitiveShape,
+    uniforms: &mut SceneUniforms,
+) {
+    *primitive_shape = shape;
+    uniforms.sphere_params[3] = match shape {
+        PrimitiveShape::Cube => 0.0,
+        PrimitiveShape::Sphere => 1.0,
+        PrimitiveShape::ParabolicMirror => 2.0,
+        PrimitiveShape::SphericalLens => 3.0,
+    };
+    if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
+        obj.name = match shape {
+            PrimitiveShape::Cube => "Cube",
+            PrimitiveShape::Sphere => "Sphere",
+            PrimitiveShape::ParabolicMirror => "Parabolic Mirror",
+            PrimitiveShape::SphericalLens => "Spherical Lens",
+        }
+        .to_string();
+    }
+}
+
+fn scene_camera(
+    scene_kind: SceneKind,
+    center: glam::Vec3,
+    size: glam::Vec3,
+) -> (glam::Vec3, glam::Vec3) {
     if scene_kind == SceneKind::Wine {
         let distance = size.max_element().max(12.0) * 1.35;
-        return (center + glam::Vec3::new(0.0, size.y * 0.2, distance), center);
+        return (
+            center + glam::Vec3::new(0.0, size.y * 0.2, distance),
+            center,
+        );
     }
     scene_kind.default_camera(center)
 }
@@ -480,7 +559,12 @@ fn world_to_screen(
     Some([x, y])
 }
 
-fn intersect_sphere(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, radius: f32) -> Option<f32> {
+fn intersect_sphere(
+    origin: glam::Vec3,
+    dir: glam::Vec3,
+    center: glam::Vec3,
+    radius: f32,
+) -> Option<f32> {
     let oc = origin - center;
     let a = dir.dot(dir);
     let b = oc.dot(dir);
@@ -501,13 +585,30 @@ fn intersect_sphere(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, rad
     }
 }
 
-fn intersect_cube(origin: glam::Vec3, dir: glam::Vec3, center: glam::Vec3, half_extent: glam::Vec3) -> Option<f32> {
+fn intersect_cube(
+    origin: glam::Vec3,
+    dir: glam::Vec3,
+    center: glam::Vec3,
+    half_extent: glam::Vec3,
+) -> Option<f32> {
     let min = center - half_extent;
     let max = center + half_extent;
     let inv = glam::Vec3::new(
-        if dir.x.abs() > 1e-6 { 1.0 / dir.x } else { f32::INFINITY },
-        if dir.y.abs() > 1e-6 { 1.0 / dir.y } else { f32::INFINITY },
-        if dir.z.abs() > 1e-6 { 1.0 / dir.z } else { f32::INFINITY },
+        if dir.x.abs() > 1e-6 {
+            1.0 / dir.x
+        } else {
+            f32::INFINITY
+        },
+        if dir.y.abs() > 1e-6 {
+            1.0 / dir.y
+        } else {
+            f32::INFINITY
+        },
+        if dir.z.abs() > 1e-6 {
+            1.0 / dir.z
+        } else {
+            f32::INFINITY
+        },
     );
     let t0 = (min - origin) * inv;
     let t1 = (max - origin) * inv;
@@ -638,16 +739,16 @@ pub async fn run() {
     append_mesh(&mut mesh, wine_mesh);
     let wine_material_start = decanter_material_start + decanter_material_count;
     let wine_material_count = mesh.materials.len().saturating_sub(wine_material_start);
-    let wine_base_positions: Vec<glam::Vec3> =
-        mesh.positions4[wine_vertex_start..wine_vertex_start + wine_vertex_count]
-            .iter()
-            .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
-            .collect();
-    let wine_base_normals: Vec<glam::Vec3> =
-        mesh.normals4[wine_vertex_start..wine_vertex_start + wine_vertex_count]
-            .iter()
-            .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
-            .collect();
+    let wine_base_positions: Vec<glam::Vec3> = mesh.positions4
+        [wine_vertex_start..wine_vertex_start + wine_vertex_count]
+        .iter()
+        .map(|p| glam::Vec3::new(p[0], p[1], p[2]))
+        .collect();
+    let wine_base_normals: Vec<glam::Vec3> = mesh.normals4
+        [wine_vertex_start..wine_vertex_start + wine_vertex_count]
+        .iter()
+        .map(|n| glam::Vec3::new(n[0], n[1], n[2]))
+        .collect();
 
     let mut model_verts = mesh.vertices.clone();
     let model_idx = mesh.indices.clone();
@@ -671,13 +772,17 @@ pub async fn run() {
     let sphere_obj_id = main_db.create_object("Cube", None, DbTransform::default());
     let sun_obj_id = main_db.create_object("SunLamp", None, DbTransform::default());
     let spot_obj_id = main_db.create_object("Spotlight", None, DbTransform::default());
-    let decanter_obj_id = main_db.create_object("Decanter", Some(decanter_mesh_id), DbTransform::default());
-    let wine_obj_id = main_db.create_object("WineGlass", Some(wine_mesh_id), DbTransform::default());
-    let cornell_obj_id = main_db.create_object("CornellBox", Some(cornell_mesh_id), DbTransform::default());
+    let decanter_obj_id =
+        main_db.create_object("Decanter", Some(decanter_mesh_id), DbTransform::default());
+    let wine_obj_id =
+        main_db.create_object("WineGlass", Some(wine_mesh_id), DbTransform::default());
+    let cornell_obj_id =
+        main_db.create_object("CornellBox", Some(cornell_mesh_id), DbTransform::default());
     let mut material_library: std::collections::HashMap<String, PrismMaterialData> =
         std::collections::HashMap::new();
     material_library.insert("White".to_string(), make_white_material());
     material_library.insert("Glass".to_string(), make_glass_material());
+    material_library.insert("Mirror".to_string(), make_mirror_material());
     let mut object_material_names: std::collections::HashMap<Id, String> =
         std::collections::HashMap::new();
     object_material_names.insert(sphere_obj_id, "Glass".to_string());
@@ -822,8 +927,24 @@ pub async fn run() {
         sphere_params: [0.02, 1.52, 1.0, 0.0],
         sphere_rot: [0.0, 0.0, 0.0, 1.0],
         sphere_extent: [sphere_radius, sphere_radius, sphere_radius, 0.0],
-        mesh_center: [wine_center.x, wine_center.y, wine_center.z, wine_max_extent * 0.8],
-        decanter_center: [decanter_center.x, decanter_center.y, decanter_center.z, decanter_max_extent * 0.7],
+        lens_params: [
+            sphere_radius * 1.8,
+            sphere_radius * 1.8,
+            sphere_radius * 0.5,
+            0.0,
+        ],
+        mesh_center: [
+            wine_center.x,
+            wine_center.y,
+            wine_center.z,
+            wine_max_extent * 0.8,
+        ],
+        decanter_center: [
+            decanter_center.x,
+            decanter_center.y,
+            decanter_center.z,
+            decanter_max_extent * 0.7,
+        ],
         cornell_center: [0.0, 0.5, -1.0, 1.0],
         cornell_color: [1.0, 1.0, 1.0, 0.0],
         cornell_params: [0.7, 1.0, 0.0, 0.0],
@@ -1129,6 +1250,7 @@ pub async fn run() {
     let mut gizmo_mode = GizmoModeKind::Translate;
     let mut gizmo_target = default_target_for_scene(scene_kind);
     let mut has_selection = true;
+    let mut primitive_shape = PrimitiveShape::Cube;
     let mut sphere_rotation = glam::Quat::IDENTITY;
     let mut sphere_scale = glam::Vec3::ONE;
     let mut decanter_rotation = glam::Quat::IDENTITY;
@@ -1402,8 +1524,63 @@ pub async fn run() {
                                             match scene_kind {
                                                 SceneKind::Decanter => {
                                                     if ui.button("Cube").clicked() {
+                                                        set_primitive_shape(
+                                                            &mut main_db,
+                                                            sphere_obj_id,
+                                                            &mut primitive_shape,
+                                                            PrimitiveShape::Cube,
+                                                            &mut uniforms,
+                                                        );
+                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
                                                         main_db.collection_link_object(decanter_master, sphere_obj_id);
                                                         main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Sphere").clicked() {
+                                                        set_primitive_shape(
+                                                            &mut main_db,
+                                                            sphere_obj_id,
+                                                            &mut primitive_shape,
+                                                            PrimitiveShape::Sphere,
+                                                            &mut uniforms,
+                                                        );
+                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
+                                                        main_db.collection_link_object(decanter_master, sphere_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Spherical Lens").clicked() {
+                                                        set_primitive_shape(
+                                                            &mut main_db,
+                                                            sphere_obj_id,
+                                                            &mut primitive_shape,
+                                                            PrimitiveShape::SphericalLens,
+                                                            &mut uniforms,
+                                                        );
+                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
+                                                        main_db.collection_link_object(decanter_master, sphere_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Parabolic Mirror").clicked() {
+                                                        set_primitive_shape(
+                                                            &mut main_db,
+                                                            sphere_obj_id,
+                                                            &mut primitive_shape,
+                                                            PrimitiveShape::ParabolicMirror,
+                                                            &mut uniforms,
+                                                        );
+                                                        object_material_names.insert(sphere_obj_id, "Mirror".to_string());
+                                                        main_db.collection_link_object(decanter_master, sphere_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
                                                         ui.close();
                                                     }
                                                     if ui.button("Sun Lamp").clicked() {
@@ -1446,8 +1623,63 @@ pub async fn run() {
                                                         ui.close();
                                                     }
                                                     if ui.button("Cube").clicked() {
+                                                        set_primitive_shape(
+                                                            &mut main_db,
+                                                            sphere_obj_id,
+                                                            &mut primitive_shape,
+                                                            PrimitiveShape::Cube,
+                                                            &mut uniforms,
+                                                        );
+                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
                                                         main_db.collection_link_object(cornell_master, sphere_obj_id);
                                                         main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Sphere").clicked() {
+                                                        set_primitive_shape(
+                                                            &mut main_db,
+                                                            sphere_obj_id,
+                                                            &mut primitive_shape,
+                                                            PrimitiveShape::Sphere,
+                                                            &mut uniforms,
+                                                        );
+                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
+                                                        main_db.collection_link_object(cornell_master, sphere_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Spherical Lens").clicked() {
+                                                        set_primitive_shape(
+                                                            &mut main_db,
+                                                            sphere_obj_id,
+                                                            &mut primitive_shape,
+                                                            PrimitiveShape::SphericalLens,
+                                                            &mut uniforms,
+                                                        );
+                                                        object_material_names.insert(sphere_obj_id, "Glass".to_string());
+                                                        main_db.collection_link_object(cornell_master, sphere_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Parabolic Mirror").clicked() {
+                                                        set_primitive_shape(
+                                                            &mut main_db,
+                                                            sphere_obj_id,
+                                                            &mut primitive_shape,
+                                                            PrimitiveShape::ParabolicMirror,
+                                                            &mut uniforms,
+                                                        );
+                                                        object_material_names.insert(sphere_obj_id, "Mirror".to_string());
+                                                        main_db.collection_link_object(cornell_master, sphere_obj_id);
+                                                        main_db.ensure_scene_base(scene_id, sphere_obj_id, true, true);
+                                                        gizmo_target = GizmoTargetKind::Sphere;
+                                                        has_selection = true;
                                                         ui.close();
                                                     }
                                                 }
@@ -1469,6 +1701,7 @@ pub async fn run() {
                                                     material_library.clear();
                                                     material_library.insert("White".to_string(), make_white_material());
                                                     material_library.insert("Glass".to_string(), make_glass_material());
+                                                    material_library.insert("Mirror".to_string(), make_mirror_material());
                                                     object_material_names.insert(sphere_obj_id, "Glass".to_string());
                                                     object_material_names.insert(decanter_obj_id, "Glass".to_string());
                                                     object_material_names.insert(wine_obj_id, "Glass".to_string());
@@ -1504,7 +1737,11 @@ pub async fn run() {
                                                                         Some(sun_obj_id)
                                                                     } else if name.contains("cornell") {
                                                                         Some(cornell_obj_id)
-                                                                    } else if name.contains("sphere") || name.contains("cube") {
+                                                                    } else if name.contains("lens")
+                                                                        || name.contains("mirror")
+                                                                        || name.contains("sphere")
+                                                                        || name.contains("cube")
+                                                                    {
                                                                         Some(sphere_obj_id)
                                                                     } else {
                                                                         None
@@ -1521,7 +1758,27 @@ pub async fn run() {
                                                         let m = glam::Mat4::from_cols_array(&obj.transform_matrix);
                                                         let (s, r, t) = m.to_scale_rotation_translation();
                                                         let lname = obj.name.to_ascii_lowercase();
-                                                        if lname.contains("sphere") || lname.contains("cube") {
+                                                        if lname.contains("lens")
+                                                            || lname.contains("mirror")
+                                                            || lname.contains("sphere")
+                                                            || lname.contains("cube")
+                                                        {
+                                                            let shape = if lname.contains("lens") {
+                                                                PrimitiveShape::SphericalLens
+                                                            } else if lname.contains("mirror") {
+                                                                PrimitiveShape::ParabolicMirror
+                                                            } else if lname.contains("sphere") {
+                                                                PrimitiveShape::Sphere
+                                                            } else {
+                                                                PrimitiveShape::Cube
+                                                            };
+                                                            set_primitive_shape(
+                                                                &mut main_db,
+                                                                sphere_obj_id,
+                                                                &mut primitive_shape,
+                                                                shape,
+                                                                &mut uniforms,
+                                                            );
                                                             uniforms.sphere_pos[0] = t.x;
                                                             uniforms.sphere_pos[1] = t.y;
                                                             uniforms.sphere_pos[2] = t.z;
@@ -1560,7 +1817,11 @@ pub async fn run() {
                                                                     Some(decanter_obj_id)
                                                                 } else if lname.contains("wine") {
                                                                     Some(wine_obj_id)
-                                                                } else if lname.contains("sphere") || lname.contains("cube") {
+                                                                } else if lname.contains("lens")
+                                                                    || lname.contains("mirror")
+                                                                    || lname.contains("sphere")
+                                                                    || lname.contains("cube")
+                                                                {
                                                                     Some(sphere_obj_id)
                                                                 } else if lname.contains("cornell") {
                                                                     Some(cornell_obj_id)
@@ -1673,12 +1934,66 @@ pub async fn run() {
                                         if !target_allowed_in_scene(scene_kind, gizmo_target) {
                                             gizmo_target = default_target_for_scene(scene_kind);
                                         }
-                                        ui.label(format!("Selected: {}", if has_selection { target_label(gizmo_target) } else { "None" }));
+                                        let selected_label = if has_selection {
+                                            match gizmo_target {
+                                                GizmoTargetKind::Sphere => main_db
+                                                    .objects
+                                                    .get(&sphere_obj_id)
+                                                    .map(|obj| obj.name.as_str())
+                                                    .unwrap_or(target_label(gizmo_target)),
+                                                _ => target_label(gizmo_target),
+                                            }
+                                        } else {
+                                            "None"
+                                        };
+                                        ui.label(format!("Selected: {}", selected_label));
                                         ui.horizontal(|ui| {
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Translate, "Move");
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Rotate, "Rotate");
                                             ui.selectable_value(&mut gizmo_mode, GizmoModeKind::Scale, "Scale");
                                         });
+                                        if has_selection
+                                            && gizmo_target == GizmoTargetKind::Sphere
+                                            && primitive_shape == PrimitiveShape::SphericalLens
+                                        {
+                                            ui.separator();
+                                            ui.collapsing("Lens", |ui| {
+                                                let mut lens_changed = false;
+                                                lens_changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut uniforms.lens_params[0],
+                                                            0.25..=64.0,
+                                                        )
+                                                        .text("Front radius"),
+                                                    )
+                                                    .changed();
+                                                lens_changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut uniforms.lens_params[1],
+                                                            0.25..=64.0,
+                                                        )
+                                                        .text("Back radius"),
+                                                    )
+                                                    .changed();
+                                                lens_changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut uniforms.lens_params[2],
+                                                            0.05..=24.0,
+                                                        )
+                                                        .text("Thickness"),
+                                                    )
+                                                    .changed();
+                                                uniforms.lens_params[0] = uniforms.lens_params[0].max(0.25);
+                                                uniforms.lens_params[1] = uniforms.lens_params[1].max(0.25);
+                                                uniforms.lens_params[2] = uniforms.lens_params[2].max(0.05);
+                                                if lens_changed {
+                                                    accumulation_dirty = true;
+                                                }
+                                            });
+                                        }
                                         ui.separator();
                                         ui.collapsing("Sun", |ui| {
                                             ui.add(egui::Slider::new(&mut sun_azimuth_deg, -180.0..=180.0).text("Azimuth"));
@@ -2240,17 +2555,43 @@ pub async fn run() {
                                 );
                                 let decanter_center_now = decanter_center + decanter_translation;
                                 let wine_center_now = wine_center + wine_translation;
-                                let sphere_hit = if scene_kind == SceneKind::Decanter && sphere_allowed {
-                                    intersect_cube(
-                                        ro,
-                                        rd,
-                                        sphere_center,
-                                        glam::Vec3::new(
-                                            uniforms.sphere_extent[0],
-                                            uniforms.sphere_extent[1],
-                                            uniforms.sphere_extent[2],
+                                let sphere_hit = if scene_kind != SceneKind::Wine && sphere_allowed {
+                                    match primitive_shape {
+                                        PrimitiveShape::Cube => intersect_cube(
+                                            ro,
+                                            rd,
+                                            sphere_center,
+                                            glam::Vec3::new(
+                                                uniforms.sphere_extent[0],
+                                                uniforms.sphere_extent[1],
+                                                uniforms.sphere_extent[2],
+                                            ),
                                         ),
-                                    )
+                                        PrimitiveShape::Sphere => intersect_sphere(
+                                            ro,
+                                            rd,
+                                            sphere_center,
+                                            uniforms.sphere_extent[0]
+                                                .max(uniforms.sphere_extent[1])
+                                                .max(uniforms.sphere_extent[2]),
+                                        ),
+                                        PrimitiveShape::ParabolicMirror => intersect_sphere(
+                                            ro,
+                                            rd,
+                                            sphere_center,
+                                            uniforms.sphere_extent[0]
+                                                .max(uniforms.sphere_extent[1])
+                                                .max(uniforms.sphere_extent[2]),
+                                        ),
+                                        PrimitiveShape::SphericalLens => intersect_sphere(
+                                            ro,
+                                            rd,
+                                            sphere_center,
+                                            uniforms.sphere_extent[0]
+                                                .max(uniforms.sphere_extent[1])
+                                                .max(uniforms.sphere_extent[2]),
+                                        ),
+                                    }
                                 } else {
                                     None
                                 };
@@ -2487,7 +2828,7 @@ pub async fn run() {
                                 sphere_preview.roughness,
                                 sphere_preview.ior,
                                 if sphere_preview.bsdf_connected { 1.0 } else { 0.0 },
-                                0.0,
+                                uniforms.sphere_params[3],
                             ];
 
                             let decanter_mat = object_material_names
