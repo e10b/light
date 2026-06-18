@@ -42,6 +42,7 @@ struct SceneUniforms {
     cornell_center: [f32; 4],
     cornell_color: [f32; 4],
     cornell_params: [f32; 4],
+    thermal_sensor: [f32; 4],
     sun_intensity: f32,
     frame: u32,
     scene_kind: u32,
@@ -98,6 +99,7 @@ enum PrimitiveShape {
     ParabolicMirror,
     SphericalLens,
     ImagePlane,
+    ThermalImagePlane,
     HyperbolicMirror,
 }
 
@@ -551,6 +553,7 @@ fn set_primitive_shape(
         PrimitiveShape::ParabolicMirror => 2.0,
         PrimitiveShape::SphericalLens => 3.0,
         PrimitiveShape::ImagePlane => 4.0,
+        PrimitiveShape::ThermalImagePlane => 6.0,
         PrimitiveShape::HyperbolicMirror => 5.0,
     };
     if let Some(obj) = main_db.objects.get_mut(&sphere_obj_id) {
@@ -560,6 +563,7 @@ fn set_primitive_shape(
             PrimitiveShape::ParabolicMirror => "Parabolic Mirror",
             PrimitiveShape::SphericalLens => "Spherical Lens",
             PrimitiveShape::ImagePlane => "Image",
+            PrimitiveShape::ThermalImagePlane => "Meerkat Thermal Image",
             PrimitiveShape::HyperbolicMirror => "Hyperbolic Mirror",
         }
         .to_string();
@@ -1084,6 +1088,8 @@ pub async fn run() {
         cornell_center: [0.0, 0.5, -1.0, 1.0],
         cornell_color: [1.0, 1.0, 1.0, 0.0],
         cornell_params: [0.7, 1.0, 0.0, 0.0],
+        // enabled, sensor minimum wavelength (um), maximum wavelength (um), gain
+        thermal_sensor: [0.0, 8.0, 14.0, 1.0],
         sun_intensity: 0.8,
         frame: 0,
         scene_kind: scene_kind.index(),
@@ -1186,6 +1192,44 @@ pub async fn run() {
         puppy_texture_size,
     );
     let puppy_texture_view = puppy_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // Decode only luminance. The source palette is deliberately discarded; the shader
+    // reconstructs a display color from temperature and Wien's displacement law.
+    let meerkat_image = image::open("res/Meerkat-IR50-100.jpg")
+        .expect("failed to load res/Meerkat-IR50-100.jpg")
+        .to_luma8();
+    let meerkat_dimensions = meerkat_image.dimensions();
+    let meerkat_texture_size = wgpu::Extent3d {
+        width: meerkat_dimensions.0.max(1),
+        height: meerkat_dimensions.1.max(1),
+        depth_or_array_layers: 1,
+    };
+    let meerkat_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("meerkat_temperature_texture"),
+        size: meerkat_texture_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &meerkat_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &meerkat_image,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(meerkat_dimensions.0),
+            rows_per_image: Some(meerkat_dimensions.1),
+        },
+        meerkat_texture_size,
+    );
+    let meerkat_texture_view = meerkat_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     let environment_image = image::open("res/sunflowers_puresky_4k.exr")
         .expect("failed to load sunflower environment")
@@ -1391,6 +1435,16 @@ pub async fn run() {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 16,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -1481,6 +1535,10 @@ pub async fn run() {
             wgpu::BindGroupEntry {
                 binding: 15,
                 resource: wgpu::BindingResource::TextureView(&environment_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: wgpu::BindingResource::TextureView(&meerkat_texture_view),
             },
         ],
     });
@@ -1823,6 +1881,62 @@ pub async fn run() {
                                         ui.separator();
                                         if ui.button("New Cube Scene").clicked() {
                                             requested_scene = SceneKind::Decanter;
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                scene_kind != SceneKind::Wine,
+                                                egui::Button::new("Meerkat Thermal"),
+                                            )
+                                            .on_disabled_hover_text(
+                                                "Thermal image objects are available in Scene and Cornell",
+                                            )
+                                            .clicked()
+                                        {
+                                            let (scene_id, master_id) = match scene_kind {
+                                                SceneKind::Decanter => (decanter_scene_id, decanter_master),
+                                                SceneKind::Wine => (wine_scene_id, wine_master),
+                                                SceneKind::CornellBox => (cornell_scene_id, cornell_master),
+                                            };
+                                            if scene_id.0 != 0 && master_id.0 != 0 {
+                                                let aspect = meerkat_dimensions.0 as f32
+                                                    / meerkat_dimensions.1.max(1) as f32;
+                                                let image_scale = glam::Vec3::new(
+                                                    aspect.max(0.1) * 0.7,
+                                                    0.7,
+                                                    1.0,
+                                                );
+                                                let object_id = create_primitive_object(
+                                                    &mut main_db,
+                                                    &mut object_target_by_id,
+                                                    &mut primitive_shape_by_id,
+                                                    &mut object_material_names,
+                                                    PrimitiveShape::ThermalImagePlane,
+                                                    "White",
+                                                    DbTransform {
+                                                        location: active_center
+                                                            + glam::Vec3::Z
+                                                                * (active_max_extent * 0.55),
+                                                        rotation: glam::Quat::IDENTITY,
+                                                        scale: image_scale,
+                                                    },
+                                                    sphere_radius,
+                                                    &mut primitive_shape,
+                                                    &mut uniforms,
+                                                );
+                                                if let Some(obj) = main_db.objects.get_mut(&object_id) {
+                                                    obj.name = "Meerkat Thermal Source".to_string();
+                                                }
+                                                main_db.collection_link_object(master_id, object_id);
+                                                main_db.ensure_scene_base(scene_id, object_id, true, true);
+                                                selected_primitive_id = object_id;
+                                                primitive_shape = PrimitiveShape::ThermalImagePlane;
+                                                sphere_rotation = glam::Quat::IDENTITY;
+                                                sphere_scale = image_scale;
+                                                gizmo_target = GizmoTargetKind::Sphere;
+                                                has_selection = true;
+                                                uniforms.thermal_sensor[0] = 1.0;
+                                                accumulation_dirty = true;
+                                            }
                                         }
                                         if ui.button("Telescope Demo").clicked() {
                                             let (scene_id, master_id) = match scene_kind {
@@ -2991,12 +3105,15 @@ pub async fn run() {
                                                         let (s, r, t) = m.to_scale_rotation_translation();
                                                         let lname = obj.name.to_ascii_lowercase();
                                                         if lname.contains("image")
+                                                            || lname.contains("thermal")
                                                             || lname.contains("lens")
                                                             || lname.contains("mirror")
                                                             || lname.contains("sphere")
                                                             || lname.contains("cube")
                                                         {
-                                                            let shape = if lname.contains("hyperbolic") {
+                                                            let shape = if lname.contains("thermal") {
+                                                                PrimitiveShape::ThermalImagePlane
+                                                            } else if lname.contains("hyperbolic") {
                                                                 PrimitiveShape::HyperbolicMirror
                                                             } else if lname.contains("image") {
                                                                 PrimitiveShape::ImagePlane
@@ -3190,6 +3307,7 @@ pub async fn run() {
                                                                 PrimitiveShape::ParabolicMirror => 2.0,
                                                                 PrimitiveShape::SphericalLens => 3.0,
                                                                 PrimitiveShape::ImagePlane => 4.0,
+                                                                PrimitiveShape::ThermalImagePlane => 6.0,
                                                                 PrimitiveShape::HyperbolicMirror => 5.0,
                                                             };
                                                             if matches!(
@@ -3646,6 +3764,69 @@ pub async fn run() {
                                             });
                                         }
                                         ui.separator();
+                                        egui::CollapsingHeader::new("Thermal Sensor")
+                                            .default_open(
+                                                primitive_shape
+                                                    == PrimitiveShape::ThermalImagePlane,
+                                            )
+                                            .show(ui, |ui| {
+                                                let mut enabled = uniforms.thermal_sensor[0] > 0.5;
+                                                let mut changed = ui
+                                                    .checkbox(
+                                                        &mut enabled,
+                                                        "Enable thermal sensing",
+                                                    )
+                                                    .changed();
+                                                uniforms.thermal_sensor[0] = if enabled {
+                                                    1.0
+                                                } else {
+                                                    0.0
+                                                };
+                                                ui.label("Sensor wavelength band");
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut uniforms.thermal_sensor[1],
+                                                            7.0..=14.0,
+                                                        )
+                                                        .text("Minimum µm"),
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut uniforms.thermal_sensor[2],
+                                                            8.0..=16.0,
+                                                        )
+                                                        .text("Maximum µm"),
+                                                    )
+                                                    .changed();
+                                                changed |= ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut uniforms.thermal_sensor[3],
+                                                            0.1..=3.0,
+                                                        )
+                                                        .text("Sensor gain"),
+                                                    )
+                                                    .changed();
+                                                if uniforms.thermal_sensor[1]
+                                                    > uniforms.thermal_sensor[2]
+                                                {
+                                                    uniforms.thermal_sensor.swap(1, 2);
+                                                }
+                                                ui.small(
+                                                    "Source: 283.15–311.15 K  •  Wien peak: 10.23–9.31 µm",
+                                                );
+                                                ui.small(if enabled {
+                                                    "IR-only view: non-emitting surfaces and background are black"
+                                                } else {
+                                                    "Showing decoded grayscale temperature data"
+                                                });
+                                                if changed {
+                                                    accumulation_dirty = true;
+                                                }
+                                            });
                                         ui.collapsing("Sun", |ui| {
                                             ui.add(egui::Slider::new(&mut sun_azimuth_deg, -180.0..=180.0).text("Azimuth"));
                                             ui.add(egui::Slider::new(&mut sun_elevation_deg, -10.0..=89.0).text("Elevation"));
@@ -4365,6 +4546,16 @@ pub async fn run() {
                                                 .max(uniforms.sphere_extent[2]),
                                         ),
                                         PrimitiveShape::ImagePlane => intersect_cube(
+                                            ro,
+                                            rd,
+                                            sphere_center,
+                                            glam::Vec3::new(
+                                                uniforms.sphere_extent[0],
+                                                uniforms.sphere_extent[1],
+                                                0.05,
+                                            ),
+                                        ),
+                                        PrimitiveShape::ThermalImagePlane => intersect_cube(
                                             ro,
                                             rd,
                                             sphere_center,
@@ -5556,7 +5747,10 @@ pub async fn run() {
                                         0.0
                                     },
                                 ];
-                                if shape == PrimitiveShape::ImagePlane {
+                                if matches!(
+                                    shape,
+                                    PrimitiveShape::ImagePlane | PrimitiveShape::ThermalImagePlane
+                                ) {
                                     color[3] = 0.0;
                                 }
                                 let mut params = [
@@ -5569,10 +5763,14 @@ pub async fn run() {
                                         PrimitiveShape::ParabolicMirror => 2.0,
                                         PrimitiveShape::SphericalLens => 3.0,
                                         PrimitiveShape::ImagePlane => 4.0,
+                                        PrimitiveShape::ThermalImagePlane => 6.0,
                                         PrimitiveShape::HyperbolicMirror => 5.0,
                                     },
                                 ];
-                                if shape == PrimitiveShape::ImagePlane {
+                                if matches!(
+                                    shape,
+                                    PrimitiveShape::ImagePlane | PrimitiveShape::ThermalImagePlane
+                                ) {
                                     params[2] = 1.0;
                                 }
                                 let lens_params = primitive_lens_params_by_id
@@ -5607,7 +5805,11 @@ pub async fn run() {
                                     extent: [
                                         sphere_radius * obj.transform.scale.x,
                                         sphere_radius * obj.transform.scale.y,
-                                        if shape == PrimitiveShape::ImagePlane {
+                                        if matches!(
+                                            shape,
+                                            PrimitiveShape::ImagePlane
+                                                | PrimitiveShape::ThermalImagePlane
+                                        ) {
                                             0.05
                                         } else {
                                             sphere_radius * obj.transform.scale.z

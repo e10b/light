@@ -15,6 +15,7 @@ struct Uniforms {
   cornell_center: vec4<f32>,
   cornell_color: vec4<f32>,
   cornell_params: vec4<f32>,
+  thermal_sensor: vec4<f32>,
   sun_intensity: f32,
   frame: u32,
   scene_kind: u32,
@@ -114,6 +115,9 @@ var<uniform> primitive_block: PrimitiveBlock;
 
 @group(0) @binding(15)
 var environment_texture: texture_2d<f32>;
+
+@group(0) @binding(16)
+var thermal_texture: texture_2d<f32>;
 
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
@@ -320,6 +324,9 @@ fn primitive_radius(half_extent: vec3<f32>) -> f32 {
 }
 
 fn primitive_shape() -> u32 {
+  if (uniforms.sphere_params.w >= 5.5) {
+    return 6u;
+  }
   if (uniforms.sphere_params.w >= 4.5) {
     return 5u;
   }
@@ -452,6 +459,57 @@ fn image_plane_color(local_hit: vec3<f32>, half_extent: vec3<f32>) -> vec3<f32> 
   return mix(mix(c00, c10, frac.x), mix(c01, c11, frac.x), frac.y);
 }
 
+fn thermal_false_color(heat: f32) -> vec3<f32> {
+  let t = clamp(heat, 0.0, 1.0);
+  if (t < 0.25) {
+    return mix(vec3<f32>(0.005, 0.0, 0.02), vec3<f32>(0.18, 0.01, 0.32), t * 4.0);
+  }
+  if (t < 0.5) {
+    return mix(vec3<f32>(0.18, 0.01, 0.32), vec3<f32>(0.85, 0.04, 0.03), (t - 0.25) * 4.0);
+  }
+  if (t < 0.75) {
+    return mix(vec3<f32>(0.85, 0.04, 0.03), vec3<f32>(1.0, 0.65, 0.02), (t - 0.5) * 4.0);
+  }
+  return mix(vec3<f32>(1.0, 0.65, 0.02), vec3<f32>(1.0), (t - 0.75) * 4.0);
+}
+
+fn virtual_thermal_sensor(wavelength_um: f32, heat: f32) -> vec3<f32> {
+  let band_min = min(uniforms.thermal_sensor.y, uniforms.thermal_sensor.z);
+  let band_max = max(uniforms.thermal_sensor.y, uniforms.thermal_sensor.z);
+  let feather = max((band_max - band_min) * 0.08, 0.02);
+  let response = smoothstep(band_min - feather, band_min + feather, wavelength_um)
+    * (1.0 - smoothstep(band_max - feather, band_max + feather, wavelength_um));
+  return thermal_false_color(heat) * response * uniforms.thermal_sensor.w;
+}
+
+fn grayscale_to_kelvin(gray: f32) -> f32 {
+  return mix(283.15, 311.15, clamp(gray, 0.0, 1.0));
+}
+
+fn wien_peak_wavelength_um(kelvin: f32) -> f32 {
+  return 2897.771955 / max(kelvin, 1e-4);
+}
+
+fn thermal_image_plane_color(local_hit: vec3<f32>, half_extent: vec3<f32>) -> vec3<f32> {
+  let dims = textureDimensions(thermal_texture);
+  let uv = clamp(
+    vec2<f32>(
+      local_hit.x / max(half_extent.x * 2.0, 1e-4) + 0.5,
+      0.5 - local_hit.y / max(half_extent.y * 2.0, 1e-4)
+    ),
+    vec2<f32>(0.0),
+    vec2<f32>(1.0)
+  );
+  let pixel = vec2<i32>(min(vec2<u32>(uv * vec2<f32>(dims)), dims - vec2<u32>(1u)));
+  let gray = textureLoad(thermal_texture, pixel, 0).r;
+  let kelvin = grayscale_to_kelvin(gray);
+  let wavelength_um = wien_peak_wavelength_um(kelvin);
+  if (uniforms.thermal_sensor.x < 0.5) {
+    return vec3<f32>(gray);
+  }
+  return virtual_thermal_sensor(wavelength_um, gray);
+}
+
 fn spherical_lens_edge_radius(front_radius: f32, back_radius: f32, half_thickness: f32, max_aperture: f32) -> f32 {
   let max_radius = min(max_aperture, min(front_radius, back_radius) * 0.999);
   var lo = 0.0;
@@ -527,7 +585,7 @@ fn spherical_lens_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_e
 
 fn primitive_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32>) -> f32 {
   let shape = primitive_shape();
-  if (shape == 4u) {
+  if (shape == 4u || shape == 6u) {
     return image_plane_intersection_t(origin - center, direction, half_extent);
   }
   if (shape == 3u) {
@@ -544,7 +602,7 @@ fn primitive_intersection_t(origin: vec3<f32>, direction: vec3<f32>, center: vec
 
 fn primitive_normal(hit_pos: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32>) -> vec3<f32> {
   let shape = primitive_shape();
-  if (shape == 4u) {
+  if (shape == 4u || shape == 6u) {
     return vec3<f32>(0.0, 0.0, select(-1.0, 1.0, hit_pos.z >= center.z));
   }
   if (shape == 3u) {
@@ -586,6 +644,7 @@ fn primitive_normal(hit_pos: vec3<f32>, center: vec3<f32>, half_extent: vec3<f32
 }
 
 fn primitive_shape_for(params: vec4<f32>) -> u32 {
+  if (params.w >= 5.5) { return 6u; }
   if (params.w >= 4.5) { return 5u; }
   if (params.w >= 3.5) { return 4u; }
   if (params.w >= 2.5) { return 3u; }
@@ -640,6 +699,7 @@ fn spherical_lens_intersection_t_for(origin: vec3<f32>, direction: vec3<f32>, ha
 
 fn primitive_intersection_t_for(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> f32 {
   let shape = primitive_shape_for(params);
+  if (shape == 6u) { return image_plane_intersection_t(origin, direction, half_extent); }
   if (shape == 5u) { return hyperbolic_mirror_intersection_t(origin, direction, half_extent, lens); }
   if (shape == 4u) { return image_plane_intersection_t(origin, direction, half_extent); }
   if (shape == 3u) { return spherical_lens_intersection_t_for(origin, direction, half_extent, lens); }
@@ -650,6 +710,7 @@ fn primitive_intersection_t_for(origin: vec3<f32>, direction: vec3<f32>, half_ex
 
 fn primitive_normal_for(local_hit: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> vec3<f32> {
   let shape = primitive_shape_for(params);
+  if (shape == 6u) { return vec3<f32>(0.0, 0.0, select(-1.0, 1.0, local_hit.z >= 0.0)); }
   if (shape == 5u) {
     let a = max(abs(lens.x), 1e-4);
     let b = max(abs(lens.y), 1e-4);
@@ -819,7 +880,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
   if (uniforms.scene_kind == 99u) {
     return vec3<f32>(0.0);
   }
-  if (uniforms.scene_kind == 1u) {
+  if (uniforms.scene_kind == 1u && uniforms.thermal_sensor.x < 0.5) {
     return trace_cornell(origin, direction, seed_in);
   }
   let is_wine_scene = uniforms.scene_kind == 2u;
@@ -907,13 +968,22 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
 
     if (hit_type == 0u) {
+      if (uniforms.thermal_sensor.x >= 0.5) {
+        return vec3<f32>(0.0);
+      }
       L = L + throughput * sky(rd);
       break;
     }
 
-    
-
     let hit_pos = ro + rd * hit_t;
+    if (uniforms.thermal_sensor.x >= 0.5) {
+      if (hit_type == 1u && primitive_shape_for(hit_primitive.params) == 6u) {
+        let local_hit = quat_mul_vec(q_inv, hit_pos - cube_center);
+        return thermal_image_plane_color(local_hit, hit_primitive.extent.xyz);
+      }
+      return vec3<f32>(0.0);
+    }
+
     var normal = vec3<f32>(0.0, 1.0, 0.0);
     var albedo = vec3<f32>(0.8);
 
@@ -949,6 +1019,11 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       }
       if (primitive_shape_for(hit_primitive.params) == 4u) {
         albedo = image_plane_color(local_hit, hit_primitive.extent.xyz);
+        L = L + throughput * albedo;
+        break;
+      }
+      if (primitive_shape_for(hit_primitive.params) == 6u) {
+        albedo = thermal_image_plane_color(local_hit, hit_primitive.extent.xyz);
         L = L + throughput * albedo;
         break;
       }

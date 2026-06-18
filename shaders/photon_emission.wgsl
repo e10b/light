@@ -128,6 +128,7 @@ fn quat_mul_vec(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
 }
 
 fn primitive_shape_for(params: vec4<f32>) -> u32 {
+  if (params.w >= 5.5) { return 6u; }
   if (params.w >= 4.5) { return 5u; }
   if (params.w >= 3.5) { return 4u; }
   if (params.w >= 2.5) { return 3u; }
@@ -299,6 +300,7 @@ fn spherical_lens_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_e
 
 fn primitive_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> f32 {
   let shape = primitive_shape_for(params);
+  if (shape == 6u) { return image_plane_intersection_t(origin, direction, half_extent); }
   if (shape == 5u) { return hyperbolic_mirror_intersection_t(origin, direction, half_extent, lens); }
   if (shape == 4u) { return image_plane_intersection_t(origin, direction, half_extent); }
   if (shape == 3u) { return spherical_lens_intersection_t(origin, direction, half_extent, lens); }
@@ -309,6 +311,7 @@ fn primitive_intersection_t(origin: vec3<f32>, direction: vec3<f32>, half_extent
 
 fn primitive_normal(local_hit: vec3<f32>, half_extent: vec3<f32>, params: vec4<f32>, lens: vec4<f32>) -> vec3<f32> {
   let shape = primitive_shape_for(params);
+  if (shape == 6u) { return vec3<f32>(0.0, 0.0, select(-1.0, 1.0, local_hit.z >= 0.0)); }
   if (shape == 5u) {
     let a = max(abs(lens.x), 1e-4);
     let b = max(abs(lens.y), 1e-4);
