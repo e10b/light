@@ -27,6 +27,8 @@ struct Uniforms {
   cornell_enabled: u32,
   primitive_count: u32,
   camera_aperture: f32,
+  photon_brightness: f32,
+  ground_brightness: f32,
 };
 
 @group(0) @binding(0)
@@ -110,6 +112,9 @@ struct PrimitiveBlock {
 @group(0) @binding(14)
 var<uniform> primitive_block: PrimitiveBlock;
 
+@group(0) @binding(15)
+var environment_texture: texture_2d<f32>;
+
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) tex_coords: vec2<f32>,
@@ -128,69 +133,18 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
 
 fn sky(dir: vec3<f32>) -> vec3<f32> {
   let PI = 3.141592653589793;
-  let up = vec3<f32>(0.0, 1.0, 0.0);
-  let sun_dir = normalize(uniforms.light_pos.xyz);
   let view_dir = normalize(dir);
-
-  let cos_theta = clamp(dot(view_dir, up), 0.0, 1.0);
-  let theta = acos(cos_theta);
-  let cos_theta_s = clamp(dot(sun_dir, up), 0.001, 1.0);
-  let theta_s = acos(cos_theta_s);
-  let cos_gamma = clamp(dot(view_dir, sun_dir), -1.0, 1.0);
-  let gamma = acos(cos_gamma);
-
-  let T = 3.0;
-  let T2 = T * T;
-
-  let Ay = 0.1787 * T - 1.4630;
-  let By = -0.3554 * T + 0.4275;
-  let Cy = -0.0227 * T + 5.3251;
-  let Dy = 0.1206 * T - 2.5771;
-  let Ey = -0.0670 * T + 0.3703;
-
-  let Ax = -0.0193 * T - 0.2592;
-  let Bx = -0.0665 * T + 0.0008;
-  let Cx = -0.0004 * T + 0.2125;
-  let Dx = -0.0641 * T - 0.8989;
-  let Ex = -0.0033 * T + 0.0452;
-
-  let Az = -0.0167 * T - 0.2608;
-  let Bz = -0.0950 * T + 0.0092;
-  let Cz = -0.0079 * T + 0.2102;
-  let Dz = -0.0441 * T - 1.6537;
-  let Ez = -0.0109 * T + 0.0529;
-
-  let chi = (4.0 / 9.0 - T / 120.0) * (PI - 2.0 * theta_s);
-  let Yz = (4.0453 * T - 4.9710) * tan(chi) - 0.2155 * T + 2.4192;
-  let xz = (0.00165 * theta_s * theta_s * theta_s - 0.00374 * theta_s * theta_s + 0.00208 * theta_s) * T2 +
-           (-0.02902 * theta_s * theta_s * theta_s + 0.06377 * theta_s * theta_s - 0.03202 * theta_s + 0.00394) * T +
-           (0.11693 * theta_s * theta_s * theta_s - 0.21196 * theta_s * theta_s + 0.06052 * theta_s + 0.25886);
-  let yz = (0.00275 * theta_s * theta_s * theta_s - 0.00610 * theta_s * theta_s + 0.00316 * theta_s) * T2 +
-           (-0.04214 * theta_s * theta_s * theta_s + 0.08970 * theta_s * theta_s - 0.04153 * theta_s + 0.00515) * T +
-           (0.15346 * theta_s * theta_s * theta_s - 0.26756 * theta_s * theta_s + 0.06669 * theta_s + 0.26688);
-
-  let Fy = preetham_perez(cos_theta, gamma, cos_gamma, Ay, By, Cy, Dy, Ey);
-  let Fx = preetham_perez(cos_theta, gamma, cos_gamma, Ax, Bx, Cx, Dx, Ex);
-  let Fz = preetham_perez(cos_theta, gamma, cos_gamma, Az, Bz, Cz, Dz, Ez);
-  let Fy0 = preetham_perez(cos_theta_s, 0.0, 1.0, Ay, By, Cy, Dy, Ey);
-  let Fx0 = preetham_perez(cos_theta_s, 0.0, 1.0, Ax, Bx, Cx, Dx, Ex);
-  let Fz0 = preetham_perez(cos_theta_s, 0.0, 1.0, Az, Bz, Cz, Dz, Ez);
-
-  let Y = max(Yz * Fy / max(Fy0, 1e-4), 0.0);
-  let x = clamp(xz * Fx / max(Fx0, 1e-4), 0.001, 0.999);
-  let y = clamp(yz * Fz / max(Fz0, 1e-4), 0.001, 0.999);
-  let X = (x / y) * Y;
-  let Z = ((1.0 - x - y) / y) * Y;
-
-  let rgb = vec3<f32>(
-    3.2406 * X - 1.5372 * Y - 0.4986 * Z,
-   -0.9689 * X + 1.8758 * Y + 0.0415 * Z,
-    0.0557 * X - 0.2040 * Y + 1.0570 * Z
+  let uv = vec2<f32>(
+    fract(0.5 + atan2(view_dir.z, view_dir.x) / (2.0 * PI)),
+    acos(clamp(view_dir.y, -1.0, 1.0)) / PI
   );
-
-  let sky_rgb = max(rgb * 0.06, vec3<f32>(0.0));
-  let sun_disk = smoothstep(cos(0.27 * PI / 180.0) - 0.0008, cos(0.27 * PI / 180.0) + 0.0002, cos_gamma);
-  return sky_rgb + vec3<f32>(1.0, 0.97, 0.9) * sun_disk * 0.35;
+  let dims = textureDimensions(environment_texture);
+  let pixel = vec2<i32>(
+    clamp(i32(uv.x * f32(dims.x)), 0, i32(dims.x) - 1),
+    clamp(i32(uv.y * f32(dims.y)), 0, i32(dims.y) - 1)
+  );
+  let radiance = max(textureLoad(environment_texture, pixel, 0).rgb * 0.8, vec3<f32>(0.0));
+  return radiance / (vec3<f32>(1.0) + radiance);
 }
 
 fn preetham_perez(cos_t: f32, g: f32, cos_g: f32, a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {
@@ -257,7 +211,7 @@ fn estimate_photon_density(position: vec3<f32>, normal: vec3<f32>, radius: f32) 
   }
 
   let area = 3.141592653589793 * radius2;
-  return flux / max(area, 1e-4);
+  return flux / max(area, 1e-4) * uniforms.photon_brightness;
 }
 
 fn wl(lambda_nm: f32) -> vec3<f32> {
@@ -815,6 +769,7 @@ fn trace_cornell(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<
     }
 
     if (hit_t >= 1e37) {
+      L = L + throughput * sky(rd);
       break;
     }
 
@@ -941,10 +896,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     if (t_ground < hit_t) { hit_t = t_ground; hit_type = 3u; }
 
     if (hit_type == 0u) {
-      // Wine is a black studio scene; default scene uses neutral gray.
-      if (!is_wine_scene) {
-        L = L + throughput * vec3<f32>(0.62) * spectral_weight;
-      }
+      L = L + throughput * sky(rd);
       break;
     }
 
@@ -1046,6 +998,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
         let is_white = (grid_x ^ grid_z) == 0;
         albedo = select(vec3<f32>(0.3), vec3<f32>(0.7), is_white);
       }
+      albedo = albedo * uniforms.ground_brightness;
       metallic = 0.0;
       roughness = 0.9;
       transmission = 0.0;
@@ -1114,7 +1067,8 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
     let receives_spot_pool = is_wine_scene && hit_type == 3u;
     if ((visible || receives_spot_pool) && transmission < 0.5) {
       let nl = max(dot(normal, to_light), 0.0);
-      let base = select(vec3<f32>(0.08), vec3<f32>(0.05), hit_type == 1u);
+      let base = select(vec3<f32>(0.04), vec3<f32>(0.025), hit_type == 1u)
+        + sky(normal) * 0.1;
       let light_color = select(vec3<f32>(1.0, 0.94, 0.82), vec3<f32>(1.0, 0.82, 0.58) * spot_shape * 7.5, is_wine_scene);
       let photon_indirect = estimate_photon_density(hit_pos, normal, photon_uniforms.voxel_size * 1.5);
       if (is_wine_scene && hit_type == 3u) {
@@ -1172,7 +1126,7 @@ fn trace_ray(origin: vec3<f32>, direction: vec3<f32>, seed_in: u32) -> vec3<f32>
       if (is_wine_scene && hit_type == 3u) {
         L = L + throughput * photon_indirect * 8.0 * spectral_weight;
       } else {
-        L = L + throughput * ((vec3<f32>(0.04) + photon_indirect) * albedo) * spectral_weight;
+        L = L + throughput * ((vec3<f32>(0.02) + sky(normal) * 0.08 + photon_indirect) * albedo) * spectral_weight;
       }
       break;
     }

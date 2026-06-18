@@ -8,7 +8,10 @@ struct PhotonMapUniforms {
   hash_table_size: u32,
   frame: u32,
   primitive_count: u32,
-  pad: vec3<u32>,
+  mesh_visibility: u32,
+  pad: vec2<u32>,
+  decanter_center: vec4<f32>,
+  wine_center: vec4<f32>,
 };
 
 struct Photon {
@@ -349,78 +352,79 @@ fn emit_photons(@builtin(global_invocation_id) gid: vec3<u32>) {
   let radius = max(uniforms.emitter_center.w, 1.0);
   let disk = disk_sample(gid.x * 9781u + uniforms.frame * 6271u, radius);
 
-  var ro = vec3<f32>(0.0);
-  var rd = vec3<f32>(0.0, 0.0, 1.0);
-  var photon_color = vec3<f32>(1.0);
-  var image_emitter_found = false;
-  let primitive_limit = min(uniforms.primitive_count, 64u);
-  for (var pi = 0u; pi < primitive_limit; pi = pi + 1u) {
-    let prim_data = primitive_block.items[pi];
-    if (primitive_shape_for(prim_data.params) == 4u && !image_emitter_found) {
-      let image_x = quat_mul_vec(prim_data.rot, vec3<f32>(1.0, 0.0, 0.0));
-      let image_y = quat_mul_vec(prim_data.rot, vec3<f32>(0.0, 1.0, 0.0));
-      let image_forward = normalize(quat_mul_vec(prim_data.rot, vec3<f32>(0.0, 0.0, 1.0)));
-      let ux = rand01(gid.x * 3911u + uniforms.frame * 197u + 3u);
-      let vy = rand01(gid.x * 4721u + uniforms.frame * 251u + 5u);
-      let u = (ux * 2.0 - 1.0) * prim_data.extent.x;
-      let v = (vy * 2.0 - 1.0) * prim_data.extent.y;
-      photon_color = sample_image_texture(vec2<f32>(ux, 1.0 - vy));
-      ro = prim_data.pos.xyz + image_x * u + image_y * v + image_forward * 0.03;
-      rd = image_forward;
+  let is_spotlight = uniforms.light_pos.w < 0.0;
+  let sun_to_scene = -normalize(uniforms.light_pos.xyz);
+  let spot_position = uniforms.light_pos.xyz;
+  let spot_axis = normalize(center - spot_position);
+  let light_axis = select(sun_to_scene, spot_axis, is_spotlight);
+  let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light_axis.y) < 0.95);
+  let tangent = normalize(cross(up, light_axis));
+  let bitangent = cross(light_axis, tangent);
+  let aperture = disk * select(1.0, 0.08, is_spotlight);
 
-      var lens_target = ro + image_forward * 30.0;
-      var nearest_optic_z = 1e38;
-      var found_primary_mirror = false;
-      for (var li = 0u; li < primitive_limit; li = li + 1u) {
-        let lens_data = primitive_block.items[li];
-        let target_shape = primitive_shape_for(lens_data.params);
-        if (target_shape == 2u || target_shape == 3u) {
-          let optic_z = dot(lens_data.pos.xyz - ro, image_forward);
-          let is_primary_mirror = target_shape == 2u;
-          let better_primary = is_primary_mirror && !found_primary_mirror;
-          let better_distance = is_primary_mirror == found_primary_mirror && optic_z < nearest_optic_z;
-          if (optic_z > 0.05 && (better_primary || better_distance)) {
-            let lens_x = quat_mul_vec(lens_data.rot, vec3<f32>(1.0, 0.0, 0.0));
-            let lens_y = quat_mul_vec(lens_data.rot, vec3<f32>(0.0, 1.0, 0.0));
-            let aperture_radius = max(max(lens_data.extent.x, lens_data.extent.y) * 0.82, 0.05);
-            let aperture_sample = disk_sample(gid.x * 6553u + uniforms.frame * 379u + li * 17u, aperture_radius);
-            lens_target = lens_data.pos.xyz + lens_x * aperture_sample.x + lens_y * aperture_sample.y;
-            nearest_optic_z = optic_z;
-            found_primary_mirror = found_primary_mirror || is_primary_mirror;
-          }
-        }
-      }
-      rd = normalize(lens_target - ro);
-      image_emitter_found = true;
+  let primitive_limit = min(uniforms.primitive_count, 64u);
+  var optical_count = 0u;
+  for (var pi = 0u; pi < primitive_limit; pi = pi + 1u) {
+    let candidate = primitive_block.items[pi];
+    let shape = primitive_shape_for(candidate.params);
+    let transmission = clamp(candidate.color.w, 0.0, 1.0);
+    if (shape == 2u || shape == 3u || shape == 5u || transmission >= 0.5) {
+      optical_count = optical_count + 1u;
     }
   }
-  if (!image_emitter_found) {
-    let is_spotlight = uniforms.light_pos.w < 0.0;
-    let sun_to_scene = -normalize(uniforms.light_pos.xyz);
-    let spot_position = uniforms.light_pos.xyz;
-    let spot_axis = normalize(center - spot_position);
-    let light_axis = select(sun_to_scene, spot_axis, is_spotlight);
-    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(light_axis.y) < 0.95);
-    let tangent = normalize(cross(up, light_axis));
-    let bitangent = cross(light_axis, tangent);
-    let aperture = disk * select(1.0, 0.08, is_spotlight);
-    ro = select(center - light_axis * 70.0 + tangent * disk.x + bitangent * disk.y, spot_position, is_spotlight);
-    rd = normalize(select(light_axis, center + tangent * aperture.x + bitangent * aperture.y - spot_position, is_spotlight));
+
+  var photon_target = center + tangent * aperture.x + bitangent * aperture.y;
+  if (optical_count > 0u) {
+    let target_slot = gid.x % optical_count;
+    var optical_index = 0u;
+    for (var pi = 0u; pi < primitive_limit; pi = pi + 1u) {
+      let candidate = primitive_block.items[pi];
+      let shape = primitive_shape_for(candidate.params);
+      let transmission = clamp(candidate.color.w, 0.0, 1.0);
+      let is_optical = shape == 2u || shape == 3u || shape == 5u || transmission >= 0.5;
+      if (is_optical) {
+        if (optical_index == target_slot) {
+          let local_x = quat_mul_vec(candidate.rot, vec3<f32>(1.0, 0.0, 0.0));
+          let local_y = quat_mul_vec(candidate.rot, vec3<f32>(0.0, 1.0, 0.0));
+          let aperture_radius = max(min(candidate.extent.x, candidate.extent.y), 0.05);
+          let local_disk = disk_sample(
+            gid.x * 6553u + uniforms.frame * 379u + pi * 17u,
+            aperture_radius
+          );
+          photon_target = candidate.pos.xyz + local_x * local_disk.x + local_y * local_disk.y;
+          break;
+        }
+        optical_index = optical_index + 1u;
+      }
+    }
   }
+
+  var ro = select(photon_target - light_axis * 70.0, spot_position, is_spotlight);
+  var rd = normalize(select(light_axis, photon_target - spot_position, is_spotlight));
   let lambda_nm = 380.0 + 400.0 * rand01(gid.x * 8191u + uniforms.frame * 131u + 17u);
-  if (!image_emitter_found) {
-    photon_color = wl(lambda_nm);
-  }
-  var power = select(0.035, 0.08, image_emitter_found);
+  let photon_color = wl(lambda_nm);
+  var power = 0.035;
   var passed_glass = false;
-  write_photon(gid.x, center, vec3<f32>(0.0, 1.0, 0.0), lambda_nm, 0.0, photon_color);
+  write_photon(gid.x, photon_target, vec3<f32>(0.0, 1.0, 0.0), lambda_nm, 0.0, photon_color);
 
   for (var bounce = 0u; bounce < 8u; bounce = bounce + 1u) {
     var rq: ray_query;
     rayQueryInitialize(&rq, acc_struct, RayDesc(0u, 0xffu, 0.001, 1000.0, ro, rd));
     rayQueryProceed(&rq);
     let tri_hit = rayQueryGetCommittedIntersection(&rq);
-    let tri_t = select(1e38, tri_hit.t, tri_hit.kind != RAY_QUERY_INTERSECTION_NONE);
+    var tri_t = select(1e38, tri_hit.t, tri_hit.kind != RAY_QUERY_INTERSECTION_NONE);
+    if (tri_t < 1e37) {
+      let tri_pos = ro + rd * tri_t;
+      let decanter_visible = (uniforms.mesh_visibility & 1u) != 0u;
+      let wine_visible = (uniforms.mesh_visibility & 2u) != 0u;
+      let in_decanter = decanter_visible &&
+        distance(tri_pos, uniforms.decanter_center.xyz) <= uniforms.decanter_center.w;
+      let in_wine = wine_visible &&
+        distance(tri_pos, uniforms.wine_center.xyz) <= uniforms.wine_center.w;
+      if (!in_decanter && !in_wine) {
+        tri_t = 1e38;
+      }
+    }
     let ground_t = ground_plane_intersection(ro, rd);
 
     var primitive_t = 1e38;

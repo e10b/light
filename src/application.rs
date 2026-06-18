@@ -54,7 +54,9 @@ struct SceneUniforms {
     cornell_enabled: u32,
     primitive_count: u32,
     camera_aperture: f32,
-    _pad: [u32; 3],
+    photon_brightness: f32,
+    ground_brightness: f32,
+    _pad: [u32; 2],
 }
 
 const MAX_PRIMITIVES: usize = 64;
@@ -1057,7 +1059,9 @@ pub async fn run() {
         cornell_enabled: 0,
         primitive_count: 1,
         camera_aperture: 0.0,
-        _pad: [0; 3],
+        photon_brightness: 0.1,
+        ground_brightness: 1.0,
+        _pad: [0; 2],
     };
     primitive_lens_params_by_id.insert(sphere_obj_id, uniforms.lens_params);
 
@@ -1145,6 +1149,43 @@ pub async fn run() {
         puppy_texture_size,
     );
     let puppy_texture_view = puppy_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let environment_image = image::open("res/sunflowers_puresky_4k.exr")
+        .expect("failed to load sunflower environment")
+        .to_rgba32f();
+    let environment_dimensions = environment_image.dimensions();
+    let environment_texture_size = wgpu::Extent3d {
+        width: environment_dimensions.0.max(1),
+        height: environment_dimensions.1.max(1),
+        depth_or_array_layers: 1,
+    };
+    let environment_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sunflower_environment_texture"),
+        size: environment_texture_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &environment_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(environment_image.as_raw()),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(16 * environment_dimensions.0),
+            rows_per_image: Some(environment_dimensions.1),
+        },
+        environment_texture_size,
+    );
+    let environment_texture_view =
+        environment_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let primitive_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("primitive_instances_buf"),
         size: (std::mem::size_of::<GpuPrimitive>() * MAX_PRIMITIVES) as u64,
@@ -1303,6 +1344,16 @@ pub async fn run() {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 15,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -1389,6 +1440,10 @@ pub async fn run() {
             wgpu::BindGroupEntry {
                 binding: 14,
                 resource: primitive_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: wgpu::BindingResource::TextureView(&environment_texture_view),
             },
         ],
     });
@@ -1620,6 +1675,15 @@ pub async fn run() {
                         1.0
                     };
                     let wants_keyboard = egui_ctx.wants_keyboard_input();
+
+                    if !wants_keyboard && keys_pressed.contains("r") {
+                        gizmo_mode = GizmoModeKind::Rotate;
+                        keys_pressed.remove("r");
+                    }
+                    if !wants_keyboard && keys_pressed.contains("g") {
+                        gizmo_mode = GizmoModeKind::Translate;
+                        keys_pressed.remove("g");
+                    }
 
                     if !wants_keyboard && has_selection && keys_pressed.contains("x") {
                         let scene_id = match scene_kind {
@@ -1872,6 +1936,18 @@ pub async fn run() {
                                                 has_selection = true;
                                                 optical_trace_enabled = true;
                                                 optical_trace_rays = 9;
+                                                sun_azimuth_deg = 180.0;
+                                                sun_elevation_deg = 70.0;
+                                                sun_intensity = 1.5;
+                                                sun_lamp_distance = sun_lamp_distance.max(80.0);
+                                                let sun_elevation = sun_elevation_deg.to_radians();
+                                                sun_empty_position = active_center
+                                                    + glam::Vec3::new(
+                                                        -sun_elevation.cos(),
+                                                        sun_elevation.sin(),
+                                                        0.0,
+                                                    ) * sun_lamp_distance;
+                                                sun_empty_rotation = glam::Quat::IDENTITY;
                                                 camera = Camera::look_at(
                                                     glam::Vec3::new(2.0, bench_y + 8.0, 58.0),
                                                     glam::Vec3::new(3.0, bench_y, 0.0),
@@ -2101,10 +2177,17 @@ pub async fn run() {
                                                 has_selection = true;
                                                 optical_trace_enabled = true;
                                                 optical_trace_rays = 11;
-                                                sun_intensity = 2.2;
+                                                sun_azimuth_deg = 0.0;
+                                                sun_elevation_deg = 70.0;
+                                                sun_intensity = 1.5;
                                                 sun_lamp_distance = sun_lamp_distance.max(80.0);
-                                                sun_empty_position =
-                                                    active_center + glam::Vec3::X * sun_lamp_distance;
+                                                let sun_elevation = sun_elevation_deg.to_radians();
+                                                sun_empty_position = active_center
+                                                    + glam::Vec3::new(
+                                                        sun_elevation.cos(),
+                                                        sun_elevation.sin(),
+                                                        0.0,
+                                                    ) * sun_lamp_distance;
                                                 sun_empty_rotation = glam::Quat::IDENTITY;
                                                 camera = Camera::look_at(
                                                     focuser_center + folded_axis * 8.0 + glam::Vec3::Y * 0.35,
@@ -2366,10 +2449,17 @@ pub async fn run() {
                                                 has_selection = true;
                                                 optical_trace_enabled = true;
                                                 optical_trace_rays = 11;
-                                                sun_intensity = 2.2;
+                                                sun_azimuth_deg = 0.0;
+                                                sun_elevation_deg = 70.0;
+                                                sun_intensity = 1.5;
                                                 sun_lamp_distance = sun_lamp_distance.max(80.0);
-                                                sun_empty_position =
-                                                    active_center + glam::Vec3::X * sun_lamp_distance;
+                                                let sun_elevation = sun_elevation_deg.to_radians();
+                                                sun_empty_position = active_center
+                                                    + glam::Vec3::new(
+                                                        sun_elevation.cos(),
+                                                        sun_elevation.sin(),
+                                                        0.0,
+                                                    ) * sun_lamp_distance;
                                                 sun_empty_rotation = glam::Quat::IDENTITY;
                                                 camera = Camera::look_at(
                                                     collimator_center
@@ -3472,6 +3562,34 @@ pub async fn run() {
                                             ui.add(egui::Slider::new(&mut sun_azimuth_deg, -180.0..=180.0).text("Azimuth"));
                                             ui.add(egui::Slider::new(&mut sun_elevation_deg, -10.0..=89.0).text("Elevation"));
                                             ui.add(egui::Slider::new(&mut sun_intensity, 0.0..=5.0).text("Intensity"));
+                                        });
+                                        ui.collapsing("Photon Map", |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut uniforms.photon_brightness,
+                                                        0.0..=10.0,
+                                                    )
+                                                    .text("Brightness"),
+                                                )
+                                                .changed()
+                                            {
+                                                accumulation_dirty = true;
+                                            }
+                                        });
+                                        ui.collapsing("Ground", |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut uniforms.ground_brightness,
+                                                        0.0..=3.0,
+                                                    )
+                                                    .text("Brightness"),
+                                                )
+                                                .changed()
+                                            {
+                                                accumulation_dirty = true;
+                                            }
                                         });
                                         ui.collapsing("Spotlight", |ui| {
                                             let az_changed = ui.add(egui::Slider::new(&mut wine_spotlight_azimuth_deg, -180.0..=180.0).text("Azimuth")).changed();
@@ -5458,6 +5576,10 @@ pub async fn run() {
                                 uniforms.frame,
                                 photons_per_frame,
                                 uniforms.primitive_count,
+                                (if decanter_visible_for_photons { 1 } else { 0 })
+                                    | (if wine_visible_for_photons { 2 } else { 0 }),
+                                uniforms.decanter_center,
+                                uniforms.mesh_center,
                             );
                             photon_mapper.emit_photons(&mut encoder, photons_per_frame);
                             photon_mapper.build_spatial_structure(&mut encoder);

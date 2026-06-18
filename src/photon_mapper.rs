@@ -14,7 +14,10 @@ struct PhotonMapUniforms {
     hash_table_size: u32,
     frame: u32,
     primitive_count: u32,
-    _pad: [u32; 7],
+    mesh_visibility: u32,
+    _pad: [u32; 2],
+    decanter_center: [f32; 4],
+    wine_center: [f32; 4],
 }
 
 #[repr(C)]
@@ -83,7 +86,10 @@ impl PhotonMapper {
             hash_table_size: HASH_TABLE_SIZE,
             frame: 0,
             primitive_count: 0,
-            _pad: [0; 7],
+            mesh_visibility: 0,
+            _pad: [0; 2],
+            decanter_center: [0.0; 4],
+            wine_center: [0.0; 4],
         };
 
         let uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -265,6 +271,9 @@ impl PhotonMapper {
         frame: u32,
         photons_per_frame: u32,
         primitive_count: u32,
+        mesh_visibility: u32,
+        decanter_center: [f32; 4],
+        wine_center: [f32; 4],
     ) {
         self.photon_count = photons_per_frame.min(MAX_PHOTONS);
         let uniforms = PhotonMapUniforms {
@@ -275,7 +284,10 @@ impl PhotonMapper {
             hash_table_size: HASH_TABLE_SIZE,
             frame,
             primitive_count: primitive_count.min(64),
-            _pad: [0; 7],
+            mesh_visibility,
+            _pad: [0; 2],
+            decanter_center,
+            wine_center,
         };
         queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -295,11 +307,10 @@ impl PhotonMapper {
     }
 
     pub fn build_spatial_structure(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.hash_heads, 0, None);
         if self.photon_count == 0 {
             return;
         }
-
-        encoder.clear_buffer(&self.hash_heads, 0, None);
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("photon_hash_pass"),
