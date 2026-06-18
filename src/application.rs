@@ -111,6 +111,43 @@ enum GizmoTargetKind {
     WineSpotlight,
 }
 
+fn visibility_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
+    let response = ui.add_sized([24.0, 20.0], egui::Button::new(""));
+    let color = ui.style().interact(&response).fg_stroke.color;
+    let center = response.rect.center();
+    let left = Pos2::new(center.x - 6.5, center.y);
+    let right = Pos2::new(center.x + 6.5, center.y);
+    let top = center.y - 4.0;
+    let bottom = center.y + 4.0;
+    let eye_stroke = Stroke::new(1.35, color);
+
+    ui.painter().add(egui::Shape::line(
+        vec![
+            left,
+            Pos2::new(center.x - 3.5, top + 0.3),
+            Pos2::new(center.x, top),
+            Pos2::new(center.x + 3.5, top + 0.3),
+            right,
+            Pos2::new(center.x + 3.5, bottom - 0.3),
+            Pos2::new(center.x, bottom),
+            Pos2::new(center.x - 3.5, bottom - 0.3),
+            left,
+        ],
+        eye_stroke,
+    ));
+
+    if visible {
+        ui.painter().circle_filled(center, 2.25, color);
+    } else {
+        let slash_start = Pos2::new(center.x - 6.0, center.y - 5.0);
+        let slash_end = Pos2::new(center.x + 6.0, center.y + 5.0);
+        ui.painter()
+            .line_segment([slash_start, slash_end], Stroke::new(2.0, color));
+    }
+
+    response
+}
+
 fn default_target_for_scene(scene_kind: SceneKind) -> GizmoTargetKind {
     match scene_kind {
         SceneKind::Decanter => GizmoTargetKind::Decanter,
@@ -3122,13 +3159,7 @@ pub async fn run() {
                                                     gizmo_target == target
                                                 };
                                             ui.horizontal(|ui| {
-                                                let visibility_icon = if is_visible {
-                                                    "\u{25c9}"
-                                                } else {
-                                                    "\u{25cb}"
-                                                };
-                                                if ui
-                                                    .small_button(visibility_icon)
+                                                if visibility_button(ui, is_visible)
                                                     .on_hover_text(if is_visible {
                                                         "Hide object"
                                                     } else {
