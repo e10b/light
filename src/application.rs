@@ -2467,7 +2467,7 @@ pub async fn run() {
                                                     collimator_center - rear_view_axis * primary_radius,
                                                 );
                                                 render_mode = RenderModeKind::Pathtraced;
-                                                uniforms.camera_aperture = 0.5;
+                                                uniforms.camera_aperture = 0.0;
                                                 accumulation_dirty = true;
                                                 project_status =
                                                     "Cassegrain collimated-view demo created".to_string();
@@ -3090,6 +3090,7 @@ pub async fn run() {
                                         };
                                         let scene_object_ids = main_db.scene_objects_recursive(scene_id);
                                         let mut delete_object_id = None;
+                                        let mut visibility_change = None;
                                         for object_id in scene_object_ids {
                                             let Some(target) = object_target_by_id.get(&object_id).copied() else {
                                                 continue;
@@ -3100,6 +3101,19 @@ pub async fn run() {
                                                 .map(|o| o.name.as_str())
                                                 .unwrap_or("Object");
                                             let is_selectable = target_allowed_in_scene(scene_kind, target);
+                                            let is_visible = main_db
+                                                .scenes
+                                                .get(&scene_id)
+                                                .and_then(|scene| {
+                                                    main_db.view_layers.get(&scene.view_layer_id)
+                                                })
+                                                .and_then(|view_layer| {
+                                                    view_layer
+                                                        .bases
+                                                        .iter()
+                                                        .find(|base| base.object_id == object_id)
+                                                })
+                                                .is_some_and(|base| base.visible);
                                             let is_selected = has_selection
                                                 && if target == GizmoTargetKind::Sphere {
                                                     gizmo_target == GizmoTargetKind::Sphere
@@ -3108,6 +3122,23 @@ pub async fn run() {
                                                     gizmo_target == target
                                                 };
                                             ui.horizontal(|ui| {
+                                                let visibility_icon = if is_visible {
+                                                    "\u{25c9}"
+                                                } else {
+                                                    "\u{25cb}"
+                                                };
+                                                if ui
+                                                    .small_button(visibility_icon)
+                                                    .on_hover_text(if is_visible {
+                                                        "Hide object"
+                                                    } else {
+                                                        "Show object"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    visibility_change =
+                                                        Some((object_id, !is_visible));
+                                                }
                                                 let clicked = ui
                                                     .add_enabled_ui(is_selectable, |ui| {
                                                         ui.selectable_label(is_selected, label).clicked()
@@ -3171,6 +3202,32 @@ pub async fn run() {
                                                     delete_object_id = Some(object_id);
                                                 }
                                             });
+                                        }
+                                        if let Some((object_id, visible)) = visibility_change {
+                                            main_db.set_scene_base_visibility(
+                                                scene_id,
+                                                object_id,
+                                                visible,
+                                            );
+                                            let hidden_was_selected = has_selection
+                                                && object_target_by_id
+                                                    .get(&object_id)
+                                                    .copied()
+                                                    .is_some_and(|target| {
+                                                        if target == GizmoTargetKind::Sphere {
+                                                            gizmo_target
+                                                                == GizmoTargetKind::Sphere
+                                                                && selected_primitive_id
+                                                                    == object_id
+                                                        } else {
+                                                            gizmo_target == target
+                                                        }
+                                                    });
+                                            if !visible && hidden_was_selected {
+                                                has_selection = false;
+                                                gizmo_target = default_target_for_scene(scene_kind);
+                                            }
+                                            accumulation_dirty = true;
                                         }
                                         if let Some(object_id) = delete_object_id {
                                             let was_selected = has_selection
