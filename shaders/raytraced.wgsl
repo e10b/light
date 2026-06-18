@@ -26,7 +26,7 @@ struct Uniforms {
   wine_enabled: u32,
   cornell_enabled: u32,
   primitive_count: u32,
-  pad: u32,
+  camera_aperture: f32,
 };
 
 @group(0) @binding(0)

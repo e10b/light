@@ -26,7 +26,7 @@ struct Uniforms {
   wine_enabled: u32,
   cornell_enabled: u32,
   primitive_count: u32,
-  pad: u32,
+  camera_aperture: f32,
 };
 
 @group(0) @binding(0)
@@ -1281,9 +1281,8 @@ fn fs_main(vertex: VertexOut) -> @location(0) vec4<f32> {
   let far_pos = cam_far.xyz / cam_far.w;
   
   // Convert to world space
-  let origin = (uniforms.view_inv * vec4<f32>(0.0, 0.0, 0.0, 1.0)).xyz;
+  let camera_origin = (uniforms.view_inv * vec4<f32>(0.0, 0.0, 0.0, 1.0)).xyz;
   let far_world = (uniforms.view_inv * vec4<f32>(far_pos, 1.0)).xyz;
-  let direction = normalize(far_world - origin);
   
   // Seed RNG with pixel coords and frame (use builtin position from vertex)
   let uv = vec2<f32>(
@@ -1295,6 +1294,13 @@ fn fs_main(vertex: VertexOut) -> @location(0) vec4<f32> {
   let idx = py * uniforms.render_width + px;
 
   let seed = u32(uniforms.frame) * 1973u + px * 9277u + py * 7013u + 1u;
+  let pupil_r = sqrt(rand01(seed ^ 0x68bc21ebu)) * uniforms.camera_aperture;
+  let pupil_theta = rand01(seed ^ 0x02e5be93u) * 6.28318530718;
+  let camera_right = normalize((uniforms.view_inv * vec4<f32>(1.0, 0.0, 0.0, 0.0)).xyz);
+  let camera_up = normalize((uniforms.view_inv * vec4<f32>(0.0, 1.0, 0.0, 0.0)).xyz);
+  let origin = camera_origin + camera_right * (cos(pupil_theta) * pupil_r)
+    + camera_up * (sin(pupil_theta) * pupil_r);
+  let direction = normalize(far_world - camera_origin);
   let sample_color = trace_ray(origin, direction, seed);
 
   var accum_color = sample_color;
@@ -1327,13 +1333,19 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let cam_far = uniforms.proj_inv * vec4<f32>(ndc.x, ndc.y, 1.0, 1.0);
   let far_pos = cam_far.xyz / cam_far.w;
 
-  let origin = (uniforms.view_inv * vec4<f32>(0.0, 0.0, 0.0, 1.0)).xyz;
+  let camera_origin = (uniforms.view_inv * vec4<f32>(0.0, 0.0, 0.0, 1.0)).xyz;
   let far_world = (uniforms.view_inv * vec4<f32>(far_pos, 1.0)).xyz;
-  let direction = normalize(far_world - origin);
 
   let seed = uniforms.frame * 1973u + px * 9277u + py * 7013u + 1u;
+  let pupil_r = sqrt(rand01(seed ^ 0x68bc21ebu)) * uniforms.camera_aperture;
+  let pupil_theta = rand01(seed ^ 0x02e5be93u) * 6.28318530718;
+  let camera_right = normalize((uniforms.view_inv * vec4<f32>(1.0, 0.0, 0.0, 0.0)).xyz);
+  let camera_up = normalize((uniforms.view_inv * vec4<f32>(0.0, 1.0, 0.0, 0.0)).xyz);
+  let origin = camera_origin + camera_right * (cos(pupil_theta) * pupil_r)
+    + camera_up * (sin(pupil_theta) * pupil_r);
+  let direction = normalize(far_world - camera_origin);
   let sample_color = trace_ray(origin, direction, seed);
-  let selected_mask = selection_mask_ray(origin, direction);
+  let selected_mask = selection_mask_ray(camera_origin, direction);
 
   var accum_color = sample_color;
   if (uniforms.frame > 0u) {

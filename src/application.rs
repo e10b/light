@@ -53,7 +53,8 @@ struct SceneUniforms {
     wine_enabled: u32,
     cornell_enabled: u32,
     primitive_count: u32,
-    _pad: [u32; 4],
+    camera_aperture: f32,
+    _pad: [u32; 3],
 }
 
 const MAX_PRIMITIVES: usize = 64;
@@ -1055,7 +1056,8 @@ pub async fn run() {
         wine_enabled: 0,
         cornell_enabled: 0,
         primitive_count: 1,
-        _pad: [0; 4],
+        camera_aperture: 0.0,
+        _pad: [0; 3],
     };
     primitive_lens_params_by_id.insert(sphere_obj_id, uniforms.lens_params);
 
@@ -2375,6 +2377,7 @@ pub async fn run() {
                                                     collimator_center - rear_view_axis * primary_radius,
                                                 );
                                                 render_mode = RenderModeKind::Pathtraced;
+                                                uniforms.camera_aperture = 0.5;
                                                 accumulation_dirty = true;
                                                 project_status =
                                                     "Cassegrain collimated-view demo created".to_string();
@@ -3503,6 +3506,18 @@ pub async fn run() {
                                                 );
                                                 uniforms.proj_inv =
                                                     projection.inverse().to_cols_array_2d();
+                                                accumulation_dirty = true;
+                                            }
+                                            if ui
+                                                .add(
+                                                    egui::Slider::new(
+                                                        &mut uniforms.camera_aperture,
+                                                        0.0..=0.8,
+                                                    )
+                                                    .text("Pupil radius"),
+                                                )
+                                                .changed()
+                                            {
                                                 accumulation_dirty = true;
                                             }
                                             let rear_collimator_id = main_db.objects.iter().find_map(
