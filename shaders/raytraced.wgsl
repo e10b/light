@@ -144,7 +144,18 @@ fn sky(dir: vec3<f32>) -> vec3<f32> {
     clamp(i32(uv.y * f32(dims.y)), 0, i32(dims.y) - 1)
   );
   let radiance = max(textureLoad(environment_texture, pixel, 0).rgb * 0.8, vec3<f32>(0.0));
-  return radiance / (vec3<f32>(1.0) + radiance);
+  let mapped = clamp(
+    (radiance * (2.51 * radiance + vec3<f32>(0.03))) /
+      (radiance * (2.43 * radiance + vec3<f32>(0.59)) + vec3<f32>(0.14)),
+    vec3<f32>(0.0),
+    vec3<f32>(1.0)
+  );
+  let luma = dot(mapped, vec3<f32>(0.2126, 0.7152, 0.0722));
+  return clamp(
+    mix(vec3<f32>(luma), mapped, 1.12),
+    vec3<f32>(0.0),
+    vec3<f32>(1.0)
+  );
 }
 
 fn preetham_perez(cos_t: f32, g: f32, cos_g: f32, a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {

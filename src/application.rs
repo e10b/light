@@ -3577,20 +3577,22 @@ pub async fn run() {
                                                 accumulation_dirty = true;
                                             }
                                         });
-                                        ui.collapsing("Ground", |ui| {
-                                            if ui
-                                                .add(
-                                                    egui::Slider::new(
-                                                        &mut uniforms.ground_brightness,
-                                                        0.0..=3.0,
+                                        egui::CollapsingHeader::new("Ground")
+                                            .default_open(true)
+                                            .show(ui, |ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::Slider::new(
+                                                            &mut uniforms.ground_brightness,
+                                                            0.0..=3.0,
+                                                        )
+                                                        .text("Brightness"),
                                                     )
-                                                    .text("Brightness"),
-                                                )
-                                                .changed()
-                                            {
-                                                accumulation_dirty = true;
-                                            }
-                                        });
+                                                    .changed()
+                                                {
+                                                    accumulation_dirty = true;
+                                                }
+                                            });
                                         ui.collapsing("Spotlight", |ui| {
                                             let az_changed = ui.add(egui::Slider::new(&mut wine_spotlight_azimuth_deg, -180.0..=180.0).text("Azimuth")).changed();
                                             let el_changed = ui.add(egui::Slider::new(&mut wine_spotlight_elevation_deg, 5.0..=85.0).text("Elevation")).changed();
